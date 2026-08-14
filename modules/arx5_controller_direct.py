@@ -1,0 +1,523 @@
+"""
+Arx5Controller using SingleArmClient (direct SDK interface) instead of ZMQ.
+This is a drop-in replacement for Arx5Controller when using arx_x5_python SDK directly.
+"""
+
+import multiprocessing as mp
+import enum
+from multiprocessing.managers import SharedMemoryManager
+from typing import Optional
+import numpy as np
+from utils.other_util import precise_wait
+from shared_memory.shared_memory_queue import SharedMemoryQueue, Empty
+from shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
+
+from modules.pose_trajectory_interpolator import PoseTrajectoryInterpolator
+import time
+from modules.arx5_single_arm_client import SingleArmClient
+import numpy.typing as npt
+
+from multiprocessing import Value
+import ctypes
+
+from modules.arx_x5_python.bimanual.script.single_arm import SingleArm
+
+
+class Command(enum.Enum):
+    STOP = 0
+    SERVOL = 1
+    SCHEDULE_WAYPOINT = 2
+    RESET_TO_HOME = 3
+    ADD_WAYPOINT = 4
+    UPDATE_TRAJECTORY = 5
+    SET_JOINT_TARGET = 6
+    SET_JOINT_TRAJECTORY = 7
+    SET_GRAVITY_COMPENSATION = 8
+    SET_TO_DAMPING = 9
+    SET_END_CONTROL = 10
+
+
+class Arx5ControllerDirect(mp.Process):
+    """
+    Arx5Controller using SingleArmClient (direct arx_x5_python SDK).
+    This version does not require a ZMQ server.
+    """
+
+    def __init__(
+        self,
+        shm_manager: SharedMemoryManager,
+        can_port: str = "can0",
+        arm_type: int = 0,
+        urdf_path: Optional[str] = None,
+        launch_timeout: float = 10,
+        frequency: float = 100,
+        get_max_k: Optional[int] = None,
+        verbose: bool = False,
+        receive_latency: float = 0.0,
+        reset_to_home_on_start: bool = True,
+    ):
+        """
+        初始化控制器
+        
+        Args:
+            shm_manager: 共享内存管理器
+            can_port: CAN 总线端口 (如 "can0")
+            arm_type: 机械臂类型 (0: x5, 1: x5_master, 2: x5_2025)
+            urdf_path: URDF 文件路径（可选）
+            launch_timeout: 启动超时时间
+            frequency: 控制频率 (Hz)
+            get_max_k: ring buffer 最大长度
+            verbose: 是否打印调试信息
+            receive_latency: 接收延迟补偿
+            reset_to_home_on_start: 子进程启动时是否调用 reset_to_home
+        """
+        super().__init__(name="Arx5ControllerDirect")
+        self.can_port = can_port
+        self.arm_type = arm_type
+        self.urdf_path = urdf_path
+        self.reset_to_home_on_start = reset_to_home_on_start
+
+        example = {
+            "cmd": Command.SERVOL.value,
+            "target_pose": np.zeros((6,), dtype=np.float64),
+            "gripper_pos": 0.0,
+            "duration": 0.0,
+            "target_time": 0.0,
+            "gravity_compensation": False,
+        }
+        input_queue = SharedMemoryQueue.create_from_examples(
+            shm_manager=shm_manager, examples=example, buffer_size=256
+        )
+        self.verbose = verbose
+
+        # build ring buffer
+        receive_keys = [
+            ("ActualTCPPose", "tcp_pose"),
+            ("ActualQ", "joint_pos"),
+            ("ActualQd", "joint_vel"),
+            ("gripper_position", "gripper_pos"),
+        ]
+        example = dict()
+        for key, func_name in receive_keys:
+            if "joint" in func_name:
+                example[key] = np.zeros(6)
+            elif "tcp_pose" in func_name:
+                example[key] = np.zeros(6)
+        example["gripper_position"] = 0.0
+        example["robot_receive_timestamp"] = time.time()
+        example["robot_timestamp"] = time.time()
+
+        if get_max_k is None:
+            get_max_k = int(frequency * 5)
+        ring_buffer = SharedMemoryRingBuffer.create_from_examples(
+            shm_manager=shm_manager,
+            examples=example,
+            get_max_k=get_max_k,
+            get_time_budget=0.2,
+            put_desired_frequency=frequency,
+        )
+        self.launch_timeout = launch_timeout
+        self.ready_event = mp.Event()
+        self.input_queue = input_queue
+        self.ring_buffer = ring_buffer
+        self.receive_keys = receive_keys
+        self.frequency = frequency
+        self.receive_latency = receive_latency
+
+        # Will be initialized in the subprocess
+        self.robot_client: SingleArmClient
+        self.reset_success = Value(ctypes.c_bool, False)
+
+    # ========= launch method ===========
+    def start(self, wait=True):
+        super().start()
+        if wait:
+            self.start_wait()
+        if self.verbose:
+            print(f"[Arx5ControllerDirect] Controller process spawned at {self.pid}")
+
+    def stop(self, wait=True):
+        message = {"cmd": Command.STOP.value}
+        self.input_queue.put(message)
+        if wait:
+            self.stop_wait()
+        if self.verbose:
+            print(f"[Arx5ControllerDirect] Controller process terminated at {self.pid}")
+
+    def start_wait(self):
+        print(f"[Arx5ControllerDirect] Waiting for controller process to be ready")
+        print(f"{self.launch_timeout=}")
+        self.ready_event.wait(self.launch_timeout)
+        assert self.is_alive()
+
+    def stop_wait(self):
+        self.join()
+
+    @property
+    def is_ready(self):
+        return self.ready_event.is_set()
+
+    # ========= context manager ===========
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+
+    # ========= receive APIs =============
+    def get_state(self, k=None, out=None):
+        if k is None:
+            return self.ring_buffer.get(out=out)
+        else:
+            return self.ring_buffer.get_last_k(k=k, out=out)
+
+    def get_all_state(self):
+        return self.ring_buffer.get_all()
+
+    # ========= command methods ============
+    def servoL(self, pose: npt.NDArray[np.float64], gripper_pos: float, duration=0.1):
+        """
+        duration: desired time to reach pose
+        """
+        assert self.is_alive()
+        assert duration >= (1 / self.frequency)
+        pose = np.array(pose)
+        assert pose.shape == (6,)
+
+        message = {
+            "cmd": Command.SERVOL.value,
+            "target_pose": pose,
+            "gripper_pos": gripper_pos,
+            "duration": duration,
+        }
+        self.input_queue.put(message)
+
+    def schedule_waypoint(
+        self, pose: npt.NDArray[np.float64], gripper_pos: float, target_time: float
+    ):
+        pose = np.array(pose)
+        assert pose.shape == (6,)
+
+        message = {
+            "cmd": Command.SCHEDULE_WAYPOINT.value,
+            "target_pose": pose,
+            "gripper_pos": gripper_pos,
+            "target_time": target_time,
+        }
+        self.input_queue.put(message)
+
+    def add_waypoint(
+        self, pose: npt.NDArray[np.float64], gripper_pos: float, target_time: float
+    ):
+        pose = np.array(pose)
+        assert pose.shape == (6,)
+
+        message = {
+            "cmd": Command.ADD_WAYPOINT.value,
+            "target_pose": pose,
+            "gripper_pos": gripper_pos,
+            "target_time": target_time,
+        }
+        self.input_queue.put(message)
+
+    def update_trajectory(self):
+        message = {
+            "cmd": Command.UPDATE_TRAJECTORY.value,
+        }
+        self.input_queue.put(message)
+
+    def reset_to_home(self):
+        self.reset_success.value = False
+        message = {"cmd": Command.RESET_TO_HOME.value}
+        self.input_queue.put(message)
+        while not self.reset_success.value:
+            print("waiting for reset")
+            time.sleep(0.1)
+
+    def set_gravity_compensation(self):
+        message = {"cmd": Command.SET_GRAVITY_COMPENSATION.value}
+        self.input_queue.put(message)
+
+    def set_end_control(self):
+        message = {"cmd": Command.SET_END_CONTROL.value}
+        self.input_queue.put(message)
+
+    def set_to_damping(self):
+        message = {"cmd": Command.SET_TO_DAMPING.value}
+        self.input_queue.put(message)
+
+    # ========= main loop in process ============
+    def run(self):
+        # 使用 SingleArmClient 而不是 Arx5Client
+        self.robot_client = SingleArmClient(
+            can_port=self.can_port,
+            arm_type=self.arm_type,
+            urdf_path=self.urdf_path,
+        )
+        if self.reset_to_home_on_start:
+            self.robot_client.reset_to_home()
+        else:
+            print(
+                f"[Arx5ControllerDirect] skip reset_to_home on start "
+                f"(can={self.can_port})"
+            )
+        self.robot_client.set_mode(4)
+        time.sleep(1)
+        
+        np.set_printoptions(precision=3, suppress=True)
+        self.waypoint_buffer = []
+
+        try:
+            dt = 1 / self.frequency
+            self.robot_client.get_state()
+            curr_pose = self.robot_client.tcp_pose
+            curr_gripper_pos = self.robot_client.gripper_pos
+            curr_t = time.monotonic()
+            last_waypoint_time = curr_t
+            pose_interp = PoseTrajectoryInterpolator(
+                times=np.array([curr_t]), poses=np.array([curr_pose])
+            )
+            gripper_pos_interp = PoseTrajectoryInterpolator(
+                times=np.array([curr_t]),
+                poses=np.array([[curr_gripper_pos, 0, 0, 0, 0, 0]]),
+            )
+
+            t_start = time.monotonic()
+            iter_idx = 0
+            keep_running = True
+            is_gravity_compensation = False  # 追踪重力补偿状态
+            
+            while keep_running:
+                t_now = time.monotonic()
+                
+                # 只有在非重力补偿模式下才发送位姿命令
+                if not is_gravity_compensation:
+                    pose_cmd = pose_interp(t_now)
+                    gripper_cmd = float(gripper_pos_interp(t_now)[0])
+                    self.robot_client.set_tcp_pose(pose_cmd, gripper_cmd)
+                    self.robot_client
+                
+                # 获取当前状态
+                self.robot_client.get_state()
+                state = {
+                    "ActualTCPPose": self.robot_client.tcp_pose,
+                    "ActualQ": self.robot_client.joint_pos,
+                    "ActualQd": self.robot_client.joint_vel,
+                    "gripper_position": self.robot_client.gripper_pos,
+                }
+                t_recv = time.time()
+                state["robot_receive_timestamp"] = t_recv
+                state["robot_timestamp"] = t_recv - self.receive_latency
+                self.ring_buffer.put(state)
+
+                try:
+                    commands = self.input_queue.get_k(1)
+                    n_cmd = len(commands["cmd"])
+                except Empty:
+                    commands = {}
+                    n_cmd = 0
+
+                # execute commands
+                for i in range(n_cmd):
+                    command = dict()
+                    for key, value in commands.items():
+                        command[key] = value[i]
+                    cmd = command["cmd"]
+
+                    if cmd == Command.STOP.value:
+                        keep_running = False
+                        break
+                        
+                    elif cmd == Command.SERVOL.value:
+                        target_pose = command["target_pose"]
+                        duration = float(command["duration"])
+                        curr_time = t_now + dt
+                        t_insert = curr_time + duration
+                        pose_interp = pose_interp.drive_to_waypoint(
+                            pose=target_pose,
+                            time=t_insert,
+                            curr_time=curr_time,
+                        )
+                        gripper_pos_interp = gripper_pos_interp.drive_to_waypoint(
+                            pose=[command["gripper_pos"], 0, 0, 0, 0, 0],
+                            time=t_insert,
+                            curr_time=curr_time,
+                        )
+                        last_waypoint_time = t_insert
+                        if self.verbose:
+                            print(f"[Arx5ControllerDirect] New pose target: {target_pose}")
+                            
+                    elif cmd == Command.SCHEDULE_WAYPOINT.value:
+                        target_pose = command["target_pose"]
+                        target_time = float(command["target_time"])
+                        target_time = time.monotonic() - time.time() + target_time
+                        pose_interp = pose_interp.schedule_waypoint(
+                            pose=target_pose,
+                            time=target_time,
+                            curr_time=t_now,
+                            last_waypoint_time=last_waypoint_time,
+                        )
+                        gripper_pos_interp = gripper_pos_interp.schedule_waypoint(
+                            pose=[command["gripper_pos"], 0, 0, 0, 0, 0],
+                            time=target_time,
+                            curr_time=t_now,
+                            last_waypoint_time=last_waypoint_time,
+                        )
+                        last_waypoint_time = target_time
+
+                    elif cmd == Command.RESET_TO_HOME.value:
+                        self.robot_client.reset_to_home()
+                        self.robot_client.get_state()
+
+                        self.ring_buffer.clear()
+                        state = {
+                            "ActualTCPPose": self.robot_client.tcp_pose,
+                            "ActualQ": self.robot_client.joint_pos,
+                            "ActualQd": self.robot_client.joint_vel,
+                            "gripper_position": self.robot_client.gripper_pos,
+                        }
+                        t_recv = time.time()
+                        state["robot_receive_timestamp"] = t_recv
+                        state["robot_timestamp"] = t_recv - self.receive_latency
+                        self.ring_buffer.put(state)
+                        
+                        if self.verbose:
+                            print(f"[Arx5ControllerDirect] Reset to home")
+
+                        curr_pose = self.robot_client.tcp_pose
+                        curr_gripper_pos = self.robot_client.gripper_pos
+                        curr_t = time.monotonic()
+                        last_waypoint_time = curr_t
+                        pose_interp = PoseTrajectoryInterpolator(
+                            times=np.array([curr_t]), poses=np.array([curr_pose])
+                        )
+                        gripper_pos_interp = PoseTrajectoryInterpolator(
+                            times=np.array([curr_t]),
+                            poses=np.array([[curr_gripper_pos, 0, 0, 0, 0, 0]]),
+                        )
+                        self.reset_success.value = True
+                        is_gravity_compensation = False
+
+                    elif cmd == Command.ADD_WAYPOINT.value:
+                        if len(self.waypoint_buffer) > 0:
+                            last_waypoint_time = self.waypoint_buffer[-1]["target_time"]
+                            if command["target_time"] <= last_waypoint_time:
+                                print(f"[Arx5ControllerDirect] Waypoint time not in the future, skipping")
+                                continue
+                        self.waypoint_buffer.append(command)
+                        
+                    elif cmd == Command.UPDATE_TRAJECTORY.value:
+                        if len(self.waypoint_buffer) == 0:
+                            print(f"[Arx5ControllerDirect] No new waypoints to update trajectory")
+                            continue
+                            
+                        # Dynamic latency matching (same logic as original)
+                        start_time = time.monotonic()
+                        matching_dt = 0.01
+                        pose_samples = np.zeros((3, 6))
+                        pose_samples[0, :] = pose_interp(t_now - matching_dt)
+                        pose_samples[1, :] = pose_interp(t_now)
+                        pose_samples[2, :] = pose_interp(t_now + matching_dt)
+
+                        input_poses = np.array([cmd["target_pose"] for cmd in self.waypoint_buffer])
+                        input_times = np.array([cmd["target_time"] for cmd in self.waypoint_buffer])
+                        input_gripper_pos = np.array([cmd["gripper_pos"] for cmd in self.waypoint_buffer])
+                        input_pose_interp = PoseTrajectoryInterpolator(
+                            times=input_times - input_times[0], poses=input_poses
+                        )
+
+                        latency_precision = 0.02
+                        max_latency = 1.2
+                        smoothing_time = 0.5
+                        errors = []
+                        error_weights = np.array([1, 1, 1, 0.1, 0.1, 0.1])
+                        
+                        for latency in np.arange(matching_dt, max_latency, latency_precision):
+                            input_pose_samples = np.zeros((3, 6))
+                            input_pose_samples[0, :] = input_pose_interp(latency - matching_dt)
+                            input_pose_samples[1, :] = input_pose_interp(latency)
+                            input_pose_samples[2, :] = input_pose_interp(latency + matching_dt)
+                            error = np.sum(np.abs(input_pose_samples - pose_samples) * error_weights)
+                            errors.append(error)
+                            
+                        errors = np.array(errors)
+                        best_latency = np.arange(matching_dt, max_latency, latency_precision)[np.argmin(errors)]
+
+                        smoothened_input_poses = input_poses.copy()
+                        new_times = input_times - input_times[0] + t_now - best_latency
+                        
+                        for j in range(smoothened_input_poses.shape[0]):
+                            if new_times[j] < t_now:
+                                smoothened_input_poses[j] = pose_interp(new_times[j])
+                            elif t_now <= new_times[j] < t_now + smoothing_time:
+                                alpha = (new_times[j] - t_now) / smoothing_time
+                                smoothened_input_poses[j] = (1 - alpha) * pose_interp(new_times[j]) + alpha * input_poses[j]
+                            else:
+                                smoothened_input_poses[j] = input_poses[j]
+
+                        pose_interp = PoseTrajectoryInterpolator(times=new_times, poses=smoothened_input_poses)
+                        extended_gripper_pos = np.zeros_like(input_poses)
+                        extended_gripper_pos[:, 0] = input_gripper_pos
+                        gripper_pos_interp = PoseTrajectoryInterpolator(times=new_times, poses=extended_gripper_pos)
+                        
+                        if self.verbose:
+                            print(f"[Arx5ControllerDirect] latency: {best_latency:.3f}s, error: {errors.min():.3f}")
+                        self.waypoint_buffer = []
+
+                    elif cmd == Command.SET_GRAVITY_COMPENSATION.value:
+                        self.robot_client.set_gravity_compensation()
+                        print("[Arx5ControllerDirect] set_gravity_compensation -> True")
+                        
+                        # 设置重力补偿标志，停止下发 tcp_pose 命令
+                        is_gravity_compensation = True
+                        self.waypoint_buffer = []
+
+                    elif cmd == Command.SET_END_CONTROL.value:
+                        self.robot_client.set_end_control()
+                        print("[Arx5ControllerDirect] set_end_control -> True")
+                        is_gravity_compensation = False
+                        self.waypoint_buffer = []
+                        self.ring_buffer.clear()
+
+                        # 获取当前状态
+                        self.robot_client.get_state()
+                        state = {
+                            "ActualTCPPose": self.robot_client.tcp_pose,
+                            "ActualQ": self.robot_client.joint_pos,
+                            "ActualQd": self.robot_client.joint_vel,
+                            "gripper_position": self.robot_client.gripper_pos,
+                        }
+                        t_recv = time.time()
+                        state["robot_receive_timestamp"] = t_recv
+                        state["robot_timestamp"] = t_recv - self.receive_latency
+                        self.ring_buffer.put(state)
+
+                        self.robot_client.set_tcp_pose(state["ActualTCPPose"], state["gripper_position"])
+                    elif cmd == Command.SET_TO_DAMPING.value:
+                        self.robot_client.set_to_damping()
+                        print(f"[Arx5ControllerDirect] set_to_damping")
+                        self.waypoint_buffer = []
+
+                    else:
+                        keep_running = False
+                        print(f"[Arx5ControllerDirect] Unknown command {cmd}")
+                        break
+                        
+                # regulate frequency
+                t_wait_util = t_start + (iter_idx + 1) * dt
+                precise_wait(t_wait_util, time_func=time.monotonic)
+                
+                if iter_idx == 0:
+                    self.ready_event.set()
+                    if self.verbose:
+                        print("[Arx5ControllerDirect] Controller process is ready")
+                iter_idx += 1
+
+        finally:
+            print("[Arx5ControllerDirect] Setting robot to damping")
+            self.robot_client.set_to_damping()
+            del self.robot_client
+            self.ready_event.set()
+            if self.verbose:
+                print("[Arx5ControllerDirect] Controller process terminated")
