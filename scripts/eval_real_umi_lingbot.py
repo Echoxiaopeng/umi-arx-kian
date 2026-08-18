@@ -961,8 +961,8 @@ class LingBotVAClient:
 # 辅助
 # ===========================================================================
 
-# DEFAULT_GRIPPER_MAX_WIDTH = 0.085
-DEFAULT_GRIPPER_MAX_WIDTH = 0.05
+DEFAULT_GRIPPER_MAX_WIDTH = 0.085 # 改成这个他才正常工作
+# DEFAULT_GRIPPER_MAX_WIDTH = 0.05 # 改成这个他在刚开始的时候就会闭合夹爪。
 DEFAULT_TASK_PROMPT = (
     "pick up the electronic component and place it into the designated box"
 )
@@ -1145,7 +1145,7 @@ def _clear_key_events(key_counter, terminal_reader):
     default=DEFAULT_GRIPPER_MAX_WIDTH,
     help="夹爪最大开度（米）",
 )
-@click.option("--max_delta_pos", type=float, default=0.03, help="单步位置 delta 安全限位（米）")
+@click.option("--max_delta_pos", type=float, default=0.08, help="单步位置 delta 安全限位（米）")
 @click.option(
     "--max_delta_rot",
     type=float,
