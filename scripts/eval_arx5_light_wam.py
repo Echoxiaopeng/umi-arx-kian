@@ -1,4 +1,6 @@
 """
+python /data1/projects/umi-arx-kian/scripts/eval_arx5_light_wam.py   -o data_local/umi_eval_output   --policy_host 112.91.138.78   --policy_port 5566 --terminal_keys -eh 4 --no_binarize_gripper
+
 真实机器人 UMI 策略评估脚本（Light-WAM 适配版）。
 
 对齐数据集: data/umi_pick_elec_lerobot_real
@@ -7,6 +9,19 @@
 
 用法:
     # 1. 先启动 Light-WAM 推理服务（另一个终端）:
+
+conda activate lightwam
+cd /data1/projects/Light-wam
+export PYTHONPATH="$PWD/src:$PWD:${PYTHONPATH:-}"
+export DIFFSYNTH_MODEL_BASE_PATH="$PWD/checkpoints"
+CKPT=$PWD/runs/checkpoints/weights/step_006000.pt \
+ACTION_HORIZON=32 \
+BINARIZE_GRIPPER=false \
+ENABLE_REAL_GRIPPER_SNAP=false \
+REAL_GRIPPER_DIM_INDICES=9 \
+HOST=127.0.0.1 PORT=5566 \
+bash experiments/real_robot/serve_real_robot_policy.sh
+
     python experiments/real_robot/serve_real_robot_policy.py \
         --ckpt runs/lightwam_umi_pick_elec/.../checkpoints/weights/step_XXXXX.pt \
         --device cuda --port 5566 --protocol openpi \
@@ -14,9 +29,7 @@
         --real-gripper-dim-indices 9
 
     # 2. 再运行本脚本:
-    python experiments/real_robot/eval_arx5_light_wam.py \
-        -o data_local/umi_eval_output \
-        --policy_port 5566
+    python /data1/projects/umi-arx-kian/scripts/eval_arx5_light_wam.py -o data_local/umi_eval_output --policy_port 5566
 
 ================ Human in control ==============
 Robot movement:
@@ -42,13 +55,17 @@ Recording control:
        p_next = p_cur + R_cur @ a_pos
        R_next = R_cur @ R(a_rot6)
   4. rot6 约定: 旋转矩阵前两行展平 [r00,r01,r02, r10,r11,r12]
-  5. gripper: 绝对开度（可阈值）
-  6. 执行层仍用机器人绝对 TCP；发给模型的是 EE-relative state
+  5. gripper: 训练数据越大越夹紧，ZMQ 越大越张开；策略输出默认先反转
+  6. 训练/采集使用 link6，ZMQ 读写 eef_link：
+     eef_link → 沿 TCP Z 退回 0.145m 到 link6 → 积分相对 action
+     → 沿新姿态 TCP Z 前移 0.145m 到 eef_link → 下发绝对 TCP
 
 # ssh 远程运行方式：
 export DISPLAY=:1
 export XAUTHORITY=/run/user/1000/gdm/Xauthority
-python scripts/eval_arx5_light_wam.py --terminal_keys
+python /data1/projects/umi-arx-kian/scripts/eval_arx5_light_wam.py --terminal_keys
+
+
 """
 
 import sys
@@ -132,6 +149,8 @@ ACTION_DIM = 10
 STATE_DIM = 20
 GRIPPER_ACTION_INDEX = 9
 IDENTITY_ROT6 = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float64)
+# X5.urdf: eef_link = link6 + 0.145m along tool x = TCP Z after ee2tcp.
+X5_EEF_OFFSET_TCP_Z = 0.145
 # umi_pick_elec_lerobot_real dataset_stats.json → state.default.global_{min,max}[18:20]
 TRAIN_STATE_GRIP_MIN = 0.01154826
 TRAIN_STATE_GRIP_MAX = 0.0768357366
@@ -149,6 +168,65 @@ def _to_uint8_hwc(image: np.ndarray) -> np.ndarray:
     if float(np.nanmax(array)) <= 1.5:
         array = array * 255.0
     return np.ascontiguousarray(np.clip(array, 0, 255).round().astype(np.uint8))
+
+
+def _invert_gripper_width(
+    grip: np.ndarray,
+    *,
+    gripper_min_width: float,
+    gripper_max_width: float,
+) -> np.ndarray:
+    """训练数据极性（越大越夹紧）→ ZMQ 极性（越大越张开）。"""
+    return (
+        gripper_min_width
+        + gripper_max_width
+        - np.asarray(grip, dtype=np.float64)
+    )
+
+
+def _shift_tcp_along_z(
+    pos: np.ndarray,
+    rotvec: np.ndarray,
+    dz: float,
+) -> np.ndarray:
+    """p' = p + R_tcp @ [0, 0, dz]，姿态保持不变。"""
+    position = np.asarray(pos, dtype=np.float64).reshape(3)
+    if abs(float(dz)) < 1e-12:
+        return position.copy()
+    rotation = st.Rotation.from_rotvec(
+        np.asarray(rotvec, dtype=np.float64).reshape(3)
+    )
+    return position + rotation.apply(
+        np.array([0.0, 0.0, float(dz)], dtype=np.float64)
+    )
+
+
+def _x5_eef_to_link6(
+    pos: np.ndarray,
+    rotvec: np.ndarray,
+    dz: float,
+) -> np.ndarray:
+    """ZMQ X5 eef_link 位置 → 训练/采集使用的 link6 位置。"""
+    return _shift_tcp_along_z(pos, rotvec, -dz)
+
+
+def _link6_to_x5_eef(
+    pos: np.ndarray,
+    rotvec: np.ndarray,
+    dz: float,
+) -> np.ndarray:
+    """训练/采集使用的 link6 位置 → ZMQ X5 eef_link 位置。"""
+    return _shift_tcp_along_z(pos, rotvec, dz)
+
+
+def _abs_exec_link6_to_x5_eef(abs_exec: np.ndarray, dz: float) -> np.ndarray:
+    """将 (N,7) link6 绝对 waypoint 转成 eef_link waypoint。"""
+    out = np.asarray(abs_exec, dtype=np.float64).copy()
+    if abs(float(dz)) < 1e-12:
+        return out
+    for i in range(out.shape[0]):
+        out[i, :3] = _link6_to_x5_eef(out[i, :3], out[i, 3:6], dz)
+    return out
 
 
 def _read_tcp_pose(obs: dict) -> tuple[np.ndarray, np.ndarray, float]:
@@ -224,7 +302,11 @@ def _pose_relative_to(
     return pos_rel, rot6_rel
 
 
-def _build_umi_state(obs: dict) -> np.ndarray:
+def _build_umi_state(
+    obs: dict,
+    *,
+    eef_offset: float = 0.0,
+) -> np.ndarray:
     """
     构造 20 维 UMI state（与 umi_pick_elec_lerobot_real / 训练分布一致）:
         [pos_hist(3), pos_curr(3), rot_hist(6), rot_curr(6), grip_hist, grip_curr]
@@ -232,7 +314,7 @@ def _build_umi_state(obs: dict) -> np.ndarray:
     需要 robot_obs_horizon >= 2。位姿相对当前 EE：
         curr → 0 / I
         hist → T_cur^{-1} @ T_hist
-    夹爪为绝对开度。
+    夹爪为绝对开度。eef_offset>0 时先把 eef_link 退回 link6。
     """
     eef_pos = np.asarray(obs["robot0_eef_pos"], dtype=np.float64)
     if eef_pos.ndim != 2 or eef_pos.shape[0] < 2:
@@ -241,6 +323,8 @@ def _build_umi_state(obs: dict) -> np.ndarray:
         )
     pos_hist, rotvec_hist, grip_hist = _read_tcp_pose_at(obs, -2)
     pos_curr, rotvec_curr, grip_curr = _read_tcp_pose_at(obs, -1)
+    pos_hist = _x5_eef_to_link6(pos_hist, rotvec_hist, eef_offset)
+    pos_curr = _x5_eef_to_link6(pos_curr, rotvec_curr, eef_offset)
 
     pos_hist_rel, rot_hist_rel = _pose_relative_to(
         pos_hist, rotvec_hist, ref_pos=pos_curr, ref_rotvec=rotvec_curr
@@ -285,7 +369,8 @@ def _delta_chunk_to_absolute_pose(
     gripper_min_width: float,
     gripper_max_width: float,
     binarize_gripper: bool = True,
-    gripper_close_threshold: float = 0.06,
+    gripper_close_threshold: float = 0.055,
+    invert_gripper: bool = True,
 ) -> np.ndarray:
     """
     将模型输出（相对当前 EE 的逐步 SE(3)）积分为绝对 TCP，供 env.exec_actions。
@@ -293,7 +378,7 @@ def _delta_chunk_to_absolute_pose(
     每步 action ≈ T_t^{-1} @ T_{t+1}，链式复合:
         p <- p + R @ a_pos
         R <- R @ R_from_rot6(a_rot6)
-    夹爪为绝对开度，可选二值化后 clip。
+    夹爪为绝对开度；默认先从训练数据极性反转到 ZMQ 极性，再二值化。
     返回 (N, 7): [x,y,z, rx,ry,rz, grip]
     """
     deltas = np.asarray(action_chunk, dtype=np.float64)
@@ -305,6 +390,12 @@ def _delta_chunk_to_absolute_pose(
     r_cur = st.Rotation.from_rotvec(np.asarray(cur_rotvec, dtype=np.float64).reshape(3))
 
     abs_grip = deltas[:, GRIPPER_ACTION_INDEX].copy()
+    if invert_gripper:
+        abs_grip = _invert_gripper_width(
+            abs_grip,
+            gripper_min_width=gripper_min_width,
+            gripper_max_width=gripper_max_width,
+        )
     if binarize_gripper:
         abs_grip = np.where(abs_grip < gripper_close_threshold, gripper_min_width, gripper_max_width)
     abs_grip = np.clip(abs_grip, gripper_min_width, gripper_max_width)
@@ -604,11 +695,13 @@ def _print_policy_cycle_diag(
     obs_latency: float,
     exec_budget_s: float,
     wrist_img: np.ndarray,
+    model_cur_pos: np.ndarray,
     cur_pos: np.ndarray,
     cur_rotvec: np.ndarray,
     cur_grip: float,
     state_rel: np.ndarray,
     last_cmd_abs: np.ndarray | None,
+    last_model_state_pos: np.ndarray | None,
     last_state_pos: np.ndarray | None,
     last_state_rotvec: np.ndarray | None,
     last_state_grip: float | None,
@@ -618,6 +711,7 @@ def _print_policy_cycle_diag(
     prev_decode_step_world: np.ndarray | None,
     raw_action_chunk: np.ndarray,
     action_chunk: np.ndarray,
+    abs_model_exec: np.ndarray,
     abs_exec: np.ndarray,
     infer_s: float,
     n_exec: int,
@@ -652,8 +746,8 @@ def _print_policy_cycle_diag(
     cur_model_step_world = r_cur_diag.apply(cur_model_step_ee)
     cur_decode_step_world = r_cur_diag.apply(cur_decode_step_ee)
     actual_exec_world = None
-    if last_state_pos is not None:
-        actual_exec_world = cur_pos - last_state_pos
+    if last_model_state_pos is not None:
+        actual_exec_world = model_cur_pos - last_model_state_pos
 
     print("\n" + "=" * 72)
     print(
@@ -665,7 +759,8 @@ def _print_policy_cycle_diag(
 
     print(
         f"[DIAG][OBS] img={wrist_img.shape}/{wrist_img.dtype} mean={wrist_img.mean():.1f} "
-        f"abs_pos={_fmt_vec3(cur_pos, unit='m')} "
+        f"eef_pos={_fmt_vec3(cur_pos, unit='m')} "
+        f"link6_pos={_fmt_vec3(model_cur_pos, unit='m')} "
         f"abs_rotvec={_fmt_vec3(cur_rotvec, unit='rad')} "
         f"grip={cur_grip:.4f}m"
     )
@@ -757,9 +852,9 @@ def _print_policy_cycle_diag(
         )
     print(f"[DIAG][MODEL][raw_exec]\n{raw_exec}")
 
-    # decode 自检：abs[0] 反推 delta 应与 clipped raw[0] 一致
+    # decode 自检必须在训练使用的 link6 坐标点上进行。
     implied_delta = _absolute_pose_to_delta_step(
-        abs_exec[0], cur_pos=cur_pos, cur_rotvec=cur_rotvec
+        abs_model_exec[0], cur_pos=model_cur_pos, cur_rotvec=cur_rotvec
     )
     decode_pos_err_mm = float(np.linalg.norm(implied_delta[:3] - clipped_exec[0, :3]) * 1000.0)
     decode_rot_err_deg = _rot_angle_deg(
@@ -782,7 +877,9 @@ def _print_policy_cycle_diag(
     )
     if n_exec > 1:
         step1_implied = _absolute_pose_to_delta_step(
-            abs_exec[1], cur_pos=abs_exec[0, :3], cur_rotvec=abs_exec[0, 3:6]
+            abs_model_exec[1],
+            cur_pos=abs_model_exec[0, :3],
+            cur_rotvec=abs_model_exec[0, 3:6],
         )
         print(
             f"[DIAG][DECODE] step1 delta pos={_fmt_vec3(clipped_exec[1, :3], unit='m')} "
@@ -792,7 +889,8 @@ def _print_policy_cycle_diag(
             f"[DIAG][DECODE] step1 roundtrip pos_err="
             f"{np.linalg.norm(step1_implied[:3]-clipped_exec[1,:3])*1000:.4f}mm"
         )
-    print(f"[DIAG][DECODE][abs_exec]\n{abs_exec}")
+    print(f"[DIAG][DECODE][abs_link6]\n{abs_model_exec}")
+    print(f"[DIAG][DECODE][abs_eef_exec]\n{abs_exec}")
 
     print(
         f"[DIAG][SCHED] submit={sched['n_exec']} keep={sched['n_keep']} drop={sched['n_drop']} "
@@ -1042,8 +1140,8 @@ def _clear_key_events(key_counter, terminal_reader):
 @click.option("--policy_request_timeout", default=5.0, type=float, show_default=True,
               help="单次推理请求的超时（秒）")
 @click.option("--task_prompt", default=DEFAULT_TASK_PROMPT, help="任务描述")
-@click.option("--steps_per_inference", "-si", default=8, type=int, help="每次推理的动作步数")
-@click.option("--exec_horizon", "-eh", default=4, type=int, show_default=True,
+@click.option("--steps_per_inference", "-si", default=12, type=int, help="每次推理的动作步数")
+@click.option("--exec_horizon", "-eh", default=12, type=int, show_default=True,
               help="每次实际执行的帧数（≤ steps_per_inference）")
 @click.option("--max_duration", "-md", default=2000000, help="每 episode 最大时长（秒）")
 @click.option("--frequency", "-f", default=20, type=float,
@@ -1064,6 +1162,12 @@ def _clear_key_events(key_counter, terminal_reader):
 @click.option("--max_delta_rot", type=float, default=0.3, help="单步相对旋转 delta 安全限位（弧度）")
 @click.option("--no_binarize_gripper", is_flag=True, default=False,
               help="不对积分后的夹爪做开/关二值化")
+@click.option(
+    "--no_invert_gripper",
+    is_flag=True,
+    default=False,
+    help="不把策略夹爪从训练数据极性（越大越夹紧）翻到 ZMQ 极性（越大越张开）",
+)
 @click.option(
     "--clip_state_grip/--no_clip_state_grip",
     default=True,
@@ -1091,6 +1195,13 @@ def _clear_key_events(key_counter, terminal_reader):
     default=None,
     help="调试用：跳过模型，使用固定 10 维 EE-relative action，格式 pos×3,rot6×6,grip",
 )
+@click.option(
+    "--eef_offset",
+    type=float,
+    default=X5_EEF_OFFSET_TCP_Z,
+    show_default=True,
+    help="训练数据是 link6、ZMQ 控制点是 eef_link；沿 TCP Z 的位置偏移。设为 0 可关闭。",
+)
 def main(
     output,
     policy_host,
@@ -1114,11 +1225,13 @@ def main(
     max_delta_pos,
     max_delta_rot,
     no_binarize_gripper,
+    no_invert_gripper,
     clip_state_grip,
     train_state_grip_min,
     train_state_grip_max,
     terminal_keys,
     debug_fixed_delta,
+    eef_offset,
 ):
     # -------------------------------------------------------------------------
     # 1. 基础设置
@@ -1146,6 +1259,8 @@ def main(
         raise click.BadParameter("--frequency must be > 0")
     if policy_connect_timeout <= 0 or policy_request_timeout <= 0:
         raise click.BadParameter("--policy timeouts must be > 0")
+    eef_offset = float(eef_offset)
+    invert_gripper = not no_invert_gripper
 
     fixed_delta_vec = None
     if debug_fixed_delta is not None:
@@ -1177,6 +1292,21 @@ def main(
     )
     print(f"Light-WAM policy service: ws://{policy_host}:{policy_port}")
     print(f"Task prompt: {task_prompt}")
+    if abs(eef_offset) > 1e-12:
+        print(
+            "[ALIGN] link6↔eef_link enabled "
+            f"(offset={eef_offset:.3f}m along TCP Z; rotation unchanged)"
+        )
+    else:
+        print("[ALIGN] eef_offset=0: link6↔eef_link conversion disabled")
+    print(
+        "[ALIGN] gripper polarity: "
+        + (
+            "training (larger=close) → ZMQ (larger=open)"
+            if invert_gripper
+            else "no inversion"
+        )
+    )
     print(
         "[CHANGE] UMI decode: EE-frame SE(3) chain (p+=R@a_pos, R=R@Rd) + abs gripper; "
         f"state={STATE_DIM}d hist/curr relative-to-current EE; "
@@ -1302,7 +1432,7 @@ def main(
             obs = env.get_obs()
             # uint8 图像 + 20d EE-relative state（pos_curr≈0, rot_curr≈I）
             wrist_img = _to_uint8_hwc(obs["camera0_rgb"][-1])
-            state_raw = _build_umi_state(obs)
+            state_raw = _build_umi_state(obs, eef_offset=eef_offset)
             state, state_grip_clipped = _clip_umi_state_for_model(
                 state_raw,
                 grip_min=train_state_grip_min,
@@ -1320,8 +1450,11 @@ def main(
                     f"{state_raw[18:20]} -> {state[18:20]}"
                 )
 
-            raw_action = client.infer(wrist_img, state, task_prompt)
-            print(f"  Warmup inference done. action_chunk shape: {raw_action.shape}")
+            if fixed_delta_vec is None:
+                raw_action = client.infer(wrist_img, state, task_prompt)
+                print(f"  Warmup inference done. action_chunk shape: {raw_action.shape}")
+            else:
+                print("  Fixed-delta debug mode: policy connection and warmup inference skipped.")
             print("Ready!")
 
             # =================================================================
@@ -1470,6 +1603,7 @@ def main(
                     iter_idx = 0
                     cycle_idx = 0
                     last_cmd_abs = None
+                    last_model_state_pos = None
                     last_state_pos = None
                     last_state_rotvec = None
                     last_state_grip = None
@@ -1490,7 +1624,7 @@ def main(
                         s = time.time()
                         wrist_img = _to_uint8_hwc(obs["camera0_rgb"][-1])
                         # 发给模型：20d EE-relative hist/curr state
-                        state_raw = _build_umi_state(obs)
+                        state_raw = _build_umi_state(obs, eef_offset=eef_offset)
                         state, state_grip_clipped = _clip_umi_state_for_model(
                             state_raw,
                             grip_min=train_state_grip_min,
@@ -1502,8 +1636,13 @@ def main(
                                 f"[STATE] clipped grip for model upload: "
                                 f"{state_raw[18:20]} -> {state[18:20]}"
                             )
-                        # 执行层：机器人绝对 TCP
-                        cur_pos, cur_rotvec, cur_grip = _read_tcp_pose(obs)
+                        # ZMQ 观测/执行使用 eef_link；模型相对动作在训练的 link6 上展开。
+                        cur_pos_robot, cur_rotvec, cur_grip = _read_tcp_pose(obs)
+                        cur_pos_link6 = _x5_eef_to_link6(
+                            cur_pos_robot,
+                            cur_rotvec,
+                            eef_offset,
+                        )
 
                         episode_id = env.replay_buffer.n_episodes
 
@@ -1533,14 +1672,16 @@ def main(
                             max_delta_rot=max_delta_rot,
                         )
 
-                        abs_exec = _delta_chunk_to_absolute_pose(
+                        abs_link6 = _delta_chunk_to_absolute_pose(
                             action_chunk[:exec_horizon],
-                            cur_pos=cur_pos,
+                            cur_pos=cur_pos_link6,
                             cur_rotvec=cur_rotvec,
                             gripper_min_width=gripper_min_width,
                             gripper_max_width=max_gripper_width,
                             binarize_gripper=not no_binarize_gripper,
+                            invert_gripper=invert_gripper,
                         )
+                        abs_exec = _abs_exec_link6_to_x5_eef(abs_link6, eef_offset)
 
                         command_start_time = time.time() + 0.05
                         action_timestamps = (
@@ -1556,11 +1697,13 @@ def main(
                             obs_latency=obs_latency,
                             exec_budget_s=exec_budget_s,
                             wrist_img=wrist_img,
-                            cur_pos=cur_pos,
+                            model_cur_pos=cur_pos_link6,
+                            cur_pos=cur_pos_robot,
                             cur_rotvec=cur_rotvec,
                             cur_grip=cur_grip,
                             state_rel=state,
                             last_cmd_abs=last_cmd_abs,
+                            last_model_state_pos=last_model_state_pos,
                             last_state_pos=last_state_pos,
                             last_state_rotvec=last_state_rotvec,
                             last_state_grip=last_state_grip,
@@ -1570,6 +1713,7 @@ def main(
                             prev_decode_step_world=prev_decode_step_world,
                             raw_action_chunk=raw_action_chunk,
                             action_chunk=action_chunk,
+                            abs_model_exec=abs_link6,
                             abs_exec=abs_exec,
                             infer_s=infer_s,
                             n_exec=exec_horizon,
@@ -1586,12 +1730,14 @@ def main(
                         )
 
                         if sched["n_keep"] > 0:
-                            last_cmd_abs = abs_exec[sched["n_keep"] - 1].copy()
+                            # 过期 waypoint 只会出现在前部；有效尾部的末命令始终是 -1。
+                            last_cmd_abs = abs_exec[-1].copy()
                         else:
                             last_cmd_abs = np.concatenate(
-                                [cur_pos, cur_rotvec, [cur_grip]]
+                                [cur_pos_robot, cur_rotvec, [cur_grip]]
                             ).astype(np.float64)
-                        last_state_pos = cur_pos.copy()
+                        last_model_state_pos = cur_pos_link6.copy()
+                        last_state_pos = cur_pos_robot.copy()
                         last_state_rotvec = cur_rotvec.copy()
                         last_state_grip = cur_grip
 

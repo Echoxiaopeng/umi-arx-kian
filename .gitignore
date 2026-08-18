@@ -7,3 +7,7 @@ data
 .cursor
 .idea
 .vscode
+collect_demo/
+lingbot_umi_output/
+light_wam_output/
+data_local/

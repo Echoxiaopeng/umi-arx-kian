@@ -1,6 +1,6 @@
 """
 ARX5 拖拽采数脚本（重力补偿 / 零力拖拽）。
-
+数据131可能有问题
 注：已经验证
 不需要起SDK服务，采集到的是x5.urdf（/data1/projects/umi-arx-hzl/modules/arx_x5_python/bimanual/script/x5.urdf）
 上面的 link6 的位姿。(X5.urdf / X5_umi.urdf才有eef_link)
@@ -37,7 +37,8 @@ python python/communication/zmq_server_ac_one.py X5 can3 --gripper-open-readout 
   P = 进入零力模式（重力补偿，可拖拽）
   C = 开始采集（须先按 P）
   S = 停止并保存
-  D = 丢弃当前 episode
+  D = 丢弃当前正在录的 episode（未保存）
+  E = 删除已保存的指定 episode（空闲时；输入编号后 Y 确认）
   Q = 退出
 
 不做 reset_to_home / init_delta 作为 episode 起始；按 C 时臂在哪就从哪开录。
@@ -168,7 +169,7 @@ class TerminalKeyReader:
         tty.setcbreak(self._fd)
         print(
             "[terminal_keys] 在本终端按键: "
-            "p=零力, c=开始, s=保存, d=丢弃, q=退出"
+            "p=零力, c=开始, s=保存, d=丢弃当前, e=删已保存, q=退出"
         )
         return self
 
@@ -203,8 +204,22 @@ class TerminalKeyReader:
             return KeyCode(char="q")
         if ch in ("s", "S"):
             return KeyCode(char="s")
-        if ch in ("d", "D", "\x7f", "\b"):
+        if ch in ("d", "D"):
             return KeyCode(char="d")
+        if ch in ("e", "E"):
+            return KeyCode(char="e")
+        if ch in ("y", "Y"):
+            return KeyCode(char="y")
+        if ch in ("n", "N"):
+            return KeyCode(char="n")
+        if ch in "0123456789":
+            return KeyCode(char=ch)
+        if ch in ("\n", "\r"):
+            return Key.enter
+        if ch == "\x1b":
+            return Key.esc
+        if ch in ("\x7f", "\b"):
+            return Key.backspace
         return None
 
 
@@ -305,6 +320,45 @@ def check_episode_alignment(env: Arx5EnvWithImages) -> None:
         )
 
 
+def delete_saved_episode(env: Arx5EnvWithImages, episode_id: int) -> bool:
+    """删除已写入 zarr 的指定 episode，并重编号后续 videos/{id} 以保持连续。"""
+    n_episodes = env.replay_buffer.n_episodes
+    if n_episodes <= 0:
+        print("No saved episode to delete.")
+        return False
+    if episode_id < 0 or episode_id >= n_episodes:
+        print(
+            f"Episode {episode_id} does not exist "
+            f"(valid: 0..{n_episodes - 1})."
+        )
+        return False
+
+    env.replay_buffer.delete_episode(episode_id)
+
+    video_dir = env.video_dir.joinpath(str(episode_id))
+    if video_dir.exists():
+        shutil.rmtree(str(video_dir))
+
+    for src_id in range(episode_id + 1, n_episodes):
+        src = env.video_dir.joinpath(str(src_id))
+        dst = env.video_dir.joinpath(str(src_id - 1))
+        if not src.exists():
+            continue
+        if dst.exists():
+            shutil.rmtree(str(dst))
+        src.rename(dst)
+
+    remaining = env.replay_buffer.n_episodes
+    print(f"Deleted saved episode {episode_id}. Remaining: {remaining}.")
+    if episode_id < n_episodes - 1:
+        print(
+            f"Renumbered videos {episode_id + 1}..{n_episodes - 1} "
+            f"-> {episode_id}..{n_episodes - 2}."
+        )
+    check_episode_alignment(env)
+    return True
+
+
 def save_episode(env: Arx5EnvWithImages, episode_id: int) -> bool:
     """保存并验证 zarr/video 同时成功；任一侧失败则不保留该 episode。"""
     if env.replay_buffer.n_episodes != episode_id:
@@ -375,6 +429,7 @@ def make_vis_image(
     *,
     drag_ready: bool = False,
     recording: bool = False,
+    delete_prompt: str | None = None,
 ) -> np.ndarray:
     cam_keys = sorted(k for k in obs if k.startswith("camera") and k.endswith("_rgb"))
     if not cam_keys:
@@ -392,12 +447,15 @@ def make_vis_image(
     if recording:
         status = "REC"
         help_text = "S save | D drop | Q quit"
+    elif delete_prompt:
+        status = "DEL"
+        help_text = delete_prompt
     elif drag_ready:
         status = "DRAG"
-        help_text = "C start | Q quit"
+        help_text = "C start | E del ep | Q quit"
     else:
         status = "IDLE"
-        help_text = "P zero-force | Q quit"
+        help_text = "P zero-force | E del ep | Q quit"
     text = f"{status} Ep:{episode_id}  t={t_elapsed:.1f}s  steps={n_steps}"
     cv2.putText(vis, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
     cv2.putText(
@@ -420,6 +478,20 @@ def drain_keys(key_source) -> list:
 
 def is_drop_key(key_stroke) -> bool:
     return key_stroke in (Key.backspace, KeyCode(char="d"))
+
+
+def key_char(key_stroke) -> str | None:
+    char = getattr(key_stroke, "char", None)
+    if isinstance(char, str) and len(char) == 1:
+        return char.lower()
+    return None
+
+
+def parse_episode_id(text: str) -> int | None:
+    stripped = text.strip()
+    if not stripped.isdigit():
+        return None
+    return int(stripped)
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +568,7 @@ def main(
     print(f"  n_robots   : {n_robots}")
     print(f"  save_images: {save_images}")
     print("  startup: reset_to_home once; episode: no init move")
-    print("  P=zero-force  C=start  S=save  D=drop  Q=quit")
+    print("  P=zero-force  C=start  S=save  D=drop-current  E=del-saved  Q=quit")
     print("=" * 60)
 
     key_ctx = (
@@ -535,6 +607,9 @@ def main(
 
             leave_drag_mode(env)
             drag_ready = False
+            delete_mode = None  # None | "input" | "confirm"
+            delete_buf = ""
+            delete_target = None
 
             while True:
                 # ---------- idle: P -> zero-force, then C -> start ----------
@@ -545,6 +620,50 @@ def main(
                             print("Quit.")
                             leave_drag_mode(env)
                             return
+
+                        if delete_mode == "confirm":
+                            ch = key_char(key_stroke)
+                            if ch == "y":
+                                delete_saved_episode(env, delete_target)
+                                delete_mode = None
+                                delete_buf = ""
+                                delete_target = None
+                            elif ch == "n" or key_stroke == Key.esc:
+                                print("Delete cancelled.")
+                                delete_mode = None
+                                delete_buf = ""
+                                delete_target = None
+                            continue
+
+                        if delete_mode == "input":
+                            ch = key_char(key_stroke)
+                            if key_stroke == Key.esc:
+                                print("Delete cancelled.")
+                                delete_mode = None
+                                delete_buf = ""
+                            elif key_stroke == Key.backspace:
+                                delete_buf = delete_buf[:-1]
+                            elif ch is not None and ch.isdigit():
+                                delete_buf += ch
+                            elif key_stroke == Key.enter:
+                                n_saved = env.replay_buffer.n_episodes
+                                episode_id = parse_episode_id(delete_buf)
+                                if episode_id is None:
+                                    print("Type an episode ID first (digits).")
+                                elif episode_id < 0 or episode_id >= n_saved:
+                                    print(
+                                        f"Episode {episode_id} does not exist "
+                                        f"(valid: 0..{n_saved - 1})."
+                                    )
+                                else:
+                                    delete_target = episode_id
+                                    delete_mode = "confirm"
+                                    print(
+                                        f"Confirm delete saved episode {episode_id}? "
+                                        "Y=yes  N=no"
+                                    )
+                            continue
+
                         if key_stroke == KeyCode(char="p"):
                             if not drag_ready:
                                 env.set_gravity_compensation()
@@ -560,19 +679,43 @@ def main(
                         if key_stroke == KeyCode(char="s"):
                             print("Not recording — nothing to save.")
                         if is_drop_key(key_stroke):
-                            print("No active episode to drop.")
+                            print("No active episode to drop. Press E to delete a saved one.")
+                        if key_stroke == KeyCode(char="e"):
+                            n_saved = env.replay_buffer.n_episodes
+                            if n_saved <= 0:
+                                print("No saved episode to delete.")
+                            else:
+                                delete_mode = "input"
+                                delete_buf = ""
+                                delete_target = None
+                                print(
+                                    f"Delete saved episode: type ID (0..{n_saved - 1}), "
+                                    "Enter to confirm, Esc to cancel."
+                                )
                     if start_episode:
                         break
 
                     try:
                         obs = env.get_obs()
+                        n_saved = env.replay_buffer.n_episodes
+                        delete_prompt = None
+                        if delete_mode == "input":
+                            delete_prompt = (
+                                f"ID:{delete_buf or '_'}  (0..{max(n_saved - 1, 0)}) "
+                                "Enter=ok Esc=cancel"
+                            )
+                        elif delete_mode == "confirm":
+                            delete_prompt = (
+                                f"Delete Ep {delete_target}?  Y=yes N=no"
+                            )
                         vis = make_vis_image(
                             obs,
-                            env.replay_buffer.n_episodes,
+                            n_saved,
                             0.0,
                             0,
                             drag_ready=drag_ready,
                             recording=False,
+                            delete_prompt=delete_prompt,
                         )
                         cv2.imshow("drag_collect", vis[..., ::-1])
                         cv2.pollKey()
@@ -608,6 +751,8 @@ def main(
                                 stop_save = True
                             elif is_drop_key(key_stroke):
                                 stop_drop = True
+                            elif key_stroke == KeyCode(char="e"):
+                                print("Still recording — save/drop first, then press E.")
                             elif key_stroke == KeyCode(char="q"):
                                 print("Quit requested — abort current episode.")
                                 abort_episode(env)
@@ -642,7 +787,8 @@ def main(
                             if save_episode(env, episode_id):
                                 print(
                                     f"Episode {episode_id} saved "
-                                    f"({n_steps} loop steps @ {frequency} Hz)."
+                                    f"({n_steps} loop steps @ {frequency} Hz). "
+                                    "Press E to delete a saved episode."
                                 )
                             # 保存后仍保持零力，可直接再按 C 录下一条
                             break
@@ -657,9 +803,15 @@ def main(
                     drag_ready = False
 
                 if drag_ready:
-                    print("Ready for next episode. Press C to start (or Q to quit).\n")
+                    print(
+                        "Ready for next episode. Press C to start, "
+                        "E to delete a saved episode, or Q to quit.\n"
+                    )
                 else:
-                    print("Ready. Press P for zero-force, then C to start.\n")
+                    print(
+                        "Ready. Press P for zero-force, "
+                        "E to delete a saved episode, or C to start.\n"
+                    )
 
 
 if __name__ == "__main__":

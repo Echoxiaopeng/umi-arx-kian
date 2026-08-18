@@ -39,18 +39,16 @@ p_eef = p_link6 + R_tcp @ [0, 0, 0.145]
     # 1. GPU 机启动 server（务必加载微调权重，例如 step400 评测包）:
     #    在 wan_va/configs/va_umi_cfg.py 将
     #    wan22_pretrained_model_name_or_path 指到 checkpoints/lingbot-va-umi-step400
-    conda activate lingbot
+    conda activate Lingbot
     cd /path/to/lingbot-va
-    CUDA_VISIBLE_DEVICES=0 NGPU=1 CONFIG_NAME=umi \\
-      bash script/run_launch_va_server_sync.sh
+    CUDA_VISIBLE_DEVICES=0 NGPU=1 CONFIG_NAME=umi bash script/run_launch_va_server_sync.sh
     # 默认 host=0.0.0.0 port=29536
 
     # 可选隧道: ssh -L 5566:127.0.0.1:5566 kian@
 
     # 2. 本机（机械臂 / 相机 / SpaceMouse）:
-    python scripts/eval_real_umi_lingbot.py 
-        --umi_project_root /data1/projects/umi-arx-hzl 
-        --policy_port 5566
+    conda activate umi-arx-kian
+    python scripts/eval_real_umi_lingbot.py --policy_port 5566
         
 
 键盘:
@@ -270,8 +268,8 @@ def _invert_gripper_width(
 
 
 # X5.urdf: eef_link = link6 + 0.145 m along tool x = TCP Z after ee2tcp.
+# X5_EEF_OFFSET_TCP_Z = 0.11
 X5_EEF_OFFSET_TCP_Z = 0.145
-
 
 def _matrix_to_rotation_6d(matrix: np.ndarray) -> np.ndarray:
     """旋转矩阵 → 6D（前两行展平）。"""
@@ -963,7 +961,8 @@ class LingBotVAClient:
 # 辅助
 # ===========================================================================
 
-DEFAULT_GRIPPER_MAX_WIDTH = 0.085
+# DEFAULT_GRIPPER_MAX_WIDTH = 0.085
+DEFAULT_GRIPPER_MAX_WIDTH = 0.05
 DEFAULT_TASK_PROMPT = (
     "pick up the electronic component and place it into the designated box"
 )
