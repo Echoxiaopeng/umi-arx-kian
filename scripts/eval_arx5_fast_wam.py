@@ -3,14 +3,14 @@
 真实机器人 UMI 策略评估脚本（Fast-WAM 适配版）。
 
 对齐数据集: data/umi_pick_elec_lerobot_real
-通过 WebSocket 连接 Light-WAM 推理服务（serve_real_robot_policy.py），
+通过 WebSocket 连接 Fast-WAM 推理服务（serve_real_robot_policy.py），
 不需要在本脚本内加载模型权重。
 
 用法:
-    # 1. 先启动 Light-WAM 推理服务（另一个终端）:
+# 1. 先启动 Fast-WAM 推理服务（另一个终端）:
 
 
-    # 2. 再运行本脚本:
+# 2. 再运行本脚本:
 python /data1/projects/umi-arx-kian/scripts/eval_arx5_fast_wam.py   -o data_local/umi_eval_output   --policy_host 112.91.138.78   --policy_port 5566 --terminal_keys -eh 4 --no_binarize_gripper
 
 
@@ -33,14 +33,22 @@ Recording control:
   2. state (20): flatten(eef_pos[2,3], eef_rot[2,6], gripper[2,1])
      相对当前 EE（UMI get_real_umi_obs_dict）:
        [pos_hist(3), pos_curr(3≈0), rot_hist(6), rot_curr(6≈I), grip_hist, grip_curr]
+     夹爪 state[18:20] 使用训练集极性（越大越夹紧），由 _build_umi_state 从 ZMQ 读数转换
   3. action (10): 相对当前 EE 的下一步目标 [pos(3), rot6d(6), gripper]
      SE(3): T_next = T_cur @ T_action
        p_next = p_cur + R_cur @ a_pos
        R_next = R_cur @ R(a_rot6)
+     模型输出的 action[...,9] 同样是训练集极性；下发前 invert 回 ZMQ 物理开口
   4. rot6 约定: 旋转矩阵前两行展平 [r00,r01,r02, r10,r11,r12]
-  5. gripper: 训练数据越大越夹紧，ZMQ 越大越张开；策略输出默认先反转
+  5. 夹爪极性（采集 zarr / 训练集 vs 真机 ZMQ）:
+       - 训练/采集 robot0_gripper_width: 电机行程映射值，越大越夹紧（张开≈0.03，夹紧≈0.07）
+       - 真机 ZMQ gripper_position: 物理开口宽度（米），越大越张开（min≈闭合，max≈全开）
+       - 线性互转: g' = gripper_min + gripper_max - g（对称，可逆）
+       - state 上传: ZMQ → 训练；action 下发: 训练 → ZMQ
+       - --no_invert_gripper 同时关闭 state/action 两侧转换
+       - 人工 SpaceMouse / init_gripper_delta 始终操作 ZMQ 物理开口，不 invert
   6. 训练/采集使用 link6，ZMQ 读写 eef_link：
-     eef_link → 沿 TCP Z 退回 0.145m 到 link6 → 积分相对 action
+     eef_link → 沿 TCP Z 退回 0.145m 到 link6 → 在 link6 上构造 state / 积分 action
      → 沿新姿态 TCP Z 前移 0.145m 到 eef_link → 下发绝对 TCP
 
 # ssh 远程运行方式：
@@ -129,7 +137,9 @@ def _msgpack_decode(obj):
 #   - 复合: T_next = T_cur @ T_action
 #           p_next = p_cur + R_cur @ a_pos
 #           R_next = R_cur @ R_from_rot6(a_rot6)
-#   - 夹爪: 绝对开度（米）
+#   - 夹爪: 训练集绝对值，越大越夹紧（与 zarr robot0_gripper_width 同语义）
+#           真机 ZMQ 为物理开口（越大越张开）；state/action 经 _invert_gripper_width 互转
+#           人工遥操与 init 仍用 ZMQ 物理开口，不经 invert
 # ===========================================================================
 
 ACTION_DIM = 10
@@ -139,8 +149,11 @@ IDENTITY_ROT6 = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float64)
 # X5.urdf: eef_link = link6 + 0.145m along tool x = TCP Z after ee2tcp.
 X5_EEF_OFFSET_TCP_Z = 0.145
 # umi_pick_elec_lerobot_real dataset_stats.json → state.default.global_{min,max}[18:20]
+# 统计量在训练集极性下：min≈张开，max≈夹紧
 TRAIN_STATE_GRIP_MIN = 0.01154826
 TRAIN_STATE_GRIP_MAX = 0.0768357366
+# ZMQ 物理开口参考上界（用于 invert 与 exec_actions clip，非训练统计）
+DEFAULT_GRIPPER_MAX_WIDTH = 0.085
 
 
 def _to_uint8_hwc(image: np.ndarray) -> np.ndarray:
@@ -163,7 +176,11 @@ def _invert_gripper_width(
     gripper_min_width: float,
     gripper_max_width: float,
 ) -> np.ndarray:
-    """训练数据极性（越大越夹紧）→ ZMQ 极性（越大越张开）。"""
+    """训练集极性（越大越夹紧）↔ ZMQ 物理开口（越大越张开）。
+
+    线性对翻: g' = gripper_min + gripper_max - g，在 [min, max] 内自逆。
+    例: min=0.011, max=0.085 时，ZMQ 全开 0.085 → 训练 ≈0.011；ZMQ 闭合 0.011 → 训练 ≈0.085。
+    """
     return (
         gripper_min_width
         + gripper_max_width
@@ -217,7 +234,7 @@ def _abs_exec_link6_to_x5_eef(abs_exec: np.ndarray, dz: float) -> np.ndarray:
 
 
 def _read_tcp_pose(obs: dict) -> tuple[np.ndarray, np.ndarray, float]:
-    """读机器人当前绝对 TCP：pos(3), rotvec(3), gripper_width。"""
+    """读机器人当前绝对 TCP：pos(3), rotvec(3), gripper（ZMQ 物理开口，未 invert）。"""
     pos = np.asarray(obs["robot0_eef_pos"][-1], dtype=np.float64).reshape(3)
     rotvec = np.asarray(obs["robot0_eef_rot_axis_angle"][-1], dtype=np.float64).reshape(3)
     grip = float(np.asarray(obs["robot0_gripper_width"][-1]).squeeze())
@@ -228,8 +245,9 @@ def _read_live_tcp_pose(env) -> tuple[np.ndarray, np.ndarray, float, float]:
     """
     直接从机器人 ring buffer 读最新绝对 TCP（不走相机对齐，开销远低于 get_obs）。
 
-    返回 (pos(3), rotvec(3), gripper_width, robot_timestamp)。
-    与 get_obs 的 robot0_eef_* 同源：两者都出自 ActualTCPPose。
+    位姿与 get_obs["robot0_eef_*"] 同源（ActualTCPPose）。
+    返回 (pos(3), rotvec(3), gripper, robot_timestamp)；
+    gripper 为 ZMQ 物理开口（越大越张开，未 invert）。
     """
     states = env.get_robot_state()
     state = states[0] if isinstance(states, (list, tuple)) else states
@@ -240,7 +258,7 @@ def _read_live_tcp_pose(env) -> tuple[np.ndarray, np.ndarray, float, float]:
 
 
 def _read_tcp_pose_at(obs: dict, index: int) -> tuple[np.ndarray, np.ndarray, float]:
-    """读 obs horizon 中指定 index 的绝对 TCP。"""
+    """读 obs horizon 中指定 index 的绝对 TCP 与 ZMQ 夹爪（物理开口，未 invert）。"""
     pos = np.asarray(obs["robot0_eef_pos"][index], dtype=np.float64).reshape(3)
     rotvec = np.asarray(obs["robot0_eef_rot_axis_angle"][index], dtype=np.float64).reshape(3)
     grip = float(np.asarray(obs["robot0_gripper_width"][index]).squeeze())
@@ -308,15 +326,25 @@ def _build_umi_state(
     obs: dict,
     *,
     eef_offset: float = 0.0,
+    invert_gripper: bool = True,
+    gripper_min_width: float = 0.011,
+    gripper_max_width: float = DEFAULT_GRIPPER_MAX_WIDTH,
 ) -> np.ndarray:
     """
     构造 20 维 UMI state（与 umi_pick_elec_lerobot_real / 训练分布一致）:
         [pos_hist(3), pos_curr(3), rot_hist(6), rot_curr(6), grip_hist, grip_curr]
 
-    需要 robot_obs_horizon >= 2。位姿相对当前 EE：
-        curr → 0 / I
+    需要 robot_obs_horizon >= 2。
+
+    位姿（link6 坐标系，相对当前 EE）:
+        eef_offset>0 时先把 ZMQ eef_link 沿 TCP Z 退回 link6
+        curr → pos=0, rot=I
         hist → T_cur^{-1} @ T_hist
-    夹爪为绝对开度。eef_offset>0 时先把 eef_link 退回 link6。
+
+    夹爪:
+        训练集为绝对值、越大越夹紧（与 convert_replay_buffer_to_lerobot_rel 一致）
+        默认 invert_gripper=True：把 ZMQ 物理开口转为训练极性后再写入 state[18:20]
+        后续 _clip_umi_state_for_model 在训练极性下 clip 到 TRAIN_STATE_GRIP_* 范围
     """
     eef_pos = np.asarray(obs["robot0_eef_pos"], dtype=np.float64)
     if eef_pos.ndim != 2 or eef_pos.shape[0] < 2:
@@ -335,13 +363,22 @@ def _build_umi_state(
     pos_curr_rel = np.zeros(3, dtype=np.float64)
     rot_curr_rel = IDENTITY_ROT6.copy()
 
+    # ZMQ 物理开口 → 训练集极性（与 action 侧 invert 对称）
+    grip_pair = np.array([grip_hist, grip_curr], dtype=np.float64)
+    if invert_gripper:
+        grip_pair = _invert_gripper_width(
+            grip_pair,
+            gripper_min_width=gripper_min_width,
+            gripper_max_width=gripper_max_width,
+        )
+
     return np.concatenate(
         [
             pos_hist_rel,
             pos_curr_rel,
             rot_hist_rel,
             rot_curr_rel,
-            [grip_hist, grip_curr],
+            grip_pair,
         ]
     ).astype(np.float32)
 
@@ -353,7 +390,7 @@ def _clip_umi_state_for_model(
     grip_max: float = TRAIN_STATE_GRIP_MAX,
     clip_grip: bool = True,
 ) -> tuple[np.ndarray, bool]:
-    """上传前将 state gripper 维 clip 到训练分布，避免真机开度 OOD。"""
+    """上传前将 state[18:20] clip 到训练集 gripper 统计范围（训练极性，越大越夹紧）。"""
     state = np.asarray(state, dtype=np.float32).reshape(-1).copy()
     if not clip_grip:
         return state, False
@@ -380,8 +417,13 @@ def _delta_chunk_to_absolute_pose(
     每步 action ≈ T_t^{-1} @ T_{t+1}，链式复合:
         p <- p + R @ a_pos
         R <- R @ R_from_rot6(a_rot6)
-    夹爪为绝对开度；默认先从训练数据极性反转到 ZMQ 极性，再二值化。
-    返回 (N, 7): [x,y,z, rx,ry,rz, grip]
+
+    夹爪:
+        模型 action[...,9] 为训练集绝对值（越大越夹紧）
+        invert_gripper=True 时先转为 ZMQ 物理开口，再可选二值化与 clip
+        gripper_close_threshold 在 ZMQ 物理开口空间判定（小于阈值 → 闭合）
+
+    返回 (N, 7): [x,y,z, rx,ry,rz, grip]，grip 为 ZMQ 物理开口
     """
     deltas = np.asarray(action_chunk, dtype=np.float64)
     if deltas.ndim != 2 or deltas.shape[1] != ACTION_DIM:
@@ -392,6 +434,7 @@ def _delta_chunk_to_absolute_pose(
     r_cur = st.Rotation.from_rotvec(np.asarray(cur_rotvec, dtype=np.float64).reshape(3))
 
     abs_grip = deltas[:, GRIPPER_ACTION_INDEX].copy()
+    # 训练极性 → ZMQ 物理开口
     if invert_gripper:
         abs_grip = _invert_gripper_width(
             abs_grip,
@@ -538,7 +581,10 @@ def _absolute_pose_to_delta_step(
     cur_pos: np.ndarray,
     cur_rotvec: np.ndarray,
 ) -> np.ndarray:
-    """单步 decode 的逆：从绝对位姿反推 EE-relative action（10 维，用于自检）。"""
+    """单步 decode 的逆：从绝对位姿反推 EE-relative action（10 维，用于自检）。
+
+    abs_pose[6] 为 ZMQ 物理开口；返回 delta[9] 仍为 ZMQ 值（未转回训练极性）。
+    """
     abs_pose = np.asarray(abs_pose, dtype=np.float64).reshape(7)
     cur_pos = np.asarray(cur_pos, dtype=np.float64).reshape(3)
     r_cur = st.Rotation.from_rotvec(np.asarray(cur_rotvec, dtype=np.float64).reshape(3))
@@ -550,7 +596,7 @@ def _absolute_pose_to_delta_step(
 
 
 def _summarize_action_steps(raw_exec: np.ndarray) -> str:
-    """一行摘要：每步位移/转角/夹爪。"""
+    """一行摘要：每步位移/转角/夹爪（raw_exec[...,9] 为训练极性）。"""
     raw_exec = np.asarray(raw_exec, dtype=np.float64)
     pos_mm = np.linalg.norm(raw_exec[:, :3], axis=1) * 1000.0
     rot_deg = np.array(
@@ -726,6 +772,9 @@ def _print_policy_cycle_diag(
     rebase_shift_mm: float | None = None,
     rebase_rot_deg: float | None = None,
     rebase_age_s: float | None = None,
+    invert_gripper: bool = True,
+    gripper_min_width: float = 0.011,
+    gripper_max_width: float = DEFAULT_GRIPPER_MAX_WIDTH,
 ) -> None:
     """打印一个 control cycle 的结构化诊断。"""
     raw_exec = np.asarray(raw_action_chunk[:n_exec], dtype=np.float64)
@@ -781,7 +830,7 @@ def _print_policy_cycle_diag(
         f"eef_pos={_fmt_vec3(cur_pos, unit='m')} "
         f"link6_pos={_fmt_vec3(model_cur_pos, unit='m')} "
         f"abs_rotvec={_fmt_vec3(cur_rotvec, unit='rad')} "
-        f"grip={cur_grip:.4f}m"
+        f"zmq_grip={cur_grip:.4f}m"
     )
     state_arr = np.asarray(state_rel, dtype=np.float64).reshape(-1)
     print(
@@ -791,7 +840,8 @@ def _print_policy_cycle_diag(
         print(
             f"[DIAG][OBS][state20] pos_hist={_fmt_vec3(state_arr[0:3], unit='m')} "
             f"pos_curr={_fmt_vec3(state_arr[3:6], unit='m')} "
-            f"grip_hist={state_arr[18]:.4f} grip_curr={state_arr[19]:.4f}"
+            f"grip_hist={state_arr[18]:.4f} grip_curr={state_arr[19]:.4f} "
+            f"(training polarity, larger=close)"
         )
     print(
         f"[DIAG][OBS][tcp_abs] "
@@ -890,17 +940,31 @@ def _print_policy_cycle_diag(
     )
     print(
         f"[DIAG][DECODE] step0 abs pos={_fmt_vec3(abs_exec[0, :3], unit='m')} "
-        f"rotvec={_fmt_vec3(abs_exec[0, 3:6], unit='rad')} grip={abs_exec[0, 6]:.4f}m"
+        f"rotvec={_fmt_vec3(abs_exec[0, 3:6], unit='rad')} "
+        f"zmq_grip={abs_exec[0, 6]:.4f}m"
     )
     print(
         f"[DIAG][DECODE] step0 delta pos={_fmt_vec3(clipped_exec[0, :3], unit='m')} "
         f"drot6={np.array2string(clipped_exec[0, 3:9], precision=4)} "
-        f"grip={clipped_exec[0, GRIPPER_ACTION_INDEX]:.4f}m"
+        f"train_grip={clipped_exec[0, GRIPPER_ACTION_INDEX]:.4f}m"
     )
+    implied_zmq_grip = float(implied_delta[GRIPPER_ACTION_INDEX])
+    model_train_grip = float(clipped_exec[0, GRIPPER_ACTION_INDEX])
+    if invert_gripper:
+        implied_train_grip = float(
+            _invert_gripper_width(
+                np.asarray([implied_zmq_grip]),
+                gripper_min_width=gripper_min_width,
+                gripper_max_width=gripper_max_width,
+            )[0]
+        )
+    else:
+        implied_train_grip = implied_zmq_grip
     print(
         f"[DIAG][DECODE][roundtrip] pos_err={decode_pos_err_mm:.4f}mm "
         f"rot_err={decode_rot_err_deg:.4f}deg "
-        f"grip_err={abs(implied_delta[GRIPPER_ACTION_INDEX]-clipped_exec[0, GRIPPER_ACTION_INDEX])*1000:.3f}mm"
+        f"grip_err={abs(implied_train_grip - model_train_grip)*1000:.3f}mm "
+        f"(train {model_train_grip:.4f} vs zmq {implied_zmq_grip:.4f})"
     )
     if n_exec > 1:
         step1_implied = _absolute_pose_to_delta_step(
@@ -946,11 +1010,11 @@ def _print_policy_cycle_diag(
 
 
 # ===========================================================================
-# Light-WAM 远程推理客户端
+# Fast-WAM 远程推理客户端
 # ===========================================================================
 
 class LightWAMClient:
-    """通过 WebSocket 连接 Light-WAM serve_real_robot_policy.py 推理服务。"""
+    """通过 WebSocket 连接 Fast-WAM serve_real_robot_policy.py 推理服务。"""
 
     def __init__(
         self,
@@ -970,18 +1034,20 @@ class LightWAMClient:
 
     def infer(self, wrist_image: np.ndarray, state: np.ndarray, prompt: str) -> np.ndarray:
         """
-        发送单相机 observation 到 Light-WAM 服务，返回 action_chunk。
+        发送单相机 observation 到 Fast-WAM 服务，返回 action_chunk。
 
         参数:
             wrist_image: HWC uint8 ndarray, shape (H, W, 3)，腕部相机图片
             state:       float32 ndarray, shape (20,)，EE-relative UMI state
                          [pos_hist(3), pos_curr(3), rot_hist(6), rot_curr(6),
                           grip_hist, grip_curr]
+                         grip_hist/grip_curr 已为训练集极性（越大越夹紧）
             prompt:      str，任务描述
 
         返回:
             action_chunk: float32 ndarray, shape (action_horizon, 10)
-              EE-relative SE(3): [pos(3), rot6d(6), gripper(absolute)]
+              EE-relative SE(3): [pos(3), rot6d(6), gripper]
+              gripper 维为训练集极性（越大越夹紧），下发前由 _delta_chunk_to_absolute_pose invert
         """
         wrist_image = _to_uint8_hwc(wrist_image)
         state = np.asarray(state, dtype=np.float32).reshape(-1)
@@ -991,7 +1057,7 @@ class LightWAMClient:
             "prompt": prompt,
             "images": {"wrist_image": wrist_image},
             "state": state,
-            # 关掉 LIBERO 风格 *2-1；绝对夹爪默认也不做 server snap（客户端自己阈值更稳）
+            # 服务端不做夹爪后处理；state/action 极性转换与二值化均在客户端完成
             "apply_gripper_postprocess": False,
             "apply_real_gripper_snap": False,
         }
@@ -1068,7 +1134,6 @@ class LightWAMClient:
 # 辅助函数
 # ===========================================================================
 
-DEFAULT_GRIPPER_MAX_WIDTH = 0.085
 DEFAULT_TASK_PROMPT = "pick up the electronic component and place it into the designated box"
 
 
@@ -1159,16 +1224,16 @@ def _clear_key_events(key_counter, terminal_reader):
 # ===========================================================================
 
 @click.command()
-@click.option("--output", "-o", default="./light_wam_output", help="输出目录")
-@click.option("--policy_host", default="127.0.0.1", help="Light-WAM 推理服务地址")
-@click.option("--policy_port", default=5566, type=int, help="Light-WAM 推理服务端口")
+@click.option("--output", "-o", default="./fast_wam_output", help="输出目录")
+@click.option("--policy_host", default="127.0.0.1", help="Fast-WAM 推理服务地址")
+@click.option("--policy_port", default=5566, type=int, help="Fast-WAM 推理服务端口")
 @click.option("--policy_connect_timeout", default=5.0, type=float, show_default=True,
               help="连接推理服务的超时（秒）")
 @click.option("--policy_request_timeout", default=5.0, type=float, show_default=True,
               help="单次推理请求的超时（秒）")
 @click.option("--task_prompt", default=DEFAULT_TASK_PROMPT, help="任务描述")
-@click.option("--steps_per_inference", "-si", default=12, type=int, help="每次推理的动作步数")
-@click.option("--exec_horizon", "-eh", default=12, type=int, show_default=True,
+@click.option("--steps_per_inference", "-si", default=32, type=int, help="每次推理的动作步数")
+@click.option("--exec_horizon", "-eh", default=32, type=int, show_default=True,
               help="每次实际执行的帧数（≤ steps_per_inference）")
 @click.option("--max_duration", "-md", default=2000000, help="每 episode 最大时长（秒）")
 @click.option("--frequency", "-f", default=20, type=float,
@@ -1181,46 +1246,48 @@ def _clear_key_events(key_counter, terminal_reader):
 @click.option("--init_delta", type=str, default="0,0,0,0.1,-0.1,-1.0",
               show_default=True,
               help="位姿微调: dx,dy,dz,drx,dry,drz（米/弧度）")
-@click.option("--init_gripper_delta", type=float, default=0.11, help="夹爪开度微调（米）")
-@click.option("--gripper_min_width", type=float, default=0.011, help="夹爪最小开度（米）")
+@click.option("--init_gripper_delta", type=float, default=0.11,
+              help="夹爪开度微调（米，ZMQ 物理开口；越大越张开）")
+@click.option("--gripper_min_width", type=float, default=0.011,
+              help="ZMQ 物理开口下界（米，≈闭合；也用于 invert 映射）")
 @click.option("--gripper_max_width", type=float, default=DEFAULT_GRIPPER_MAX_WIDTH,
-              help="夹爪最大开度（米）")
+              help="ZMQ 物理开口上界（米，≈全开；也用于 invert 映射）")
 @click.option("--max_delta_pos", type=float, default=0.03, help="单步位置 delta 安全限位（米）")
 @click.option("--max_delta_rot", type=float, default=0.3, help="单步相对旋转 delta 安全限位（弧度）")
 @click.option("--no_binarize_gripper", is_flag=True, default=False,
-              help="不对积分后的夹爪做开/关二值化")
+              help="不对 invert 后的 ZMQ 物理开口做开/关二值化")
 @click.option(
     "--no_invert_gripper",
     is_flag=True,
     default=False,
-    help="不把策略夹爪从训练数据极性（越大越夹紧）翻到 ZMQ 极性（越大越张开）",
+    help="关闭 state/action 夹爪极性互转（默认: ZMQ↔训练，g'=min+max-g）",
 )
 @click.option(
     "--clip_state_grip/--no_clip_state_grip",
-    default=True,
+    default=False,
     show_default=True,
-    help="上传前将 state[18:20] clip 到训练集 gripper 范围",
+    help="上传前将 state[18:20] clip 到训练集 gripper 统计范围（训练极性）",
 )
 @click.option(
     "--train_state_grip_min",
     type=float,
     default=TRAIN_STATE_GRIP_MIN,
     show_default=True,
-    help="训练集 state gripper 下界（米）",
+    help="训练集 state gripper 下界（训练极性，≈全开）",
 )
 @click.option(
     "--train_state_grip_max",
     type=float,
     default=TRAIN_STATE_GRIP_MAX,
     show_default=True,
-    help="训练集 state gripper 上界（米）",
+    help="训练集 state gripper 上界（训练极性，≈全夹）",
 )
 @click.option("--terminal_keys", is_flag=True, default=False,
               help="从 SSH 终端 stdin 读 c/q/s/b（不依赖 pynput 全局键盘）")
 @click.option(
     "--debug_fixed_delta",
     default=None,
-    help="调试用：跳过模型，使用固定 10 维 EE-relative action，格式 pos×3,rot6×6,grip",
+    help="调试用：跳过模型，使用固定 10 维 EE-relative action；grip 维为训练极性",
 )
 @click.option(
     "--rebase_decode/--no_rebase_decode",
@@ -1316,7 +1383,7 @@ def main(
     os.makedirs(os.path.join(output, "action"), exist_ok=True)
 
     # -------------------------------------------------------------------------
-    # 2. 连接 Light-WAM 推理服务
+    # 2. 连接 Fast-WAM 推理服务
     # -------------------------------------------------------------------------
     client = LightWAMClient(
         host=policy_host,
@@ -1324,7 +1391,7 @@ def main(
         connect_timeout=policy_connect_timeout,
         request_timeout=policy_request_timeout,
     )
-    print(f"Light-WAM policy service: ws://{policy_host}:{policy_port}")
+    print(f"Fast-WAM policy service: ws://{policy_host}:{policy_port}")
     print(f"Task prompt: {task_prompt}")
     if abs(eef_offset) > 1e-12:
         print(
@@ -1336,17 +1403,20 @@ def main(
     print(
         "[ALIGN] gripper polarity: "
         + (
-            "training (larger=close) → ZMQ (larger=open)"
+            "state: ZMQ→training; action: training→ZMQ "
+            "(larger=close ↔ larger=open)"
             if invert_gripper
-            else "no inversion"
+            else "no inversion (state/action use ZMQ opening as-is)"
         )
     )
     print(
-        "[CHANGE] UMI decode: EE-frame SE(3) chain (p+=R@a_pos, R=R@Rd) + abs gripper; "
-        f"state={STATE_DIM}d hist/curr relative-to-current EE; "
+        "[CHANGE] UMI pipeline: "
+        f"state={STATE_DIM}d (EE-relative pose + training-polarity grip); "
+        f"action={ACTION_DIM}d (EE-relative SE(3) + training-polarity grip); "
+        f"decode: p+=R@a_pos, R=R@Rd; grip invert on upload/exec; "
         f"clip_state_grip={clip_state_grip} "
         f"train_grip=[{train_state_grip_min:.4f},{train_state_grip_max:.4f}]; "
-        f"action={ACTION_DIM}d; images uint8"
+        "images uint8"
     )
     print(
         "[ALIGN] decode base: "
@@ -1473,19 +1543,27 @@ def main(
             # -----------------------------------------------------------------
             print("Warming up policy inference...")
             obs = env.get_obs()
-            # uint8 图像 + 20d EE-relative state（pos_curr≈0, rot_curr≈I）
+            # uint8 图像 + 20d state（位姿 EE-relative；夹爪已转训练极性）
             wrist_img = _to_uint8_hwc(obs["camera0_rgb"][-1])
-            state_raw = _build_umi_state(obs, eef_offset=eef_offset)
+            state_raw = _build_umi_state(
+                obs,
+                eef_offset=eef_offset,
+                invert_gripper=invert_gripper,
+                gripper_min_width=gripper_min_width,
+                gripper_max_width=max_gripper_width,
+            )
             state, state_grip_clipped = _clip_umi_state_for_model(
                 state_raw,
                 grip_min=train_state_grip_min,
                 grip_max=train_state_grip_max,
                 clip_grip=clip_state_grip,
             )
+            zmq_grip = float(np.asarray(obs["robot0_gripper_width"][-1]).squeeze())
             print(
                 f"warmup state20: pos_hist={state[:3]}, pos_curr={state[3:6]} (~0), "
                 f"rot_curr={state[12:18]} (~I), "
-                f"grip_hist={state[18]:.4f}, grip_curr={state[19]:.4f}"
+                f"grip_hist={state[18]:.4f}, grip_curr={state[19]:.4f} "
+                f"(zmq_grip={zmq_grip:.4f})"
             )
             if state_grip_clipped:
                 print(
@@ -1588,7 +1666,7 @@ def main(
                             drot * st.Rotation.from_rotvec(target_pose[robot_idx, 3:])
                         ).as_rotvec()
 
-                    # 夹爪控制
+                    # 夹爪控制（ZMQ 物理开口；SpaceMouse 不参与训练极性 invert）
                     dpos = 0.0
                     if sm.is_button_pressed(0) and sm.is_button_pressed(1):
                         print("Reset to home...")
@@ -1667,8 +1745,14 @@ def main(
 
                         s = time.time()
                         wrist_img = _to_uint8_hwc(obs["camera0_rgb"][-1])
-                        # 发给模型：20d EE-relative hist/curr state
-                        state_raw = _build_umi_state(obs, eef_offset=eef_offset)
+                        # 构造 20d state：link6 相对位姿 + 训练极性夹爪 → clip → 送模型
+                        state_raw = _build_umi_state(
+                            obs,
+                            eef_offset=eef_offset,
+                            invert_gripper=invert_gripper,
+                            gripper_min_width=gripper_min_width,
+                            gripper_max_width=max_gripper_width,
+                        )
                         state, state_grip_clipped = _clip_umi_state_for_model(
                             state_raw,
                             grip_min=train_state_grip_min,
@@ -1700,12 +1784,12 @@ def main(
 
                         if raw_action_chunk.ndim != 2 or raw_action_chunk.shape[1] != ACTION_DIM:
                             raise ValueError(
-                                f"Light-WAM action chunk must have shape (N, {ACTION_DIM}), "
+                                f"Fast-WAM action chunk must have shape (N, {ACTION_DIM}), "
                                 f"got {raw_action_chunk.shape}"
                             )
                         if len(raw_action_chunk) < steps_per_inference:
                             raise ValueError(
-                                "Light-WAM action chunk is shorter than --steps_per_inference: "
+                                "Fast-WAM action chunk is shorter than --steps_per_inference: "
                                 f"{len(raw_action_chunk)} < {steps_per_inference}"
                             )
                         raw_action_chunk = raw_action_chunk[:steps_per_inference]
@@ -1809,6 +1893,9 @@ def main(
                             rebase_shift_mm=rebase_shift_mm,
                             rebase_rot_deg=rebase_rot_deg,
                             rebase_age_s=rebase_age_s,
+                            invert_gripper=invert_gripper,
+                            gripper_min_width=gripper_min_width,
+                            gripper_max_width=max_gripper_width,
                         )
 
                         env.exec_actions(
