@@ -27,8 +27,10 @@ p_eef = p_link6 + R_tcp @ [0, 0, 0.145]
   - state (20,): hist/current EE-relative pose + 两帧绝对夹爪
   - action (10,): EE-frame dpos + 前两行相对 rot6d + gripper(absolute)
   - 执行: p_next = p_cur + R_cur @ dpos; R_next = R_cur @ R_delta
-  - 夹爪: 训练数据越大越夹紧；ZMQ 越大越张开。策略输出先取反再二值化
-    （--no_invert_gripper 可关掉）。SpaceMouse / init_gripper_delta 不取反。
+  - 夹爪: 训练数据越大越夹紧；ZMQ 越大越张开。策略输出先取反；
+    判定夹取时下发更紧的 --gripper_grasp_width，其他时候用原开度。
+    （--no_invert_gripper 可关掉取反；--no_binarize_gripper 可关掉夹取加紧）。
+    SpaceMouse / init_gripper_delta 不取反。
   - 采集/训练是 link6 TCP；本脚本走 ZMQ X5，下发前沿 TCP Z 加 0.145 m
     变成 eef_link（旋转不变）。--eef_offset 0 可关掉。
   - 协议: reset → infer(obs 图像) → 执行 → compute_kv_cache(state=上一 chunk 原始 action)
@@ -42,6 +44,7 @@ p_eef = p_link6 + R_tcp @ [0, 0, 0.145]
     conda activate Lingbot
     cd /path/to/lingbot-va
     CUDA_VISIBLE_DEVICES=0 NGPU=1 CONFIG_NAME=umi bash script/run_launch_va_server_sync.sh
+   
     # 默认 host=0.0.0.0 port=29536
 
     # 可选隧道: ssh -L 5566:127.0.0.1:5566 kian@
@@ -268,8 +271,8 @@ def _invert_gripper_width(
 
 
 # X5.urdf: eef_link = link6 + 0.145 m along tool x = TCP Z after ee2tcp.
-# X5_EEF_OFFSET_TCP_Z = 0.11
-X5_EEF_OFFSET_TCP_Z = 0.145
+X5_EEF_OFFSET_TCP_Z = 0.1  #貌似这个工作更加正常
+# X5_EEF_OFFSET_TCP_Z = 0.145
 
 def _matrix_to_rotation_6d(matrix: np.ndarray) -> np.ndarray:
     """旋转矩阵 → 6D（前两行展平）。"""
@@ -507,6 +510,39 @@ def _flatten_lingbot_action(
     return np.stack(steps, axis=0)
 
 
+def _postprocess_exec_gripper(
+    grip: np.ndarray,
+    *,
+    gripper_min_width: float,
+    gripper_max_width: float,
+    invert_gripper: bool = True,
+    tighten_on_grasp: bool = True,
+    gripper_close_threshold: float = 0.05,
+    gripper_grasp_width: float = 0.0,
+) -> np.ndarray:
+    """策略夹爪 → ZMQ 下发开度。
+
+    先按需极性翻转；夹取（开度 < threshold）时改用更紧的 grasp_width，
+    其他时候保留翻转后的原开度。
+    """
+    abs_grip = np.asarray(grip, dtype=np.float64).copy()
+    if invert_gripper:
+        abs_grip = _invert_gripper_width(
+            abs_grip,
+            gripper_min_width=gripper_min_width,
+            gripper_max_width=gripper_max_width,
+        )
+    if tighten_on_grasp:
+        abs_grip = np.where(
+            abs_grip < gripper_close_threshold, gripper_grasp_width, abs_grip
+        )
+        exec_min = min(gripper_min_width, gripper_grasp_width)
+    else:
+        exec_min = gripper_min_width
+    exec_min = max(0.0, float(exec_min))
+    return np.clip(abs_grip, exec_min, gripper_max_width)
+
+
 def _delta_chunk_to_absolute_pose(
     action_chunk: np.ndarray,
     *,
@@ -517,12 +553,15 @@ def _delta_chunk_to_absolute_pose(
     binarize_gripper: bool = True,
     gripper_close_threshold: float = 0.05,
     invert_gripper: bool = True,
+    gripper_grasp_width: float = 0.0,
 ) -> np.ndarray:
     """
     将 EE-relative SE(3) action 链式复合为绝对 TCP：
       p <- p + R @ dpos
       R <- R @ R_from_row_rot6d
-      grip: 可选先从数据集极性翻到 ZMQ 开口，再二值化
+      grip: 可选先从数据集极性翻到 ZMQ 开口；
+            夹取时下发 gripper_grasp_width，其他时候用原开度
+            （--no_binarize_gripper 时全程用原开度）
     """
     deltas = np.asarray(action_chunk, dtype=np.float64)
     if deltas.ndim != 2 or deltas.shape[1] != ACTION_DIM:
@@ -531,18 +570,15 @@ def _delta_chunk_to_absolute_pose(
     out = np.zeros((deltas.shape[0], 7), dtype=np.float64)
     pos = np.asarray(cur_pos, dtype=np.float64).reshape(3).copy()
     r_cur = st.Rotation.from_rotvec(np.asarray(cur_rotvec, dtype=np.float64).reshape(3))
-    abs_grip = deltas[:, GRIPPER_ACTION_INDEX].copy()
-    if invert_gripper:
-        abs_grip = _invert_gripper_width(
-            abs_grip,
-            gripper_min_width=gripper_min_width,
-            gripper_max_width=gripper_max_width,
-        )
-    if binarize_gripper:
-        abs_grip = np.where(
-            abs_grip < gripper_close_threshold, gripper_min_width, gripper_max_width
-        )
-    abs_grip = np.clip(abs_grip, gripper_min_width, gripper_max_width)
+    abs_grip = _postprocess_exec_gripper(
+        deltas[:, GRIPPER_ACTION_INDEX],
+        gripper_min_width=gripper_min_width,
+        gripper_max_width=gripper_max_width,
+        invert_gripper=invert_gripper,
+        tighten_on_grasp=binarize_gripper,
+        gripper_close_threshold=gripper_close_threshold,
+        gripper_grasp_width=gripper_grasp_width,
+    )
 
     for i in range(deltas.shape[0]):
         pos = pos + r_cur.apply(deltas[i, :3])
@@ -1157,7 +1193,21 @@ def _clear_key_events(key_counter, terminal_reader):
     "--no_binarize_gripper",
     is_flag=True,
     default=False,
-    help="不对绝对夹爪做开/关二值化",
+    help="关掉夹取加紧：全程使用策略原开度（仍会按需极性翻转并 clip）",
+)
+@click.option(
+    "--gripper_close_threshold",
+    type=float,
+    default=0.045,
+    show_default=True,
+    help="ZMQ 开度（米）低于该值视为夹取，下发 --gripper_grasp_width",
+)
+@click.option(
+    "--gripper_grasp_width",
+    type=float,
+    default=0.011,
+    show_default=True,
+    help="夹取时下发的开度（米），比策略输出更紧。其他时候用原开度",
 )
 @click.option(
     "--no_invert_gripper",
@@ -1217,6 +1267,8 @@ def main(
     max_delta_pos,
     max_delta_rot,
     no_binarize_gripper,
+    gripper_close_threshold,
+    gripper_grasp_width,
     no_invert_gripper,
     cpu_affinity,
     terminal_keys,
@@ -1239,6 +1291,14 @@ def main(
     max_gripper_width = float(gripper_max_width)
     if max_gripper_width <= gripper_min_width:
         raise click.BadParameter("--gripper_max_width must be > --gripper_min_width")
+    gripper_close_threshold = float(gripper_close_threshold)
+    gripper_grasp_width = float(gripper_grasp_width)
+    if gripper_close_threshold <= 0.0:
+        raise click.BadParameter("--gripper_close_threshold must be > 0")
+    if gripper_grasp_width < 0.0:
+        raise click.BadParameter("--gripper_grasp_width must be >= 0")
+    if gripper_grasp_width >= max_gripper_width:
+        raise click.BadParameter("--gripper_grasp_width must be < --gripper_max_width")
     if steps_per_inference <= 0:
         raise click.BadParameter("--steps_per_inference must be > 0")
     if exec_horizon <= 0:
@@ -1296,13 +1356,19 @@ def main(
     else:
         print("[ALIGN] eef_offset=0: no link6↔eef_link conversion")
     invert_gripper = not no_invert_gripper
+    tighten_on_grasp = not no_binarize_gripper
     if invert_gripper:
+        polarity = "invert dataset (large=close) → ZMQ (large=open)"
+    else:
+        polarity = "no invert; treat policy output as ZMQ opening"
+    if tighten_on_grasp:
         print(
-            "[ALIGN] gripper: invert dataset (large=close) → ZMQ (large=open), "
-            "then binarize"
+            f"[ALIGN] gripper: {polarity}; "
+            f"grasp if < {gripper_close_threshold:.3f}m → "
+            f"{gripper_grasp_width:.4f}m, else original width"
         )
     else:
-        print("[ALIGN] gripper: no invert; treat policy output as ZMQ opening")
+        print(f"[ALIGN] gripper: {polarity}; always original width")
 
     obs_res = (256, 256)
     robots_config = [
@@ -1608,8 +1674,10 @@ def main(
                             cur_rotvec=cur_rotvec,
                             gripper_min_width=gripper_min_width,
                             gripper_max_width=max_gripper_width,
-                            binarize_gripper=not no_binarize_gripper,
+                            binarize_gripper=tighten_on_grasp,
+                            gripper_close_threshold=gripper_close_threshold,
                             invert_gripper=invert_gripper,
+                            gripper_grasp_width=gripper_grasp_width,
                         )
                         abs_exec = _abs_exec_link6_to_x5_eef(abs_link6, eef_offset)
 
