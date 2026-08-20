@@ -51,10 +51,37 @@ Recording control:
      eef_link → 沿 TCP Z 退回 0.145m 到 link6 → 在 link6 上构造 state / 积分 action
      → 沿新姿态 TCP Z 前移 0.145m 到 eef_link → 下发绝对 TCP
 
+Policy 控制循环（串行，不开流水线）:
+  每轮: get_obs 拍 1 张腕部图 + 读 20d state
+        → client.infer（阻塞，图+state 一起发给 Fast-WAM）
+        → 只执行 chunk 前 exec_horizon 步（其余丢掉）
+        → env.exec_actions(绝对 TCP, timestamps=time.time() 墙钟)
+        → precise_wait(最后一个 waypoint 的 timestamp + 约 1 帧)
+        → 再进入下一轮拍照
+
+  时间戳:
+    下发时现算: command_start_time = time.time() + 0.05
+    第 k 步: command_start_time + k * dt（dt = 1/frequency）
+    exec_actions / 控制器 / precise_wait 都按同一套 time.time() 墙钟对齐
+    （控制器内部会把墙钟目标时刻转成 monotonic）
+
+  exec_actions 不阻塞: 只把带时间戳的 waypoint 丢进控制器立刻返回。
+  本脚本用 precise_wait(action_timestamps[-1]) 等本批排期结束，再拍下一张，
+  避免推理慢时下一轮拍照叠在上一轮还在跑的动作上。
+
+  推理慢（例如 1s）且场景/机械臂在推理期间基本静止时:
+    观测与执行几何上仍大致对应拍照时的位姿，但执行会整体晚一个 infer_s。
+    闭环纠偏也会变慢。这不是 wait 能消掉的。
+
+  --rebase_decode（默认开）:
+    推理结束后再读实时 TCP 做相对→绝对积分基准。
+    旧用途: 推理期间上一轮还在动，防止 step0 拽回旧起点。
+    等完上一轮再拍之后，拍照位姿与推理结束位姿应接近，通常可关
+    --no_rebase_decode。日志 rebase_shift_mm 接近 0 即可确认。
+
 # ssh 远程运行方式：
 export DISPLAY=:1
 export XAUTHORITY=/run/user/1000/gdm/Xauthority
-python /data1/projects/umi-arx-kian/scripts/eval_arx5_fast_wam.py --terminal_keys
 
 python /data1/projects/umi-arx-kian/scripts/eval_arx5_fast_wam.py \
     -o data_local/umi_eval_output \
@@ -1232,9 +1259,11 @@ def _clear_key_events(key_counter, terminal_reader):
 @click.option("--policy_request_timeout", default=5.0, type=float, show_default=True,
               help="单次推理请求的超时（秒）")
 @click.option("--task_prompt", default=DEFAULT_TASK_PROMPT, help="任务描述")
-@click.option("--steps_per_inference", "-si", default=32, type=int, help="每次推理的动作步数")
+@click.option("--steps_per_inference", "-si", default=32, type=int,
+              help="每次推理请求服务端返回的动作步数；实际只执行前 exec_horizon 步")
 @click.option("--exec_horizon", "-eh", default=32, type=int, show_default=True,
-              help="每次实际执行的帧数（≤ steps_per_inference）")
+              help="每轮实际下发并等待执行完的帧数（≤ steps_per_inference）；"
+                   "例: -eh 4 @ 20Hz 表示每轮执行约 0.2s")
 @click.option("--max_duration", "-md", default=2000000, help="每 episode 最大时长（秒）")
 @click.option("--frequency", "-f", default=20, type=float,
               help="控制频率 (Hz)；默认与训练数据集 20 fps 对齐")
@@ -1293,7 +1322,9 @@ def _clear_key_events(key_counter, terminal_reader):
     "--rebase_decode/--no_rebase_decode",
     default=True,
     show_default=True,
-    help="推理结束后用最新实时位姿做相对→绝对解码基准，避免 chunk 切换时命令回跳",
+    help="推理结束后用最新实时 TCP 做相对→绝对解码基准。"
+         "上一轮动作会等完再拍时通常可关（--no_rebase_decode）；"
+         "仍开则作为限速未到位时的保险",
 )
 @click.option(
     "--eef_offset",
@@ -1717,6 +1748,7 @@ def main(
 
                     obs = env.get_obs()
 
+                    # 相机约 60Hz；wait 目标时刻略提前一帧，给成像留余量。
                     frame_latency = 1.0 / 60.0
                     precise_wait(eval_t_start - frame_latency, time_func=time.time)
                     print("Policy in control!")
@@ -1736,9 +1768,10 @@ def main(
                     prev_decode_step_world = None
 
                     while True:
-                        # 重规划周期与实际执行的 waypoint 数对齐，避免执行完后空等。
-                        t_cycle_end = t_start + (iter_idx + exec_horizon) * dt
-
+                        # -----------------------------------------------------
+                        # 1. 拍照 + 读机器人状态（每轮只采一次）
+                        #    上一轮已 wait 到最后一个 waypoint，此时机械臂应已停稳。
+                        # -----------------------------------------------------
                         obs = env.get_obs()
                         obs_timestamps = obs["timestamp"]
                         obs_latency = time.time() - obs_timestamps[-1]
@@ -1774,6 +1807,10 @@ def main(
 
                         episode_id = env.replay_buffer.n_episodes
 
+                        # -----------------------------------------------------
+                        # 2. 阻塞推理：图 + 20d state → action chunk (N, 10)
+                        #    infer 返回前机械臂应保持上一轮末位姿（本脚本串行、无并行推理）。
+                        # -----------------------------------------------------
                         if fixed_delta_vec is not None:
                             raw_action_chunk = np.tile(
                                 fixed_delta_vec, (steps_per_inference, 1)
@@ -1800,8 +1837,12 @@ def main(
                             max_delta_rot=max_delta_rot,
                         )
 
-                        # 推理耗时内机器人仍在执行上一个 chunk；若仍用推理前的位姿做
-                        # 相对→绝对积分，新 chunk 的 step0 会把机械臂拽回旧起点。
+                        # -----------------------------------------------------
+                        # 3. 解码基准位姿（相对 EE delta → 绝对 TCP）
+                        #    默认用本轮 get_obs 的位姿。--rebase_decode 时再读一次
+                        #    实时 TCP：旧逻辑是防「推理期间上一轮还在动」导致 step0 回跳；
+                        #    现在已等上一轮跑完再拍，rebase 通常接近 0，可关。
+                        # -----------------------------------------------------
                         base_pos_robot = cur_pos_robot
                         base_rotvec = cur_rotvec
                         base_pos_link6 = cur_pos_link6
@@ -1839,6 +1880,7 @@ def main(
                                     eef_offset,
                                 )
 
+                        # 只积分并下发前 exec_horizon 步；chunk 后半丢弃，下一轮重新推理。
                         abs_link6 = _delta_chunk_to_absolute_pose(
                             action_chunk[:exec_horizon],
                             cur_pos=base_pos_link6,
@@ -1850,6 +1892,12 @@ def main(
                         )
                         abs_exec = _abs_exec_link6_to_x5_eef(abs_link6, eef_offset)
 
+                        # -----------------------------------------------------
+                        # 4. 排期时间戳（墙钟 time.time()，与 exec_actions / wait 同一时钟）
+                        #    第 k 步目标时刻 = now + 0.05s + k * dt
+                        #    +0.05s: 给下发到控制器留缓冲，避免 timestamp 刚写下就过期。
+                        #    推理越慢，这批点的执行时刻整体越晚（不会补回到拍照时刻）。
+                        # -----------------------------------------------------
                         command_start_time = time.time() + 0.05
                         action_timestamps = (
                             np.arange(exec_horizon, dtype=np.float64) * dt
@@ -1898,6 +1946,7 @@ def main(
                             gripper_max_width=max_gripper_width,
                         )
 
+                        # 异步下发：立刻返回。控制器按 timestamp 插值跟踪；过期点会被丢掉。
                         env.exec_actions(
                             actions=abs_exec,
                             timestamps=action_timestamps,
@@ -1952,7 +2001,14 @@ def main(
                         if stop_episode:
                             break
 
-                        precise_wait(t_cycle_end - frame_latency)
+                        # 等到本批最后一个 waypoint 的墙钟时刻（再加约 1 帧成像余量）。
+                        # 必须用 time.time：action_timestamps 是 Unix 墙钟，不能用 monotonic。
+                        # 不要用「本轮开头 + exec_horizon*dt」：推理慢时那个 deadline 早已过期，
+                        # wait 会变成 no-op，下一轮拍照会叠在这 4 步还在跑的时候。
+                        precise_wait(
+                            float(action_timestamps[-1]) + frame_latency,
+                            time_func=time.time,
+                        )
                         iter_idx += exec_horizon
                         cycle_idx += 1
 
