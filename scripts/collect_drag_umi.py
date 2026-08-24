@@ -22,27 +22,34 @@ python python/communication/zmq_server_ac_one.py X5 can3 --gripper-open-readout 
      replay_buffer.zarr，并保存 videos/{episode_id}/*.mp4
 
 用法:
-    python scripts/collect_drag_umi.py -o data/collect_demo
+    python scripts/collect_drag_umi.py -o data/collect_demo \\
+        --init_pose 0.4,0.0,0.25,0,1.57,0 --init_gripper 0.08
 
     # SSH 无 X11 时用终端按键:
-    python scripts/collect_drag_umi.py -o data/collect_demo --terminal_keys
+    python scripts/collect_drag_umi.py -o data/collect_demo \\
+        --init_pose 0.4,0.0,0.25,0,1.57,0 --terminal_keys
 
     # 如果上面报错，则执行下面：
     cd /data1/projects/umi-arx-hzl/modules/arx_x5_python
     source setup.sh
     cd /data1/projects/umi-arx-hzl
-    python scripts/collect_drag_umi.py
+    python scripts/collect_drag_umi.py --init_pose ...
+
+
+    python scripts/collect_drag_umi.py -o data/cup_demo --init_pose -0.006958,-0.002573,0.120019,2.464006,-2.497232,1.524022 --init_gripper 0.000604 --no_zero_force
 
 键盘:
   P = 进入零力模式（重力补偿，可拖拽）
-  C = 开始采集（须先按 P）
+  C = 开始采集（默认须先按 P；--no_zero_force 时可直接 C）
   S = 停止并保存
   D = 丢弃当前正在录的 episode（未保存）
   E = 删除已保存的指定 episode（空闲时；输入编号后 Y 确认）
-  Q = 退出
+  I = 打印当前 TCP 位姿（可直接复制为 --init_pose）
+  Q = 回 home 后退出
 
-不做 reset_to_home / init_delta 作为 episode 起始；按 C 时臂在哪就从哪开录。
-进程启动时仍会 reset_to_home 一次（回零）。
+启动流程: reset_to_home →（可选）缓动到 --init_pose → 等 P 进零力（或 --no_zero_force 直接 C）。
+空闲/拖拽/录制时终端会周期性打印当前位姿，便于挑选初始位姿。
+不做 episode 级 init 移动；按 C 时臂在哪就从哪开录。
 
 关节置0：
     cansend can3 7FF#00010003
@@ -169,7 +176,7 @@ class TerminalKeyReader:
         tty.setcbreak(self._fd)
         print(
             "[terminal_keys] 在本终端按键: "
-            "p=零力, c=开始, s=保存, d=丢弃当前, e=删已保存, q=退出"
+            "p=零力, c=开始, s=保存, d=丢弃当前, e=删已保存, i=打印当前位姿, q=回home退出"
         )
         return self
 
@@ -208,6 +215,8 @@ class TerminalKeyReader:
             return KeyCode(char="d")
         if ch in ("e", "E"):
             return KeyCode(char="e")
+        if ch in ("i", "I"):
+            return KeyCode(char="i")
         if ch in ("y", "Y"):
             return KeyCode(char="y")
         if ch in ("n", "N"):
@@ -259,6 +268,188 @@ def action_from_obs(obs: dict, n_robots: int) -> np.ndarray:
         action[7 * robot_idx + 6] = gripper
     return action
 
+
+def tcp_pose_grip_from_robot_state(
+    env: Arx5EnvWithImages,
+) -> list[tuple[np.ndarray, float]]:
+    """
+    从控制器 ActualTCPPose 取位姿（与 set_tcp_pose / exec_actions 同一套数）。
+
+    注意: get_obs() 里的 eef_rot 经 PoseInterpolator 后常变成短角 rotvec，
+    而 SingleArmClient.tcp_pose 读数是长角等价形式；复制 init_pose 必须用这里。
+    """
+    out: list[tuple[np.ndarray, float]] = []
+    for state in env.get_robot_state():
+        pose = np.asarray(state["ActualTCPPose"], dtype=np.float64).reshape(6).copy()
+        grip = float(state["gripper_position"])
+        out.append((pose, grip))
+    return out
+
+
+def tcp_pose_grip_from_obs(
+    obs: dict, n_robots: int
+) -> list[tuple[np.ndarray, float]]:
+    """每臂 (pose6 [xyz,rotvec], gripper_width)，来自 get_obs（仅供画面叠加）。"""
+    out: list[tuple[np.ndarray, float]] = []
+    for robot_idx in range(n_robots):
+        pose = np.concatenate(
+            [
+                np.asarray(obs[f"robot{robot_idx}_eef_pos"][-1], dtype=np.float64),
+                np.asarray(
+                    obs[f"robot{robot_idx}_eef_rot_axis_angle"][-1], dtype=np.float64
+                ),
+            ],
+            axis=-1,
+        ).reshape(6)
+        grip = float(np.asarray(obs[f"robot{robot_idx}_gripper_width"][-1]).squeeze())
+        out.append((pose, grip))
+    return out
+
+
+def format_pose_cli(pose6: np.ndarray, grip: float | None = None) -> str:
+    """生成可直接粘贴的 --init_pose / --init_gripper 参数串。"""
+    pose6 = np.asarray(pose6, dtype=np.float64).reshape(6)
+    pose_s = ",".join(f"{v:.6f}" for v in pose6)
+    if grip is None:
+        return f"--init_pose {pose_s}"
+    return f"--init_pose {pose_s} --init_gripper {float(grip):.6f}"
+
+
+def print_current_pose(env: Arx5EnvWithImages, *, tag: str = "pose") -> None:
+    """打印可复制的 init 位姿（命令坐标系 ActualTCPPose）。"""
+    for robot_idx, (pose, grip) in enumerate(tcp_pose_grip_from_robot_state(env)):
+        print(
+            f"[{tag}] robot{robot_idx} "
+            f"pos=[{pose[0]:.4f},{pose[1]:.4f},{pose[2]:.4f}] "
+            f"rotvec=[{pose[3]:.4f},{pose[4]:.4f},{pose[5]:.4f}] "
+            f"grip={grip:.4f}"
+        )
+        print(f"[{tag}] copy: {format_pose_cli(pose, grip)}")
+
+
+def ease_in_out_quad(t: float) -> float:
+    t *= 2.0
+    if t < 1.0:
+        return 0.5 * t * t
+    t -= 1.0
+    return -0.5 * (t * (t - 2.0) - 1.0)
+
+
+def parse_pose6(text: str) -> np.ndarray:
+    vals = [float(v) for v in text.split(",")]
+    if len(vals) != 6:
+        raise click.BadParameter(
+            f"--init_pose 需要 6 个数 x,y,z,rx,ry,rz，收到 {len(vals)} 个"
+        )
+    return np.asarray(vals, dtype=np.float64)
+
+
+def move_to_init_pose(
+    env: Arx5EnvWithImages,
+    target_pose6: np.ndarray,
+    *,
+    frequency: float,
+    duration: float = 2.5,
+    init_gripper: float | None = None,
+) -> None:
+    """
+    启动时在末端控制模式下缓动到固定 TCP 位姿（此时尚未进零力）。
+
+    姿态用 SLERP，避免 rotvec 长短角表示不同时线性插值绕飞。
+    waypoint 分批下发，避免 input_queue 塞满。
+    """
+    from scipy.spatial.transform import Rotation, Slerp
+
+    if hasattr(env, "set_end_control"):
+        try:
+            env.set_end_control()
+            time.sleep(0.05)
+        except Exception as exc:  # noqa: BLE001
+            print(f"set_end_control warning: {exc}")
+
+    robot_states = env.get_robot_state()
+    n_robots = len(robot_states)
+    target_pose6 = np.asarray(target_pose6, dtype=np.float64).reshape(6)
+
+    start_pose_all = []
+    start_grip_all = []
+    target_grip_all = []
+    start_rots = []
+    target_rots = []
+    for ridx in range(n_robots):
+        curr6 = robot_states[ridx]["ActualTCPPose"].astype(np.float64).copy()
+        grip = float(robot_states[ridx]["gripper_position"])
+        tgt_grip = grip if init_gripper is None else float(init_gripper)
+        start_pose_all.append(curr6)
+        start_grip_all.append(grip)
+        target_grip_all.append(tgt_grip)
+        start_rots.append(Rotation.from_rotvec(curr6[3:6]))
+        target_rots.append(Rotation.from_rotvec(target_pose6[3:6]))
+
+    start_pose_all = np.stack(start_pose_all, axis=0)
+    start_grip_all = np.asarray(start_grip_all, dtype=np.float64)
+    target_grip_all = np.asarray(target_grip_all, dtype=np.float64)
+    target_pos = target_pose6[:3]
+
+    print("Moving to init pose (end-effector control, not zero-force)...")
+    for ridx in range(n_robots):
+        print(
+            f"  robot{ridx}  from "
+            f"{np.array2string(start_pose_all[ridx], precision=4, separator=',')} "
+            f"grip={start_grip_all[ridx]:.4f}"
+        )
+        print(
+            f"  robot{ridx}    to "
+            f"{np.array2string(target_pose6, precision=4, separator=',')} "
+            f"grip={target_grip_all[ridx]:.4f}"
+        )
+
+    # 降低下发密度，避免 SharedMemoryQueue Full（buffer=256）
+    cmd_hz = min(float(frequency), 20.0)
+    dt = 1.0 / cmd_hz
+    steps = max(2, int(duration * cmd_hz))
+    batch_size = 30
+    t0 = time.time() + 0.3
+
+    for batch_start in range(0, steps, batch_size):
+        batch_end = min(batch_start + batch_size, steps)
+        actions = []
+        timestamps = []
+        for k in range(batch_start, batch_end):
+            a = ease_in_out_quad(k / (steps - 1))
+            key_times = [0.0, 1.0]
+            cmd = np.zeros(7 * n_robots, dtype=np.float64)
+            for ridx in range(n_robots):
+                pos_now = start_pose_all[ridx, :3] + a * (
+                    target_pos - start_pose_all[ridx, :3]
+                )
+                slerp = Slerp(
+                    key_times, Rotation.concatenate([start_rots[ridx], target_rots[ridx]])
+                )
+                rot_now = slerp([a])[0].as_rotvec()
+                grip_now = start_grip_all[ridx] + a * (
+                    target_grip_all[ridx] - start_grip_all[ridx]
+                )
+                cmd[7 * ridx : 7 * ridx + 3] = pos_now
+                cmd[7 * ridx + 3 : 7 * ridx + 6] = rot_now
+                cmd[7 * ridx + 6] = grip_now
+            actions.append(cmd)
+            timestamps.append(t0 + k * dt)
+
+        env.exec_actions(
+            actions=np.asarray(actions),
+            timestamps=np.asarray(timestamps),
+            compensate_latency=False,
+        )
+        # 等本批大部分时间走完再塞下一批
+        if batch_end < steps:
+            time.sleep(max(0.0, (batch_end - batch_start) * dt * 0.85))
+
+    remain = (t0 + (steps - 1) * dt + 0.25) - time.time()
+    if remain > 0:
+        time.sleep(remain)
+    print("Init pose reached. Press P to enter zero-force, then C to record.")
+    print_current_pose(env, tag="after-init")
 
 def record_pose_action(env: Arx5EnvWithImages, obs: dict) -> None:
     """
@@ -421,15 +612,36 @@ def leave_drag_mode(env: Arx5EnvWithImages) -> None:
     #     print(f"set_to_damping warning: {exc}")
 
 
+def go_home_before_quit(env: Arx5EnvWithImages) -> None:
+    """退出前先离开零力并回 home，再交给 env 析构清理。"""
+    print("Returning to home before quit...")
+    try:
+        if hasattr(env, "set_end_control"):
+            env.set_end_control()
+            time.sleep(0.05)
+    except Exception as exc:  # noqa: BLE001
+        print(f"set_end_control warning: {exc}")
+
+    for robot_idx, robot in enumerate(env.robots):
+        try:
+            print(f"  reset_to_home robot{robot_idx}...")
+            robot.reset_to_home()
+        except Exception as exc:  # noqa: BLE001
+            print(f"  reset_to_home robot{robot_idx} failed: {exc}")
+    print("Home done. Exiting.")
+
+
 def make_vis_image(
     obs: dict,
     episode_id: int,
     t_elapsed: float,
     n_steps: int,
     *,
-    drag_ready: bool = False,
+    zero_force_active: bool = False,
+    no_zero_force: bool = False,
     recording: bool = False,
     delete_prompt: str | None = None,
+    n_robots: int = 1,
 ) -> np.ndarray:
     cam_keys = sorted(k for k in obs if k.startswith("camera") and k.endswith("_rgb"))
     if not cam_keys:
@@ -446,16 +658,19 @@ def make_vis_image(
     vis = np.concatenate(frames, axis=1) if len(frames) > 1 else frames[0]
     if recording:
         status = "REC"
-        help_text = "S save | D drop | Q quit"
+        help_text = "S save | D drop | I pose | Q quit"
     elif delete_prompt:
         status = "DEL"
         help_text = delete_prompt
-    elif drag_ready:
+    elif zero_force_active:
         status = "DRAG"
-        help_text = "C start | E del ep | Q quit"
+        help_text = "C start | I pose | E del ep | Q quit"
+    elif no_zero_force:
+        status = "READY"
+        help_text = "C start | P zero-force | I pose | Q quit"
     else:
         status = "IDLE"
-        help_text = "P zero-force | E del ep | Q quit"
+        help_text = "P zero-force | I pose | E del ep | Q quit"
     text = f"{status} Ep:{episode_id}  t={t_elapsed:.1f}s  steps={n_steps}"
     cv2.putText(vis, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
     cv2.putText(
@@ -467,6 +682,35 @@ def make_vis_image(
         (255, 255, 255),
         1,
     )
+    try:
+        for robot_idx, (pose, grip) in enumerate(
+            tcp_pose_grip_from_obs(obs, n_robots)
+        ):
+            y0 = 84 + robot_idx * 44
+            cv2.putText(
+                vis,
+                (
+                    f"r{robot_idx} xyz "
+                    f"{pose[0]:.3f},{pose[1]:.3f},{pose[2]:.3f}  "
+                    f"grip {grip:.3f}"
+                ),
+                (10, y0),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 255, 255),
+                1,
+            )
+            cv2.putText(
+                vis,
+                f"r{robot_idx} rot {pose[3]:.3f},{pose[4]:.3f},{pose[5]:.3f}",
+                (10, y0 + 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 255, 255),
+                1,
+            )
+    except Exception:
+        pass
     return vis
 
 
@@ -538,6 +782,31 @@ def parse_episode_id(text: str) -> int | None:
     default=True,
     help="是否把 RGB 写入 zarr（默认开；视频始终保存）",
 )
+@click.option(
+    "--init_pose",
+    default=None,
+    type=str,
+    help="启动后缓动到的固定 TCP 位姿: x,y,z,rx,ry,rz（米 & 轴角弧度）；省略则不移动",
+)
+@click.option(
+    "--init_gripper",
+    default=None,
+    type=float,
+    help="启动时目标夹爪开度（米）；默认保持当前开度",
+)
+@click.option(
+    "--init_duration",
+    default=2.5,
+    type=float,
+    show_default=True,
+    help="启动缓动到 init_pose 的时长（秒）",
+)
+@click.option(
+    "--no_zero_force",
+    is_flag=True,
+    default=False,
+    help="不要求先进零力模式，可直接 C 开录 / S 保存（P 仍可选）",
+)
 def main(
     output,
     frequency,
@@ -552,6 +821,10 @@ def main(
     max_duration,
     terminal_keys,
     save_images,
+    init_pose,
+    init_gripper,
+    init_duration,
+    no_zero_force,
 ):
     from peripherals.keystroke_counter import KeystrokeCounter
 
@@ -560,6 +833,7 @@ def main(
     robots_config = _default_robots_config()
     n_robots = len(robots_config)
     camera_reorder_list = [int(x) for x in camera_reorder.split(",") if x.strip() != ""]
+    init_pose6 = parse_pose6(init_pose) if init_pose else None
 
     print("=" * 60)
     print("ARX5 Drag Data Collection")
@@ -567,8 +841,23 @@ def main(
     print(f"  frequency  : {frequency} Hz")
     print(f"  n_robots   : {n_robots}")
     print(f"  save_images: {save_images}")
-    print("  startup: reset_to_home once; episode: no init move")
-    print("  P=zero-force  C=start  S=save  D=drop-current  E=del-saved  Q=quit")
+    if init_pose6 is None:
+        print("  init_pose  : (skip) drag & press I to inspect pose")
+    else:
+        print(
+            f"  init_pose  : {np.array2string(init_pose6, precision=4, separator=',')}"
+        )
+    print(
+        f"  init_gripper: "
+        f"{'keep current' if init_gripper is None else f'{init_gripper:.4f} m'}"
+    )
+    print(f"  init_duration: {init_duration:.1f}s")
+    print(f"  no_zero_force: {no_zero_force}")
+    if no_zero_force:
+        print("  startup: reset_to_home → optional init_pose → C to record (P optional)")
+    else:
+        print("  startup: reset_to_home → optional init_pose → P then C")
+    print("  P=zero-force  C=start  S=save  D=drop  E=del  I=print-pose  Q=home+quit")
     print("=" * 60)
 
     key_ctx = (
@@ -603,22 +892,46 @@ def main(
             while not env.is_ready:
                 time.sleep(0.1)
             check_episode_alignment(env)
-            print("Env ready. Press P for zero-force, then C to start recording.")
+            print("Env ready.")
 
-            leave_drag_mode(env)
-            drag_ready = False
+            if init_pose6 is not None:
+                move_to_init_pose(
+                    env,
+                    init_pose6,
+                    frequency=frequency,
+                    duration=init_duration,
+                    init_gripper=init_gripper,
+                )
+            else:
+                if no_zero_force:
+                    print(
+                        "No --init_pose. Direct record mode: press C to start, "
+                        "I to print --init_pose string."
+                    )
+                else:
+                    print(
+                        "No --init_pose. Press P to zero-force, drag to a good pose, "
+                        "press I to print --init_pose string."
+                    )
+
+            zero_force_active = False
             delete_mode = None  # None | "input" | "confirm"
             delete_buf = ""
             delete_target = None
+            last_pose_print_t = 0.0
+            pose_print_interval = 0.5
+
+            if no_zero_force:
+                print("Direct record mode: press C to start (P optional for drag).")
 
             while True:
-                # ---------- idle: P -> zero-force, then C -> start ----------
+                # ---------- idle: optional P -> zero-force, then C -> start ----------
                 start_episode = False
                 while True:
                     for key_stroke in drain_keys(key_source):
                         if key_stroke == KeyCode(char="q"):
                             print("Quit.")
-                            leave_drag_mode(env)
+                            go_home_before_quit(env)
                             return
 
                         if delete_mode == "confirm":
@@ -665,14 +978,14 @@ def main(
                             continue
 
                         if key_stroke == KeyCode(char="p"):
-                            if not drag_ready:
+                            if not zero_force_active:
                                 env.set_gravity_compensation()
-                                drag_ready = True
+                                zero_force_active = True
                                 print("Zero-force ON. Drag freely, then press C to record.")
                             else:
                                 print("Already in zero-force mode.")
                         if key_stroke == KeyCode(char="c"):
-                            if drag_ready:
+                            if zero_force_active or no_zero_force:
                                 start_episode = True
                             else:
                                 print("Press P first to enter zero-force mode.")
@@ -680,6 +993,11 @@ def main(
                             print("Not recording — nothing to save.")
                         if is_drop_key(key_stroke):
                             print("No active episode to drop. Press E to delete a saved one.")
+                        if key_stroke == KeyCode(char="i"):
+                            try:
+                                print_current_pose(env, tag="init-candidate")
+                            except Exception as exc:  # noqa: BLE001
+                                print(f"Failed to read pose: {exc}")
                         if key_stroke == KeyCode(char="e"):
                             n_saved = env.replay_buffer.n_episodes
                             if n_saved <= 0:
@@ -697,6 +1015,10 @@ def main(
 
                     try:
                         obs = env.get_obs()
+                        now = time.monotonic()
+                        if now - last_pose_print_t >= pose_print_interval:
+                            print_current_pose(env, tag="live")
+                            last_pose_print_t = now
                         n_saved = env.replay_buffer.n_episodes
                         delete_prompt = None
                         if delete_mode == "input":
@@ -713,9 +1035,11 @@ def main(
                             n_saved,
                             0.0,
                             0,
-                            drag_ready=drag_ready,
+                            zero_force_active=zero_force_active,
+                            no_zero_force=no_zero_force,
                             recording=False,
                             delete_prompt=delete_prompt,
+                            n_robots=n_robots,
                         )
                         cv2.imshow("drag_collect", vis[..., ::-1])
                         cv2.pollKey()
@@ -723,7 +1047,7 @@ def main(
                         pass
                     time.sleep(0.05)
 
-                # ---------- recording（已在零力模式，不再重复 set_gravity） ----------
+                # ---------- recording（零力可选；开录后不再重复 set_gravity） ----------
                 episode_id = env.replay_buffer.n_episodes
                 start_delay = 0.5
                 eval_t_start = time.time() + start_delay
@@ -753,13 +1077,18 @@ def main(
                                 stop_drop = True
                             elif key_stroke == KeyCode(char="e"):
                                 print("Still recording — save/drop first, then press E.")
+                            elif key_stroke == KeyCode(char="i"):
+                                print_current_pose(env, tag="rec")
                             elif key_stroke == KeyCode(char="q"):
-                                print("Quit requested — abort current episode.")
+                                print("Quit requested — abort current episode, then go home.")
                                 abort_episode(env)
-                                leave_drag_mode(env)
+                                go_home_before_quit(env)
                                 return
 
                         obs = env.get_obs()
+                        if now - last_pose_print_t >= pose_print_interval:
+                            print_current_pose(env, tag="rec")
+                            last_pose_print_t = now
                         record_pose_action(env, obs)
                         n_steps += 1
 
@@ -768,8 +1097,10 @@ def main(
                             episode_id,
                             t_elapsed,
                             n_steps,
-                            drag_ready=True,
+                            zero_force_active=zero_force_active,
+                            no_zero_force=no_zero_force,
                             recording=True,
+                            n_robots=n_robots,
                         )
                         cv2.imshow("drag_collect", vis[..., ::-1])
                         cv2.pollKey()
@@ -800,9 +1131,9 @@ def main(
                     print("Interrupted — abort episode.")
                     abort_episode(env)
                     leave_drag_mode(env)
-                    drag_ready = False
+                    zero_force_active = False
 
-                if drag_ready:
+                if zero_force_active or no_zero_force:
                     print(
                         "Ready for next episode. Press C to start, "
                         "E to delete a saved episode, or Q to quit.\n"
