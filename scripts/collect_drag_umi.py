@@ -1,7 +1,7 @@
 """
 ARX5 拖拽采数脚本（重力补偿 / 零力拖拽）。
-数据131可能有问题
 注：已经验证
+
 不需要起SDK服务，采集到的是x5.urdf（/data1/projects/umi-arx-hzl/modules/arx_x5_python/bimanual/script/x5.urdf）
 上面的 link6 的位姿。(X5.urdf / X5_umi.urdf才有eef_link)
 
@@ -22,21 +22,20 @@ python python/communication/zmq_server_ac_one.py X5 can3 --gripper-open-readout 
      replay_buffer.zarr，并保存 videos/{episode_id}/*.mp4
 
 用法:
+    python scripts/collect_drag_umi.py -o data/collect_demo --terminal_keys
+
+    # 指定初始位姿:
     python scripts/collect_drag_umi.py -o data/collect_demo \\
         --init_pose 0.4,0.0,0.25,0,1.57,0 --init_gripper 0.08
 
-    # SSH 无 X11 时用终端按键:
-    python scripts/collect_drag_umi.py -o data/collect_demo \\
-        --init_pose 0.4,0.0,0.25,0,1.57,0 --terminal_keys
+    # 启动时不移动到 init_pose:
+    python scripts/collect_drag_umi.py -o data/collect_demo --no_init_pose
 
     # 如果上面报错，则执行下面：
-    cd /data1/projects/umi-arx-hzl/modules/arx_x5_python
+    cd /data1/projects/umi-arx-kian/modules/arx_x5_python
     source setup.sh
-    cd /data1/projects/umi-arx-hzl
+    cd /data1/projects/umi-arx-kian
     python scripts/collect_drag_umi.py --init_pose ...
-
-
-    python scripts/collect_drag_umi.py -o data/cup_demo2 --init_pose -0.006958,-0.002573,0.120019,2.464006,-2.497232,1.524022 --init_gripper 0.000604 --no_zero_force
 
 键盘:
   P = 切换零力：首次进入；再按退出零力并缓动回 --init_pose
@@ -44,11 +43,11 @@ python python/communication/zmq_server_ac_one.py X5 can3 --gripper-open-readout 
   S = 停止并保存
   D = 丢弃当前正在录的 episode（未保存）
   E = 删除已保存的指定 episode（空闲时；输入编号后 Y 确认）
-  I = 打印当前 TCP 位姿（可直接复制为 --init_pose）
+  I = 开关位姿打印：开后约每 0.5s 输出一次；再按关闭
   Q = 回 home 后退出
 
-启动流程: reset_to_home →（可选）缓动到 --init_pose → 等 P 进零力（或 --no_zero_force 直接 C）。
-空闲/拖拽/录制时终端会周期性打印当前位姿，便于挑选初始位姿。
+启动流程: reset_to_home → 缓动到 --init_pose（默认开启；--no_init_pose 跳过）→ 等 P 进零力（或 --no_zero_force 直接 C）。
+默认不刷屏；按 I 开始/停止持续打印当前位姿（可复制为 --init_pose）。
 不做 episode 级 init 移动；按 C 时臂在哪就从哪开录。
 
 关节置0：
@@ -177,7 +176,7 @@ class TerminalKeyReader:
         print(
             "[terminal_keys] 在本终端按键: "
             "p=开关零力(再按回init), c=开始, s=保存, d=丢弃当前, "
-            "e=删已保存, i=打印当前位姿, q=回home退出"
+            "e=删已保存, i=开关位姿打印, q=回home退出"
         )
         return self
 
@@ -879,15 +878,29 @@ def parse_episode_id(text: str) -> int | None:
 )
 @click.option(
     "--init_pose",
-    default=None,
+    default="-0.006958,-0.002573,0.120019,2.464006,-2.497232,1.524022",
+    show_default=True,
     type=str,
-    help="启动后缓动到的固定 TCP 位姿: x,y,z,rx,ry,rz（米 & 轴角弧度）；省略则不移动",
+    help="启动后缓动到的固定 TCP 位姿: x,y,z,rx,ry,rz（米 & 轴角弧度）",
+)
+@click.option(
+    "--no_init_pose",
+    is_flag=True,
+    default=False,
+    help="启动时不缓动到 --init_pose（保持 home）",
 )
 @click.option(
     "--init_gripper",
-    default=None,
+    default=0.000604,
+    show_default=True,
     type=float,
-    help="启动时目标夹爪开度（米）；默认保持当前开度",
+    help="启动时目标夹爪开度（米）",
+)
+@click.option(
+    "--keep_gripper",
+    is_flag=True,
+    default=False,
+    help="启动/回 init 时不改夹爪，保持当前开度",
 )
 @click.option(
     "--init_duration",
@@ -899,7 +912,7 @@ def parse_episode_id(text: str) -> int | None:
 @click.option(
     "--no_zero_force",
     is_flag=True,
-    default=False,
+    default=True,
     help="不要求先进零力模式，可直接 C 开录 / S 保存（P 仍可选）",
 )
 @click.option(
@@ -924,7 +937,9 @@ def main(
     terminal_keys,
     save_images,
     init_pose,
+    no_init_pose,
     init_gripper,
+    keep_gripper,
     init_duration,
     no_zero_force,
     quit_home_duration,
@@ -936,7 +951,8 @@ def main(
     robots_config = _default_robots_config()
     n_robots = len(robots_config)
     camera_reorder_list = [int(x) for x in camera_reorder.split(",") if x.strip() != ""]
-    init_pose6 = parse_pose6(init_pose) if init_pose else None
+    init_pose6 = None if no_init_pose else parse_pose6(init_pose)
+    gripper_target = None if keep_gripper else float(init_gripper)
 
     print("=" * 60)
     print("ARX5 Drag Data Collection")
@@ -952,7 +968,7 @@ def main(
         )
     print(
         f"  init_gripper: "
-        f"{'keep current' if init_gripper is None else f'{init_gripper:.4f} m'}"
+        f"{'keep current' if gripper_target is None else f'{gripper_target:.6f} m'}"
     )
     print(f"  init_duration: {init_duration:.1f}s")
     print(f"  no_zero_force: {no_zero_force}")
@@ -1009,7 +1025,7 @@ def main(
                     init_pose6,
                     frequency=frequency,
                     duration=init_duration,
-                    init_gripper=init_gripper,
+                    init_gripper=gripper_target,
                 )
             else:
                 if no_zero_force:
@@ -1024,11 +1040,12 @@ def main(
                     )
 
             zero_force_active = False
+            pose_print_enabled = False
+            last_pose_print_t = 0.0
+            pose_print_interval = 0.5
             delete_mode = None  # None | "input" | "confirm"
             delete_buf = ""
             delete_target = None
-            last_pose_print_t = 0.0
-            pose_print_interval = 0.5
 
             if no_zero_force:
                 print("Direct record mode: press C to start (P optional for drag).")
@@ -1107,7 +1124,7 @@ def main(
                                     init_pose6,
                                     frequency=frequency,
                                     duration=init_duration,
-                                    init_gripper=init_gripper,
+                                    init_gripper=gripper_target,
                                 )
                                 zero_force_active = False
                         if key_stroke == KeyCode(char="c"):
@@ -1120,10 +1137,16 @@ def main(
                         if is_drop_key(key_stroke):
                             print("No active episode to drop. Press E to delete a saved one.")
                         if key_stroke == KeyCode(char="i"):
-                            try:
-                                print_current_pose(env, tag="init-candidate")
-                            except Exception as exc:  # noqa: BLE001
-                                print(f"Failed to read pose: {exc}")
+                            pose_print_enabled = not pose_print_enabled
+                            if pose_print_enabled:
+                                last_pose_print_t = 0.0
+                                print("Pose print ON (press I again to stop).")
+                                try:
+                                    print_current_pose(env, tag="live")
+                                except Exception as exc:  # noqa: BLE001
+                                    print(f"Failed to read pose: {exc}")
+                            else:
+                                print("Pose print OFF.")
                         if key_stroke == KeyCode(char="e"):
                             n_saved = env.replay_buffer.n_episodes
                             if n_saved <= 0:
@@ -1141,10 +1164,11 @@ def main(
 
                     try:
                         obs = env.get_obs()
-                        now = time.monotonic()
-                        if now - last_pose_print_t >= pose_print_interval:
-                            print_current_pose(env, tag="live")
-                            last_pose_print_t = now
+                        if pose_print_enabled:
+                            now = time.monotonic()
+                            if now - last_pose_print_t >= pose_print_interval:
+                                print_current_pose(env, tag="live")
+                                last_pose_print_t = now
                         n_saved = env.replay_buffer.n_episodes
                         delete_prompt = None
                         if delete_mode == "input":
@@ -1204,7 +1228,13 @@ def main(
                             elif key_stroke == KeyCode(char="e"):
                                 print("Still recording — save/drop first, then press E.")
                             elif key_stroke == KeyCode(char="i"):
-                                print_current_pose(env, tag="rec")
+                                pose_print_enabled = not pose_print_enabled
+                                if pose_print_enabled:
+                                    last_pose_print_t = 0.0
+                                    print("Pose print ON (press I again to stop).")
+                                    print_current_pose(env, tag="rec")
+                                else:
+                                    print("Pose print OFF.")
                             elif key_stroke == KeyCode(char="q"):
                                 print("Quit requested — abort current episode, then go home.")
                                 abort_episode(env)
@@ -1218,9 +1248,10 @@ def main(
                                 return
 
                         obs = env.get_obs()
-                        if now - last_pose_print_t >= pose_print_interval:
-                            print_current_pose(env, tag="rec")
-                            last_pose_print_t = now
+                        if pose_print_enabled:
+                            if now - last_pose_print_t >= pose_print_interval:
+                                print_current_pose(env, tag="rec")
+                                last_pose_print_t = now
                         record_pose_action(env, obs)
                         n_steps += 1
 
