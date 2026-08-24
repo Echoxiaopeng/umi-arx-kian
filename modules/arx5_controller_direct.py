@@ -480,20 +480,32 @@ class Arx5ControllerDirect(mp.Process):
                         self.waypoint_buffer = []
                         self.ring_buffer.clear()
 
-                        # 获取当前状态
+                        # 必须用当前真实位姿重建插值器；否则 pose_interp 仍停在
+                        # 进零力前的末路点，下一控制周期会急跳回该位姿。
                         self.robot_client.get_state()
+                        curr_pose = self.robot_client.tcp_pose
+                        curr_gripper_pos = self.robot_client.gripper_pos
+                        curr_t = time.monotonic()
+                        last_waypoint_time = curr_t
+                        pose_interp = PoseTrajectoryInterpolator(
+                            times=np.array([curr_t]), poses=np.array([curr_pose])
+                        )
+                        gripper_pos_interp = PoseTrajectoryInterpolator(
+                            times=np.array([curr_t]),
+                            poses=np.array([[curr_gripper_pos, 0, 0, 0, 0, 0]]),
+                        )
                         state = {
-                            "ActualTCPPose": self.robot_client.tcp_pose,
+                            "ActualTCPPose": curr_pose,
                             "ActualQ": self.robot_client.joint_pos,
                             "ActualQd": self.robot_client.joint_vel,
-                            "gripper_position": self.robot_client.gripper_pos,
+                            "gripper_position": curr_gripper_pos,
                         }
                         t_recv = time.time()
                         state["robot_receive_timestamp"] = t_recv
                         state["robot_timestamp"] = t_recv - self.receive_latency
                         self.ring_buffer.put(state)
 
-                        self.robot_client.set_tcp_pose(state["ActualTCPPose"], state["gripper_position"])
+                        self.robot_client.set_tcp_pose(curr_pose, curr_gripper_pos)
                     elif cmd == Command.SET_TO_DAMPING.value:
                         self.robot_client.set_to_damping()
                         print(f"[Arx5ControllerDirect] set_to_damping")

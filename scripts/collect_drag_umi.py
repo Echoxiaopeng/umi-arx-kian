@@ -36,7 +36,7 @@ python python/communication/zmq_server_ac_one.py X5 can3 --gripper-open-readout 
     python scripts/collect_drag_umi.py --init_pose ...
 
 
-    python scripts/collect_drag_umi.py -o data/cup_demo --init_pose -0.006958,-0.002573,0.120019,2.464006,-2.497232,1.524022 --init_gripper 0.000604 --no_zero_force
+    python scripts/collect_drag_umi.py -o data/cup_demo2 --init_pose -0.006958,-0.002573,0.120019,2.464006,-2.497232,1.524022 --init_gripper 0.000604 --no_zero_force
 
 键盘:
   P = 进入零力模式（重力补偿，可拖拽）
@@ -344,23 +344,35 @@ def parse_pose6(text: str) -> np.ndarray:
     return np.asarray(vals, dtype=np.float64)
 
 
-def move_to_init_pose(
+def capture_robot_pose_targets(
     env: Arx5EnvWithImages,
-    target_pose6: np.ndarray,
+) -> list[tuple[np.ndarray, float]]:
+    """记录各臂当前 TCP 位姿 + 夹爪（与 exec_actions 同源 ActualTCPPose）。"""
+    out: list[tuple[np.ndarray, float]] = []
+    for state in env.get_robot_state():
+        pose = np.asarray(state["ActualTCPPose"], dtype=np.float64).reshape(6).copy()
+        grip = float(state["gripper_position"])
+        out.append((pose, grip))
+    return out
+
+
+def move_to_tcp_pose(
+    env: Arx5EnvWithImages,
+    targets: list[tuple[np.ndarray, float | None]],
     *,
     frequency: float,
     duration: float = 2.5,
-    init_gripper: float | None = None,
+    label: str = "target",
+    ensure_end_control: bool = False,
 ) -> None:
     """
-    启动时在末端控制模式下缓动到固定 TCP 位姿（此时尚未进零力）。
+    末端控制模式下缓动到目标 TCP 位姿。
 
-    姿态用 SLERP，避免 rotvec 长短角表示不同时线性插值绕飞。
-    waypoint 分批下发，避免 input_queue 塞满。
+    targets: 每臂 (pose6, gripper)；gripper 为 None 则保持当前开度。
     """
     from scipy.spatial.transform import Rotation, Slerp
 
-    if hasattr(env, "set_end_control"):
+    if ensure_end_control and hasattr(env, "set_end_control"):
         try:
             env.set_end_control()
             time.sleep(0.05)
@@ -369,29 +381,34 @@ def move_to_init_pose(
 
     robot_states = env.get_robot_state()
     n_robots = len(robot_states)
-    target_pose6 = np.asarray(target_pose6, dtype=np.float64).reshape(6)
+    if len(targets) != n_robots:
+        raise ValueError(f"targets len {len(targets)} != n_robots {n_robots}")
 
     start_pose_all = []
     start_grip_all = []
+    target_pose_all = []
     target_grip_all = []
     start_rots = []
     target_rots = []
     for ridx in range(n_robots):
         curr6 = robot_states[ridx]["ActualTCPPose"].astype(np.float64).copy()
         grip = float(robot_states[ridx]["gripper_position"])
-        tgt_grip = grip if init_gripper is None else float(init_gripper)
+        tgt6 = np.asarray(targets[ridx][0], dtype=np.float64).reshape(6)
+        tgt_grip = targets[ridx][1]
+        tgt_grip = grip if tgt_grip is None else float(tgt_grip)
         start_pose_all.append(curr6)
+        target_pose_all.append(tgt6)
         start_grip_all.append(grip)
         target_grip_all.append(tgt_grip)
         start_rots.append(Rotation.from_rotvec(curr6[3:6]))
-        target_rots.append(Rotation.from_rotvec(target_pose6[3:6]))
+        target_rots.append(Rotation.from_rotvec(tgt6[3:6]))
 
     start_pose_all = np.stack(start_pose_all, axis=0)
+    target_pose_all = np.stack(target_pose_all, axis=0)
     start_grip_all = np.asarray(start_grip_all, dtype=np.float64)
     target_grip_all = np.asarray(target_grip_all, dtype=np.float64)
-    target_pos = target_pose6[:3]
 
-    print("Moving to init pose (end-effector control, not zero-force)...")
+    print(f"Moving to {label} (end-effector control)...")
     for ridx in range(n_robots):
         print(
             f"  robot{ridx}  from "
@@ -400,11 +417,10 @@ def move_to_init_pose(
         )
         print(
             f"  robot{ridx}    to "
-            f"{np.array2string(target_pose6, precision=4, separator=',')} "
+            f"{np.array2string(target_pose_all[ridx], precision=4, separator=',')} "
             f"grip={target_grip_all[ridx]:.4f}"
         )
 
-    # 降低下发密度，避免 SharedMemoryQueue Full（buffer=256）
     cmd_hz = min(float(frequency), 20.0)
     dt = 1.0 / cmd_hz
     steps = max(2, int(duration * cmd_hz))
@@ -421,7 +437,7 @@ def move_to_init_pose(
             cmd = np.zeros(7 * n_robots, dtype=np.float64)
             for ridx in range(n_robots):
                 pos_now = start_pose_all[ridx, :3] + a * (
-                    target_pos - start_pose_all[ridx, :3]
+                    target_pose_all[ridx, :3] - start_pose_all[ridx, :3]
                 )
                 slerp = Slerp(
                     key_times, Rotation.concatenate([start_rots[ridx], target_rots[ridx]])
@@ -441,15 +457,36 @@ def move_to_init_pose(
             timestamps=np.asarray(timestamps),
             compensate_latency=False,
         )
-        # 等本批大部分时间走完再塞下一批
         if batch_end < steps:
             time.sleep(max(0.0, (batch_end - batch_start) * dt * 0.85))
 
     remain = (t0 + (steps - 1) * dt + 0.25) - time.time()
     if remain > 0:
         time.sleep(remain)
+
+
+def move_to_init_pose(
+    env: Arx5EnvWithImages,
+    target_pose6: np.ndarray,
+    *,
+    frequency: float,
+    duration: float = 2.5,
+    init_gripper: float | None = None,
+) -> None:
+    """启动时缓动到固定 init 位姿（此时尚未进零力）。"""
+    n_robots = len(env.robots)
+    targets = [(target_pose6, init_gripper) for _ in range(n_robots)]
+    move_to_tcp_pose(
+        env,
+        targets,
+        frequency=frequency,
+        duration=duration,
+        label="init pose",
+        ensure_end_control=True,
+    )
     print("Init pose reached. Press P to enter zero-force, then C to record.")
     print_current_pose(env, tag="after-init")
+
 
 def record_pose_action(env: Arx5EnvWithImages, obs: dict) -> None:
     """
@@ -612,22 +649,44 @@ def leave_drag_mode(env: Arx5EnvWithImages) -> None:
     #     print(f"set_to_damping warning: {exc}")
 
 
-def go_home_before_quit(env: Arx5EnvWithImages) -> None:
-    """退出前先离开零力并回 home，再交给 env 析构清理。"""
-    print("Returning to home before quit...")
-    try:
-        if hasattr(env, "set_end_control"):
-            env.set_end_control()
-            time.sleep(0.05)
-    except Exception as exc:  # noqa: BLE001
-        print(f"set_end_control warning: {exc}")
+def go_home_before_quit(
+    env: Arx5EnvWithImages,
+    home_targets: list[tuple[np.ndarray, float]],
+    *,
+    frequency: float,
+    duration: float = 3.0,
+    zero_force_active: bool = False,
+) -> None:
+    """
+    退出前先离开零力，再缓动回启动时记录的 home TCP 位姿。
 
-    for robot_idx, robot in enumerate(env.robots):
+    避免零力模式下直接 robot.reset_to_home() / go_home() 造成急跳。
+    """
+    print("Returning to home before quit...")
+    if hasattr(env, "set_end_control"):
         try:
-            print(f"  reset_to_home robot{robot_idx}...")
-            robot.reset_to_home()
+            env.set_end_control()
+            # 零力切回末端控制后多等一会，让当前位姿稳住
+            time.sleep(0.4 if zero_force_active else 0.15)
         except Exception as exc:  # noqa: BLE001
-            print(f"  reset_to_home robot{robot_idx} failed: {exc}")
+            print(f"set_end_control warning: {exc}")
+
+    if home_targets:
+        move_to_tcp_pose(
+            env,
+            [(pose, grip) for pose, grip in home_targets],
+            frequency=frequency,
+            duration=duration,
+            label="home",
+        )
+    else:
+        print("No home pose cached; falling back to reset_to_home().")
+        for robot_idx, robot in enumerate(env.robots):
+            try:
+                print(f"  reset_to_home robot{robot_idx}...")
+                robot.reset_to_home()
+            except Exception as exc:  # noqa: BLE001
+                print(f"  reset_to_home robot{robot_idx} failed: {exc}")
     print("Home done. Exiting.")
 
 
@@ -807,6 +866,13 @@ def parse_episode_id(text: str) -> int | None:
     default=False,
     help="不要求先进零力模式，可直接 C 开录 / S 保存（P 仍可选）",
 )
+@click.option(
+    "--quit_home_duration",
+    default=3.0,
+    type=float,
+    show_default=True,
+    help="按 Q 退出时缓动回 home 的时长（秒）",
+)
 def main(
     output,
     frequency,
@@ -825,6 +891,7 @@ def main(
     init_gripper,
     init_duration,
     no_zero_force,
+    quit_home_duration,
 ):
     from peripherals.keystroke_counter import KeystrokeCounter
 
@@ -894,6 +961,9 @@ def main(
             check_episode_alignment(env)
             print("Env ready.")
 
+            home_targets = capture_robot_pose_targets(env)
+            print("Home pose captured (used when pressing Q to quit).")
+
             if init_pose6 is not None:
                 move_to_init_pose(
                     env,
@@ -931,7 +1001,13 @@ def main(
                     for key_stroke in drain_keys(key_source):
                         if key_stroke == KeyCode(char="q"):
                             print("Quit.")
-                            go_home_before_quit(env)
+                            go_home_before_quit(
+                                env,
+                                home_targets,
+                                frequency=frequency,
+                                duration=quit_home_duration,
+                                zero_force_active=zero_force_active,
+                            )
                             return
 
                         if delete_mode == "confirm":
@@ -1082,7 +1158,13 @@ def main(
                             elif key_stroke == KeyCode(char="q"):
                                 print("Quit requested — abort current episode, then go home.")
                                 abort_episode(env)
-                                go_home_before_quit(env)
+                                go_home_before_quit(
+                                    env,
+                                    home_targets,
+                                    frequency=frequency,
+                                    duration=quit_home_duration,
+                                    zero_force_active=zero_force_active,
+                                )
                                 return
 
                         obs = env.get_obs()
