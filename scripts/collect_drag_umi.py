@@ -39,7 +39,7 @@ python python/communication/zmq_server_ac_one.py X5 can3 --gripper-open-readout 
     python scripts/collect_drag_umi.py -o data/cup_demo2 --init_pose -0.006958,-0.002573,0.120019,2.464006,-2.497232,1.524022 --init_gripper 0.000604 --no_zero_force
 
 键盘:
-  P = 进入零力模式（重力补偿，可拖拽）
+  P = 切换零力：首次进入；再按退出零力并缓动回 --init_pose
   C = 开始采集（默认须先按 P；--no_zero_force 时可直接 C）
   S = 停止并保存
   D = 丢弃当前正在录的 episode（未保存）
@@ -176,7 +176,8 @@ class TerminalKeyReader:
         tty.setcbreak(self._fd)
         print(
             "[terminal_keys] 在本终端按键: "
-            "p=零力, c=开始, s=保存, d=丢弃当前, e=删已保存, i=打印当前位姿, q=回home退出"
+            "p=开关零力(再按回init), c=开始, s=保存, d=丢弃当前, "
+            "e=删已保存, i=打印当前位姿, q=回home退出"
         )
         return self
 
@@ -649,6 +650,41 @@ def leave_drag_mode(env: Arx5EnvWithImages) -> None:
     #     print(f"set_to_damping warning: {exc}")
 
 
+def leave_zero_force_to_init(
+    env: Arx5EnvWithImages,
+    init_pose6: np.ndarray | None,
+    *,
+    frequency: float,
+    duration: float = 2.5,
+    init_gripper: float | None = None,
+) -> None:
+    """
+    退出零力后缓动回 init_pose。
+
+    set_end_control 已在控制器侧用当前位姿重建 pose_interp，不会弹回进零力前位姿。
+    未提供 init_pose 时只退出零力、保持当前位置。
+    """
+    print("Zero-force OFF. Leaving drag mode...")
+    if hasattr(env, "set_end_control"):
+        try:
+            env.set_end_control()
+            time.sleep(0.4)
+        except Exception as exc:  # noqa: BLE001
+            print(f"set_end_control warning: {exc}")
+
+    if init_pose6 is None:
+        print("No --init_pose given; staying at current pose.")
+        return
+
+    move_to_init_pose(
+        env,
+        init_pose6,
+        frequency=frequency,
+        duration=duration,
+        init_gripper=init_gripper,
+    )
+
+
 def go_home_before_quit(
     env: Arx5EnvWithImages,
     home_targets: list[tuple[np.ndarray, float]],
@@ -723,7 +759,7 @@ def make_vis_image(
         help_text = delete_prompt
     elif zero_force_active:
         status = "DRAG"
-        help_text = "C start | I pose | E del ep | Q quit"
+        help_text = "C start | P->init | I pose | Q quit"
     elif no_zero_force:
         status = "READY"
         help_text = "C start | P zero-force | I pose | Q quit"
@@ -924,7 +960,10 @@ def main(
         print("  startup: reset_to_home → optional init_pose → C to record (P optional)")
     else:
         print("  startup: reset_to_home → optional init_pose → P then C")
-    print("  P=zero-force  C=start  S=save  D=drop  E=del  I=print-pose  Q=home+quit")
+    print(
+        "  P=toggle zero-force (again -> init_pose)  "
+        "C=start  S=save  D=drop  E=del  I=pose  Q=home+quit"
+    )
     print("=" * 60)
 
     key_ctx = (
@@ -1057,9 +1096,20 @@ def main(
                             if not zero_force_active:
                                 env.set_gravity_compensation()
                                 zero_force_active = True
-                                print("Zero-force ON. Drag freely, then press C to record.")
+                                print(
+                                    "Zero-force ON. Drag freely. "
+                                    "Press P again to exit and return to init_pose, "
+                                    "or C to record."
+                                )
                             else:
-                                print("Already in zero-force mode.")
+                                leave_zero_force_to_init(
+                                    env,
+                                    init_pose6,
+                                    frequency=frequency,
+                                    duration=init_duration,
+                                    init_gripper=init_gripper,
+                                )
+                                zero_force_active = False
                         if key_stroke == KeyCode(char="c"):
                             if zero_force_active or no_zero_force:
                                 start_episode = True
