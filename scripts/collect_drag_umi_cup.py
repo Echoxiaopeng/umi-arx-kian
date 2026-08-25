@@ -6,9 +6,9 @@ ARX5 三杯挪杯采数脚本（臂固定拍图；人按脚本出题挪杯；同
 
 协议（每条 episode）:
   1. C 出题 → 方块固定放最左杯 (0)；第 1 次交换从杯 0 开始
-  2. Space → 录第 0 帧（静止）
-  3. 显示 Move k → Space → 人交换两杯，同时录 20 帧（×3）共 61 帧
-  4. Space → 进入零力，人拖臂夹取 final_cup 上的杯子（持续录）
+  2. F → 录第 0 帧（静止）
+  3. 显示 Move k → F → 人交换两杯，同时录 frames_per_move 帧（×3）
+  4. F → 进入零力，人拖臂夹取 final_cup 上的杯子（持续录）
   5. S → 保存整段 zarr/videos + labels.jsonl；回 init_pose
 
 同步策略（与拖拽采数相同）:
@@ -21,11 +21,11 @@ ARX5 三杯挪杯采数脚本（臂固定拍图；人按脚本出题挪杯；同
     python scripts/collect_drag_umi_cup.py -o data/cup_demo --terminal_keys
 
     python scripts/collect_drag_umi_cup.py -o data/cup_demo \\
-        --init_pose 0.4,0.0,0.25,0,1.57,0 --init_gripper 0.08 --seed 0
+        --frames_per_move 30 --frequency 10 --seed 0
 
 键盘:
   C = 出下一题并进入摆放阶段
-  Space = 进入下一段观察录制 / 观察结束后进零力夹取
+  F = 进入下一段观察录制 / 观察结束后进零力夹取
   S = 夹取段结束并保存整条 episode（仅 record_grasp）
   D = 丢弃当前正在录的 episode（未保存）
   E = 删除已保存的指定 episode（空闲时；同步维护 labels.jsonl）
@@ -73,9 +73,20 @@ from utils.other_util import precise_wait  # noqa: E402
 CUP_NAMES = ("left", "middle", "right")
 N_CUPS = 3
 N_MOVES = 3
-FRAMES_PER_MOVE = 20
-FRAMES_TOTAL = 1 + N_MOVES * FRAMES_PER_MOVE  # 61
+DEFAULT_FRAMES_PER_MOVE = 20
+FRAMES_PER_MOVE = DEFAULT_FRAMES_PER_MOVE
+FRAMES_TOTAL = 1 + N_MOVES * FRAMES_PER_MOVE  # 1 + 3 * frames_per_move
 LABELS_FILENAME = "labels.jsonl"
+
+
+def set_observe_frame_counts(frames_per_move: int) -> None:
+    """Update global observe-segment lengths used by FSM / labels / UI."""
+    global FRAMES_PER_MOVE, FRAMES_TOTAL
+    fpm = int(frames_per_move)
+    if fpm < 1:
+        raise click.BadParameter("--frames_per_move must be >= 1")
+    FRAMES_PER_MOVE = fpm
+    FRAMES_TOTAL = 1 + N_MOVES * FRAMES_PER_MOVE
 
 
 @dataclass(frozen=True)
@@ -84,14 +95,18 @@ class CupTask:
     moves: tuple[tuple[int, int], ...]
     final_cup: int
 
-    def to_label_dict(self, episode_id: int, n_frames: int = FRAMES_TOTAL) -> dict:
+    def to_label_dict(self, episode_id: int, n_frames: int | None = None) -> dict:
+        obs_n = int(FRAMES_TOTAL)
+        if n_frames is None:
+            n_frames = obs_n
         return {
             "episode_id": int(episode_id),
             "initial_cup": int(self.initial_cup),
             "moves": [list(m) for m in self.moves],
             "final_cup": int(self.final_cup),
-            "n_observe_frames": FRAMES_TOTAL,
-            "grasp_start_frame": FRAMES_TOTAL,
+            "frames_per_move": int(FRAMES_PER_MOVE),
+            "n_observe_frames": obs_n,
+            "grasp_start_frame": obs_n,
             "n_frames": int(n_frames),
         }
 
@@ -407,7 +422,7 @@ class TerminalKeyReader:
         tty.setcbreak(self._fd)
         print(
             "[terminal_keys] 在本终端按键: "
-            "c=出题, space=观察段, s=夹取后保存, d=丢弃, "
+            "c=出题, f=下一段/进零力, s=夹取后保存, d=丢弃, "
             "e=删已保存, p=可选零力, i=位姿, q=回home退出"
         )
         return self
@@ -435,8 +450,8 @@ class TerminalKeyReader:
 
     @staticmethod
     def _char_to_event(ch: str):
-        if ch == " ":
-            return Key.space
+        if ch in ("f", "F"):
+            return KeyCode(char="f")
         if ch in ("p", "P"):
             return KeyCode(char="p")
         if ch in ("c", "C"):
@@ -1024,19 +1039,19 @@ def make_vis_image(
             status = "GRASP"
         else:
             status = "REC"
-        help_text = phase_text or "Space next | D drop | I pose | Q quit"
+        help_text = phase_text or "F next | D drop | I pose | Q quit"
     elif delete_prompt:
         status = "DEL"
         help_text = delete_prompt
     elif cup_lines:
         status = "TASK"
-        help_text = phase_text or "Space=record segment | D drop | Q quit"
+        help_text = phase_text or "F=next segment | D drop | Q quit"
     elif zero_force_active:
         status = "DRAG"
         help_text = "C task | P->init | I pose | Q quit"
     elif no_zero_force:
         status = "READY"
-        help_text = "C task | Space after setup | I pose | Q quit"
+        help_text = "C task | F after setup | I pose | Q quit"
     else:
         status = "IDLE"
         help_text = "C task | P zero-force | E del | Q quit"
@@ -1112,8 +1127,9 @@ def is_drop_key(key_stroke) -> bool:
     return key_stroke in (Key.backspace, KeyCode(char="d"))
 
 
-def is_space_key(key_stroke) -> bool:
-    return key_stroke == Key.space
+def is_advance_key(key_stroke) -> bool:
+    """F advances observe segments / enters zero-force grasp."""
+    return key_stroke == KeyCode(char="f")
 
 
 def key_char(key_stroke) -> str | None:
@@ -1155,14 +1171,14 @@ def phase_overlay(
     if phase == "wait_setup":
         help_t = (
             f"Place block under cup {task.initial_cup} ({cup_name(task.initial_cup)}), "
-            "then Space"
+            "then F"
         )
     elif phase == "record_frame0":
         help_t = f"Recording frame 0  ({n_steps}/{FRAMES_TOTAL})"
     elif phase.startswith("wait_move"):
         a, b = task.moves[move_idx]
         help_t = (
-            f"Get ready: swap {a} ({cup_name(a)}) <-> {b} ({cup_name(b)}), then Space"
+            f"Get ready: swap {a} ({cup_name(a)}) <-> {b} ({cup_name(b)}), then F"
         )
     elif phase.startswith("record_move"):
         a, b = task.moves[move_idx]
@@ -1173,7 +1189,7 @@ def phase_overlay(
         )
     elif phase == "wait_grasp":
         help_t = (
-            f"Observe done. Press Space to enter ZERO-FORCE and grasp cup "
+            f"Observe done. Press F to enter ZERO-FORCE and grasp cup "
             f"{task.final_cup} ({cup_name(task.final_cup)})"
         )
     elif phase == "record_grasp":
@@ -1202,7 +1218,14 @@ def phase_overlay(
     "-f",
     default=10.0,
     type=float,
-    help="采数频率 Hz（默认 10；每次移动约 2s @ 20 帧）",
+    help="采数频率 Hz（默认 10）",
+)
+@click.option(
+    "--frames_per_move",
+    default=DEFAULT_FRAMES_PER_MOVE,
+    show_default=True,
+    type=int,
+    help="每次杯子交换录制的帧数；观察段总长 = 1 + 3×该值",
 )
 @click.option("--camera_reorder", "-cr", default="0", help="相机顺序，如 0 或 0,1")
 @click.option("--obs_width", default=224, type=int)
@@ -1291,6 +1314,7 @@ def phase_overlay(
 def main(
     output,
     frequency,
+    frames_per_move,
     camera_reorder,
     obs_width,
     obs_height,
@@ -1314,6 +1338,7 @@ def main(
 ):
     from peripherals.keystroke_counter import KeystrokeCounter
 
+    set_observe_frame_counts(frames_per_move)
     os.makedirs(output, exist_ok=True)
     dt = 1.0 / frequency
     robots_config = _default_robots_config()
@@ -1330,7 +1355,11 @@ def main(
     print("ARX5 Cup Shell Data Collection (scripted labels)")
     print(f"  output     : {output}")
     print(f"  frequency  : {frequency} Hz")
-    print(f"  frames     : observe {FRAMES_TOTAL} (= 1 + {N_MOVES}x{FRAMES_PER_MOVE}) + grasp until S")
+    print(
+        f"  frames     : observe {FRAMES_TOTAL} "
+        f"(= 1 + {N_MOVES}x{FRAMES_PER_MOVE}) + grasp until S"
+    )
+    print(f"  frames_per_move: {FRAMES_PER_MOVE}")
     print(f"  n_robots   : {n_robots}")
     print(f"  save_images: {save_images}")
     print(f"  labels     : {labels_path(output)}")
@@ -1347,7 +1376,7 @@ def main(
         f"{'keep current' if gripper_target is None else f'{gripper_target:.6f} m'}"
     )
     print(
-        "  C=task  Space=observe segment  S=save after grasp  "
+        "  C=task  F=next segment / zero-force  S=save after grasp  "
         "D=drop  E=del  I=pose  Q=home+quit"
     )
     print("  Cups: 0=left  1=middle  2=right  (overlay on preview)")
@@ -1577,7 +1606,7 @@ def main(
                 print("=" * 50)
                 print(
                     f"Place block under cup {task.initial_cup} "
-                    f"({cup_name(task.initial_cup)}), then press Space."
+                    f"({cup_name(task.initial_cup)}), then press F."
                 )
 
                 phase = "wait_setup"
@@ -1605,7 +1634,7 @@ def main(
                                 else:
                                     print(
                                         "S only during grasp. "
-                                        "Finish observe, then Space to enter "
+                                        "Finish observe, then F to enter "
                                         "zero-force, then S to save."
                                     )
                             elif key_stroke == KeyCode(char="e"):
@@ -1633,7 +1662,7 @@ def main(
                                     zero_force_active=zero_force_active,
                                 )
                                 return
-                            elif is_space_key(key_stroke):
+                            elif is_advance_key(key_stroke):
                                 if phase == "wait_setup":
                                     start_delay = 0.3
                                     eval_t_start = time.time() + start_delay
@@ -1752,7 +1781,7 @@ def main(
                                             f"Frame 0 done. Ready for move 1: "
                                             f"swap {a} ({cup_name(a)}) <-> "
                                             f"{b} ({cup_name(b)}). "
-                                            "Press Space, then swap."
+                                            "Press F, then swap."
                                         )
                                     elif phase.startswith("record_move"):
                                         if move_idx + 1 >= N_MOVES:
@@ -1765,7 +1794,7 @@ def main(
                                             phase = "wait_grasp"
                                             print(
                                                 f"Observe done ({n_steps} frames). "
-                                                "Press Space to enter zero-force and "
+                                                "Press F to enter zero-force and "
                                                 f"grasp cup {task.final_cup} "
                                                 f"({cup_name(task.final_cup)})."
                                             )
@@ -1778,7 +1807,7 @@ def main(
                                                 f"move {move_idx + 1}: swap "
                                                 f"{a} ({cup_name(a)}) <-> "
                                                 f"{b} ({cup_name(b)}). "
-                                                "Press Space, then swap."
+                                                "Press F, then swap."
                                             )
 
                         cup_lines, phase_text = phase_overlay(
