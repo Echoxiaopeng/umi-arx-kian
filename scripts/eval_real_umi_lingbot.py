@@ -33,9 +33,13 @@ p_eef = p_link6 + R_tcp @ [0, 0, 0.145]
     SpaceMouse / init_gripper_delta 不取反。
   - 采集/训练是 link6 TCP；本脚本走 ZMQ X5，下发前沿 TCP Z 加 0.145 m
     变成 eef_link（旋转不变）。--eef_offset 0 可关掉。
-  - 协议: reset → infer(obs 图像) → 执行 → compute_kv_cache(state=上一 chunk 原始 action)
+  - 协议 (async, 默认, 论文 Algorithm 2):
+      reset → cold infer(a0)
+      loop: 执行 a_t ‖ (fdm_ground(a_t) → infer a_{t+1}) → commit_real(真实关键帧, a_t)
+  - 协议 (sync, --sync_infer):
+      reset → infer(obs 图像) → 执行 → compute_kv_cache(state=上一 chunk 原始 action)
   - infer obs 只包含图像；20 维 WAM state 仅用于本地诊断
-  - KV 请求顶层 state 是本轮实际提交部分对应的原始模型 action 张量
+  - FDM/KV/commit 顶层 state 是本轮实际提交部分对应的原始模型 action 张量
 
 用法:
     # 1. GPU 机启动 server（务必加载微调权重，例如 step400 评测包）:
@@ -47,12 +51,14 @@ p_eef = p_link6 + R_tcp @ [0, 0, 0.145]
    
     # 默认 host=0.0.0.0 port=29536
 
-    # 可选隧道: ssh -L 5566:127.0.0.1:5566 kian@
+    # 可选远程推理：
+python scripts/eval_real_umi_lingbot.py --policy_host 58.251.254.222 --policy_port 5566 --terminal_keys --sync_infer
 
     # 2. 本机（机械臂 / 相机 / SpaceMouse）:
     conda activate umi-arx-kian
     python scripts/eval_real_umi_lingbot.py --policy_port 5566
-        
+    # 部分执行示例: --exec_horizon 8（须为模型 H 的整数倍）
+    # 同步回退: 加 --sync_infer
 
 键盘:
   Human: C=交给 policy, Q=退出, B=删除 episode
@@ -64,12 +70,16 @@ export DISPLAY=:1
 export XAUTHORITY=/run/user/1000/gdm/Xauthority
 python scripts/eval_real_umi_lingbot.py --terminal_keys --policy_port 5566
 
+
+python scripts/eval_real_umi_lingbot.py --policy_host 58.251.254.222 --policy_port 5566
+
 测试：
     2026-7-30 目前在真机上可以正常运行，有靠近目标，但是抓取失败。使用的checkpoint是500步的，训练数据集大小是89 Episodes.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import os
 import select
@@ -168,7 +178,7 @@ class _BundledWebsocketClient:
         port: int = 29536,
         api_key: str | None = None,
         connect_timeout: float = 5.0,
-        request_timeout: float = 60.0,
+        request_timeout: float = 100.0,
     ):
         self._uri = f"ws://{host}:{port}"
         self._packer = msgpack_numpy.Packer()
@@ -896,7 +906,7 @@ class LingBotVAClient:
         port: int = 29536,
         *,
         connect_timeout: float = 5.0,
-        request_timeout: float = 60.0,
+        request_timeout: float = 100.0,
     ):
         self._client = _create_websocket_client(
             host=host,
@@ -938,17 +948,16 @@ class LingBotVAClient:
         self._first_chunk = False
         return flat, raw
 
-    def update_kv_cache(
-        self,
-        key_frames: list[dict],
-        raw_action: np.ndarray,
-        n_exec: int,
-        prompt: str,
-    ) -> tuple[int, int]:
-        if not key_frames:
-            raise ValueError("key_frames must not be empty for KV cache update")
+    def action_state_for_exec(
+        self, raw_action: np.ndarray, n_exec: int
+    ) -> tuple[np.ndarray, int]:
+        """切片本轮实际执行对应的原始 action，供 KV / FDM / commit_real。
+
+        必须在下一次 infer_chunk 之前调用：async 会先 predict 下一 chunk，
+        否则 _last_chunk_start 会被覆盖。
+        """
         if self._last_chunk_start is None:
-            raise RuntimeError("update_kv_cache called before infer_chunk")
+            raise RuntimeError("action_state_for_exec called before infer_chunk")
 
         raw = np.asarray(raw_action)
         if raw.ndim != 3:
@@ -973,6 +982,21 @@ class LingBotVAClient:
             cache_action = raw[:, :end, :]
         else:
             cache_action = raw[:, :executed_temporals, :]
+        return cache_action, executed_temporals
+
+    def update_kv_cache(
+        self,
+        key_frames: list[dict],
+        raw_action: np.ndarray,
+        n_exec: int,
+        prompt: str,
+    ) -> tuple[int, int]:
+        if not key_frames:
+            raise ValueError("key_frames must not be empty for KV cache update")
+
+        cache_action, executed_temporals = self.action_state_for_exec(
+            raw_action, n_exec
+        )
         expected_key_frames = executed_temporals * OBS_FRAMES_PER_LATENT
         if len(key_frames) != expected_key_frames:
             raise ValueError(
@@ -991,6 +1015,41 @@ class LingBotVAClient:
             )
         )
         return executed_temporals, cache_action.shape[1]
+
+    def fdm_ground(self, cache_action: np.ndarray, prompt: str) -> None:
+        """Paper Algorithm 2: 用已知 a_t grounding 想象视觉，同时机器人执行。"""
+        self._client.infer(
+            dict(
+                fdm_ground=True,
+                state=np.asarray(cache_action),
+                prompt=prompt,
+            )
+        )
+
+    def commit_real(
+        self,
+        key_frames: list[dict],
+        cache_action: np.ndarray,
+        executed_temporals: int,
+        prompt: str,
+    ) -> None:
+        """用真实关键帧替换 FDM 想象 visual；保留已预测的下一 chunk。"""
+        if not key_frames:
+            raise ValueError("key_frames must not be empty for commit_real")
+        expected_key_frames = executed_temporals * OBS_FRAMES_PER_LATENT
+        if len(key_frames) != expected_key_frames:
+            raise ValueError(
+                f"Expected {expected_key_frames} commit key frames for "
+                f"{executed_temporals} executed temporal frames, got {len(key_frames)}"
+            )
+        self._client.infer(
+            dict(
+                commit_real=True,
+                obs=key_frames,
+                state=np.asarray(cache_action),
+                prompt=prompt,
+            )
+        )
 
 
 # ===========================================================================
@@ -1123,7 +1182,7 @@ def _clear_key_events(key_counter, terminal_reader):
 )
 @click.option(
     "--policy_request_timeout",
-    default=60.0,
+    default=300.0,
     type=float,
     show_default=True,
     help="单次 LingBot-VA 请求的超时（秒；内嵌 client）",
@@ -1174,7 +1233,7 @@ def _clear_key_events(key_counter, terminal_reader):
     help="位姿微调: dx,dy,dz,drx,dry,drz（米/弧度）",
 )
 @click.option("--init_gripper_delta", type=float, default=0.11, help="夹爪开度微调（米）")
-@click.option("--gripper_min_width", type=float, default=0.011, help="夹爪最小开度（米）")
+@click.option("--gripper_min_width", type=float, default=0.01, help="夹爪最小开度（米）")
 @click.option(
     "--gripper_max_width",
     type=float,
@@ -1241,6 +1300,13 @@ def _clear_key_events(key_counter, terminal_reader):
     "相对动作在 link6 上展开后，沿 TCP Z 加该偏移再下发；旋转不变。"
     "Direct / 已经是 eef 数据时设为 0。",
 )
+@click.option(
+    "--async_infer/--sync_infer",
+    default=True,
+    show_default=True,
+    help="异步 Algorithm 2（执行 ‖ FDM+下一 chunk 预测；支持 --exec_horizon 部分执行）；"
+    "--sync_infer 回退旧闭环",
+)
 def main(
     output,
     umi_project_root,
@@ -1274,6 +1340,7 @@ def main(
     terminal_keys,
     debug_fixed_delta,
     eef_offset,
+    async_infer,
 ):
     _ensure_umi_project(umi_project_root)
     _ensure_lingbot_project(lingbot_project_root or os.environ.get("LINGBOT_VA_ROOT"))
@@ -1307,6 +1374,10 @@ def main(
         raise click.BadParameter("--frequency must be > 0")
     if policy_connect_timeout <= 0 or policy_request_timeout <= 0:
         raise click.BadParameter("--policy timeouts must be > 0")
+    if async_infer and debug_fixed_delta is not None:
+        raise click.BadParameter(
+            "--async_infer 不能与 --debug_fixed_delta 同时使用；请加 --sync_infer"
+        )
 
     fixed_delta_vec = None
     if debug_fixed_delta is not None:
@@ -1345,8 +1416,9 @@ def main(
         print("LingBot-VA connection skipped in fixed-delta debug mode.")
     eef_offset = float(eef_offset)
     print(
-        "[ALIGN] WAM state20 + EE-frame action10 (row-rot6d); "
-        "LingBot KV request state=raw model action"
+        f"[MODE] {'async_fdm (Algorithm 2)' if async_infer else 'sync'} "
+        f"| WAM state20 + EE-frame action10 (row-rot6d); "
+        "LingBot FDM/KV/commit state=raw model action"
     )
     if abs(eef_offset) > 1e-12:
         print(
@@ -1617,6 +1689,22 @@ def main(
                     prev_model_step_world = None
                     prev_decode_step_world = None
 
+                    # Cold start PREDICT only for async Algorithm 2.
+                    pending_flat = pending_raw = None
+                    if async_infer:
+                        assert client is not None
+                        obs0 = env.get_obs()
+                        wrist_img0 = _to_uint8_hwc(obs0["camera0_rgb"][-1])
+                        t_cold = time.time()
+                        pending_flat, pending_raw = client.infer_chunk(
+                            wrist_img0, task_prompt
+                        )
+                        print(
+                            f"[DIAG][MODEL] cold_infer={time.time() - t_cold:.3f}s "
+                            f"flat={pending_flat.shape} raw={pending_raw.shape} "
+                            f"mode=async_fdm"
+                        )
+
                     while True:
                         obs = env.get_obs()
                         obs_timestamps = obs["timestamp"]
@@ -1636,12 +1724,17 @@ def main(
                                 fixed_delta_vec, (steps_per_inference, 1)
                             )
                             raw_action = None
+                            infer_s = time.time() - s
+                        elif async_infer:
+                            flat_chunk = pending_flat
+                            raw_action = pending_raw
+                            infer_s = 0.0  # filled after overlap GPU work
                         else:
                             assert client is not None
                             flat_chunk, raw_action = client.infer_chunk(
                                 wrist_img, task_prompt
                             )
-                        infer_s = time.time() - s
+                            infer_s = time.time() - s
 
                         n_exec = (
                             len(flat_chunk)
@@ -1716,13 +1809,66 @@ def main(
                             debug_fixed_delta=debug_fixed_delta,
                         )
 
-                        env.exec_actions(
-                            actions=abs_exec,
-                            timestamps=action_timestamps,
-                            dynamic_latency=False,
-                        )
+                        next_flat = next_raw = None
+                        if client is not None and async_infer:
+                            # 在下一 chunk infer 前先切片 a_t，避免 _last_chunk_start 被覆盖。
+                            cache_action, executed_temporals = (
+                                client.action_state_for_exec(raw_action, n_exec)
+                            )
 
-                        if client is not None:
+                            def _exec_and_collect():
+                                env.exec_actions(
+                                    actions=abs_exec,
+                                    timestamps=action_timestamps,
+                                    dynamic_latency=False,
+                                )
+                                return _collect_keyframes_during_exec(
+                                    env,
+                                    n_exec=n_exec,
+                                    action_timestamps=action_timestamps,
+                                    actions_per_temporal=actions_per_temporal,
+                                    observation_delay=frame_latency,
+                                )
+
+                            t_overlap0 = time.time()
+                            with concurrent.futures.ThreadPoolExecutor(
+                                max_workers=1
+                            ) as pool:
+                                fut = pool.submit(_exec_and_collect)
+                                t_gpu0 = time.time()
+                                client.fdm_ground(cache_action, task_prompt)
+                                next_flat, next_raw = client.infer_chunk(
+                                    wrist_img, task_prompt
+                                )
+                                gpu_s = time.time() - t_gpu0
+                                key_frames = fut.result()
+                            overlap_s = time.time() - t_overlap0
+                            infer_s = gpu_s
+                            t_commit0 = time.time()
+                            client.commit_real(
+                                key_frames,
+                                cache_action,
+                                executed_temporals,
+                                task_prompt,
+                            )
+                            commit_s = time.time() - t_commit0
+                            pending_flat, pending_raw = next_flat, next_raw
+                            print(
+                                f"[DIAG][MODEL] async gpu(fdm+infer)={gpu_s:.3f}s "
+                                f"overlap_wall={overlap_s:.3f}s "
+                                f"commit_real={commit_s:.3f}s "
+                                f"{'OVER_BUDGET' if (overlap_s + commit_s) > budget_s else 'ok'} "
+                                f"next_flat={next_flat.shape} "
+                                f"collected={len(key_frames)} "
+                                f"executed_F={executed_temporals} "
+                                f"cached_F={cache_action.shape[1]}"
+                            )
+                        elif client is not None:
+                            env.exec_actions(
+                                actions=abs_exec,
+                                timestamps=action_timestamps,
+                                dynamic_latency=False,
+                            )
                             key_frames = _collect_keyframes_during_exec(
                                 env,
                                 n_exec=n_exec,
@@ -1745,6 +1891,11 @@ def main(
                                 f"cached_F={cached_temporals}"
                             )
                         else:
+                            env.exec_actions(
+                                actions=abs_exec,
+                                timestamps=action_timestamps,
+                                dynamic_latency=False,
+                            )
                             # 固定动作调试没有 KV 关键帧采集，因此显式等待本轮
                             # waypoint 执行完成，避免下一轮立即覆盖尚未执行的轨迹。
                             precise_wait(

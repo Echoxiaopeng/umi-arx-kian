@@ -952,7 +952,12 @@ def make_vis_image(
     cup_overlay_positions: list[tuple[int, int]] | None = None,
     highlight_cups: set[int] | None = None,
     cup_cam_offset_x: int = 0,
+    vis_scale: float = 3.0,
+    panel_height: int = 220,
 ) -> np.ndarray:
+    """
+    上方放大相机画面（仅叠 0/1/2），下方空白面板写指令/状态。
+    """
     cam_keys = sorted(k for k in obs if k.startswith("camera") and k.endswith("_rgb"))
     if not cam_keys:
         raise RuntimeError("obs 中没有 camera*_rgb")
@@ -965,7 +970,31 @@ def make_vis_image(
             else:
                 img = np.clip(img, 0, 255).astype(np.uint8)
         frames.append(img)
-    vis = np.concatenate(frames, axis=1) if len(frames) > 1 else frames[0]
+    cam = np.concatenate(frames, axis=1) if len(frames) > 1 else frames[0]
+    cam = np.ascontiguousarray(cam)
+
+    scale = max(float(vis_scale), 1.0)
+    if abs(scale - 1.0) > 1e-6:
+        cam = cv2.resize(
+            cam,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+    if cup_overlay_positions is not None:
+        scaled_positions = [
+            (int(round(x * scale)), int(round(y * scale)))
+            for x, y in cup_overlay_positions
+        ]
+        draw_cup_slot_markers(
+            cam,
+            scaled_positions,
+            highlight_cups=highlight_cups,
+            cam_offset_x=int(round(cup_cam_offset_x * scale)),
+        )
+
     if recording:
         status = "REC"
         help_text = phase_text or "Space next | D drop | I pose | Q quit"
@@ -984,67 +1013,63 @@ def make_vis_image(
     else:
         status = "IDLE"
         help_text = "C task | P zero-force | E del | Q quit"
-    text = f"{status} Ep:{episode_id}  t={t_elapsed:.1f}s  frames={n_steps}/{FRAMES_TOTAL}"
-    cv2.putText(vis, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-    cv2.putText(
-        vis,
-        help_text,
-        (10, 56),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (255, 255, 255),
-        1,
+
+    h, w = cam.shape[:2]
+    panel_h = max(int(panel_height), 160)
+    panel = np.full((panel_h, w, 3), 28, dtype=np.uint8)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    status_color = (0, 0, 255) if recording else (0, 200, 255)
+    header = (
+        f"{status}  Ep:{episode_id}  t={t_elapsed:.1f}s  "
+        f"frames={n_steps}/{FRAMES_TOTAL}"
     )
-    y = 84
+    cv2.putText(panel, header, (12, 32), font, 0.75, status_color, 2, cv2.LINE_AA)
+    cv2.putText(panel, help_text, (12, 64), font, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+    y = 96
     if cup_lines:
         for line in cup_lines:
-            cv2.putText(
-                vis,
-                line,
-                (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 0),
-                1,
-            )
-            y += 22
-    if cup_overlay_positions is not None:
-        draw_cup_slot_markers(
-            vis,
-            cup_overlay_positions,
-            highlight_cups=highlight_cups,
-            cam_offset_x=cup_cam_offset_x,
+            cv2.putText(panel, line, (12, y), font, 0.58, (80, 255, 120), 1, cv2.LINE_AA)
+            y += 26
+    else:
+        cv2.putText(
+            panel,
+            "Cups: 0=left  1=middle  2=right   (markers on image)",
+            (12, y),
+            font,
+            0.55,
+            (180, 180, 180),
+            1,
+            cv2.LINE_AA,
         )
+        y += 28
+
     try:
         for robot_idx, (pose, grip) in enumerate(
             tcp_pose_grip_from_obs(obs, n_robots)
         ):
-            y0 = y + robot_idx * 44
+            if y + 20 >= panel_h - 8:
+                break
             cv2.putText(
-                vis,
+                panel,
                 (
                     f"r{robot_idx} xyz "
                     f"{pose[0]:.3f},{pose[1]:.3f},{pose[2]:.3f}  "
                     f"grip {grip:.3f}"
                 ),
-                (10, y0),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
+                (12, y),
+                font,
+                0.48,
                 (0, 255, 255),
                 1,
+                cv2.LINE_AA,
             )
-            cv2.putText(
-                vis,
-                f"r{robot_idx} rot {pose[3]:.3f},{pose[4]:.3f},{pose[5]:.3f}",
-                (10, y0 + 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (0, 255, 255),
-                1,
-            )
+            y += 22
     except Exception:
         pass
-    return vis
+
+    return np.concatenate([cam, panel], axis=0)
 
 
 def drain_keys(key_source) -> list:
@@ -1208,6 +1233,13 @@ def phase_overlay(
     type=str,
     help="预览上 0/1/2 标记位置（224x224 像素）: x0,y0;x1,y1;x2,y2",
 )
+@click.option(
+    "--vis_scale",
+    default=3.0,
+    type=float,
+    show_default=True,
+    help="预览窗口相机画面放大倍数（仅显示，不影响落盘分辨率）",
+)
 def main(
     output,
     frequency,
@@ -1230,6 +1262,7 @@ def main(
     quit_home_duration,
     seed,
     cup_overlay_xy,
+    vis_scale,
 ):
     from peripherals.keystroke_counter import KeystrokeCounter
 
@@ -1254,6 +1287,7 @@ def main(
     print(f"  save_images: {save_images}")
     print(f"  labels     : {labels_path(output)}")
     print(f"  seed       : {seed}")
+    print(f"  vis_scale  : {vis_scale}x (preview only)")
     if init_pose6 is None:
         print("  init_pose  : (skip)")
     else:
@@ -1476,6 +1510,7 @@ def main(
                             delete_prompt=delete_prompt,
                             n_robots=n_robots,
                             cup_overlay_positions=cup_overlay_positions,
+                            vis_scale=vis_scale,
                         )
                         cv2.imshow("cup_collect", vis[..., ::-1])
                         cv2.pollKey()
@@ -1641,6 +1676,7 @@ def main(
                             highlight_cups=highlight_cups_for_phase(
                                 task, phase, move_idx
                             ),
+                            vis_scale=vis_scale,
                         )
                         cv2.imshow("cup_collect", vis[..., ::-1])
                         cv2.pollKey()
