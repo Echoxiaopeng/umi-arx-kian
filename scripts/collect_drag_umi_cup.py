@@ -1,14 +1,15 @@
 """
-ARX5 三杯挪杯采数脚本（臂固定拍图；人按脚本出题挪杯）。
+ARX5 三杯挪杯采数脚本（臂固定拍图；人按脚本出题挪杯；同 episode 零力夹取）。
 
 脚本先随机生成任务（方块初始杯子 + 3 次交换），人照做；出题参数即标签。
-机械臂缓动到 --init_pose 后保持不动，只记录相机 + 机器人状态。
+观察段机械臂固定拍图；满 61 帧后立刻进零力，继续录夹取轨迹，按 S 整段保存。
 
-协议（每条 episode 共 61 帧）:
-  1. C 出题 → 人把方块放到 initial_cup
+协议（每条 episode）:
+  1. C 出题 → 方块固定放最左杯 (0)；第 1 次交换从杯 0 开始
   2. Space → 录第 0 帧（静止）
-  3. 显示 Move k → Space → 人交换两杯，同时录 20 帧（×3）
-  4. 满 61 帧自动保存 zarr/videos + labels.jsonl
+  3. 显示 Move k → Space → 人交换两杯，同时录 20 帧（×3）共 61 帧
+  4. Space → 进入零力，人拖臂夹取 final_cup 上的杯子（持续录）
+  5. S → 保存整段 zarr/videos + labels.jsonl；回 init_pose
 
 同步策略（与拖拽采数相同）:
   1. 每步 env.get_obs()：多相机最近邻对齐，机器人状态插值到相机时间
@@ -24,17 +25,16 @@ ARX5 三杯挪杯采数脚本（臂固定拍图；人按脚本出题挪杯）。
 
 键盘:
   C = 出下一题并进入摆放阶段
-  Space = 进入下一段录制（frame0 / move1 / move2 / move3）
+  Space = 进入下一段观察录制 / 观察结束后进零力夹取
+  S = 夹取段结束并保存整条 episode（仅 record_grasp）
   D = 丢弃当前正在录的 episode（未保存）
   E = 删除已保存的指定 episode（空闲时；同步维护 labels.jsonl）
-  P = 可选零力开关（再按退出并缓动回 --init_pose）
+  P = 可选零力开关（idle；再按退出并缓动回 --init_pose）
   I = 开关位姿打印
   Q = 回 home 后退出
 
 杯子编号: 从左到右 0=left, 1=middle, 2=right（预览窗口叠 0/1/2 圆标）
-python scripts/collect_drag_umi_cup.py -o data/cup_demo \
-  --cup_overlay_xy "55,95;112,85;168,95"
-  
+
 Author: Kian
 """
 
@@ -90,6 +90,8 @@ class CupTask:
             "initial_cup": int(self.initial_cup),
             "moves": [list(m) for m in self.moves],
             "final_cup": int(self.final_cup),
+            "n_observe_frames": FRAMES_TOTAL,
+            "grasp_start_frame": FRAMES_TOTAL,
             "n_frames": int(n_frames),
         }
 
@@ -107,10 +109,20 @@ def apply_swaps(initial_cup: int, moves: list[tuple[int, int]] | tuple[tuple[int
 
 
 def sample_cup_task(rng: random.Random) -> CupTask:
-    initial = rng.randrange(N_CUPS)
+    """
+    方块始终从最左杯 (0) 开始；第 1 次交换必须包含杯 0。
+    后两次交换在三个槽位中均匀随机选一对。
+    """
+    initial = 0  # always leftmost on frame 0
     moves: list[tuple[int, int]] = []
-    for _ in range(N_MOVES):
+    # First swap starts from the left cup.
+    other = rng.choice([1, 2])
+    moves.append((0, int(other)))
+    for _ in range(N_MOVES - 1):
         a, b = rng.sample(range(N_CUPS), 2)
+        # keep smaller index first for stable display when 0 is involved
+        if a > b:
+            a, b = b, a
         moves.append((int(a), int(b)))
     final = apply_swaps(initial, moves)
     return CupTask(initial_cup=initial, moves=tuple(moves), final_cup=final)
@@ -163,10 +175,20 @@ def save_labels(output_dir: str | Path, rows: list[dict]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def append_episode_label(output_dir: str | Path, task: CupTask, episode_id: int) -> None:
+def append_episode_label(
+    output_dir: str | Path,
+    task: CupTask,
+    episode_id: int,
+    n_frames: int | None = None,
+) -> None:
     rows = load_labels(output_dir)
     rows = [r for r in rows if int(r.get("episode_id", -1)) != int(episode_id)]
-    rows.append(task.to_label_dict(episode_id))
+    rows.append(
+        task.to_label_dict(
+            episode_id,
+            n_frames=FRAMES_TOTAL if n_frames is None else int(n_frames),
+        )
+    )
     rows.sort(key=lambda r: int(r["episode_id"]))
     save_labels(output_dir, rows)
 
@@ -246,6 +268,8 @@ def highlight_cups_for_phase(
     if phase.startswith("wait_move") or phase.startswith("record_move"):
         a, b = task.moves[move_idx]
         return {int(a), int(b)}
+    if phase in ("wait_grasp", "record_grasp"):
+        return {task.final_cup}
     return set()
 
 
@@ -383,7 +407,7 @@ class TerminalKeyReader:
         tty.setcbreak(self._fd)
         print(
             "[terminal_keys] 在本终端按键: "
-            "c=出题, space=下一段录制, d=丢弃, "
+            "c=出题, space=观察段, s=夹取后保存, d=丢弃, "
             "e=删已保存, p=可选零力, i=位姿, q=回home退出"
         )
         return self
@@ -996,7 +1020,10 @@ def make_vis_image(
         )
 
     if recording:
-        status = "REC"
+        if phase_text and phase_text.startswith("ZERO-FORCE"):
+            status = "GRASP"
+        else:
+            status = "REC"
         help_text = phase_text or "Space next | D drop | I pose | Q quit"
     elif delete_prompt:
         status = "DEL"
@@ -1020,9 +1047,12 @@ def make_vis_image(
     font = cv2.FONT_HERSHEY_SIMPLEX
 
     status_color = (0, 0, 255) if recording else (0, 200, 255)
+    if n_steps <= FRAMES_TOTAL:
+        frames_text = f"frames={n_steps}/{FRAMES_TOTAL}"
+    else:
+        frames_text = f"frames={n_steps} (obs {FRAMES_TOTAL}+grasp)"
     header = (
-        f"{status}  Ep:{episode_id}  t={t_elapsed:.1f}s  "
-        f"frames={n_steps}/{FRAMES_TOTAL}"
+        f"{status}  Ep:{episode_id}  t={t_elapsed:.1f}s  {frames_text}"
     )
     cv2.putText(panel, header, (12, 32), font, 0.75, status_color, 2, cv2.LINE_AA)
     cv2.putText(panel, help_text, (12, 64), font, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
@@ -1112,7 +1142,15 @@ def phase_overlay(
         mark = ">" if i == move_idx and phase.startswith("wait_move") else " "
         if phase.startswith("record_move") and i == move_idx:
             mark = "*"
+        if phase in ("wait_grasp", "record_grasp"):
+            mark = " "
         lines.append(f"{mark} M{i + 1}: swap {a}<->{b}")
+    if phase in ("wait_grasp", "record_grasp"):
+        mark = ">" if phase == "wait_grasp" else "*"
+        lines.append(
+            f"{mark} GRASP cup {task.final_cup} ({cup_name(task.final_cup)})  "
+            f"frames={n_steps}"
+        )
 
     if phase == "wait_setup":
         help_t = (
@@ -1132,6 +1170,16 @@ def phase_overlay(
         help_t = (
             f"REC move {move_idx + 1}: swap {a}<->{b}  "
             f"seg {seg}/{FRAMES_PER_MOVE}  total {n_steps}/{FRAMES_TOTAL}"
+        )
+    elif phase == "wait_grasp":
+        help_t = (
+            f"Observe done. Press Space to enter ZERO-FORCE and grasp cup "
+            f"{task.final_cup} ({cup_name(task.final_cup)})"
+        )
+    elif phase == "record_grasp":
+        help_t = (
+            f"ZERO-FORCE: grasp cup {task.final_cup} "
+            f"({cup_name(task.final_cup)}), then S save | D drop"
         )
     else:
         help_t = f"frames {n_steps}/{FRAMES_TOTAL}"
@@ -1282,7 +1330,7 @@ def main(
     print("ARX5 Cup Shell Data Collection (scripted labels)")
     print(f"  output     : {output}")
     print(f"  frequency  : {frequency} Hz")
-    print(f"  frames     : {FRAMES_TOTAL} (= 1 + {N_MOVES}x{FRAMES_PER_MOVE})")
+    print(f"  frames     : observe {FRAMES_TOTAL} (= 1 + {N_MOVES}x{FRAMES_PER_MOVE}) + grasp until S")
     print(f"  n_robots   : {n_robots}")
     print(f"  save_images: {save_images}")
     print(f"  labels     : {labels_path(output)}")
@@ -1298,7 +1346,10 @@ def main(
         f"  init_gripper: "
         f"{'keep current' if gripper_target is None else f'{gripper_target:.6f} m'}"
     )
-    print("  C=task  Space=next segment  D=drop  E=del  I=pose  Q=home+quit")
+    print(
+        "  C=task  Space=observe segment  S=save after grasp  "
+        "D=drop  E=del  I=pose  Q=home+quit"
+    )
     print("  Cups: 0=left  1=middle  2=right  (overlay on preview)")
     if cup_overlay_xy:
         print(f"  cup_overlay_xy: {cup_overlay_xy}")
@@ -1534,6 +1585,7 @@ def main(
                 n_steps = 0
                 episode_started = False
                 stop_drop = False
+                stop_save = False
                 loop_t0 = time.monotonic()
                 last_tick = loop_t0
                 frames_needed = 0
@@ -1547,6 +1599,15 @@ def main(
                         for key_stroke in drain_keys(key_source):
                             if is_drop_key(key_stroke):
                                 stop_drop = True
+                            elif key_stroke == KeyCode(char="s"):
+                                if phase == "record_grasp":
+                                    stop_save = True
+                                else:
+                                    print(
+                                        "S only during grasp. "
+                                        "Finish observe, then Space to enter "
+                                        "zero-force, then S to save."
+                                    )
                             elif key_stroke == KeyCode(char="e"):
                                 print("Still in episode — drop first, then press E.")
                             elif key_stroke == KeyCode(char="i"):
@@ -1596,6 +1657,28 @@ def main(
                                     phase = f"record_move_{move_idx}"
                                     frames_needed = FRAMES_PER_MOVE
                                     last_tick = time.monotonic()
+                                elif phase == "wait_grasp":
+                                    print(
+                                        f">>> Zero-force ON. Grasp cup "
+                                        f"{task.final_cup} "
+                                        f"({cup_name(task.final_cup)}), "
+                                        "then press S to save."
+                                    )
+                                    try:
+                                        env.set_gravity_compensation()
+                                        zero_force_active = True
+                                    except Exception as exc:  # noqa: BLE001
+                                        print(
+                                            "set_gravity_compensation "
+                                            f"failed: {exc}"
+                                        )
+                                    phase = "record_grasp"
+                                    last_tick = time.monotonic()
+                                elif phase == "record_grasp":
+                                    print(
+                                        "Already in grasp. Drag to cup "
+                                        f"{task.final_cup}, then press S to save."
+                                    )
 
                         if stop_drop:
                             if episode_started:
@@ -1604,6 +1687,44 @@ def main(
                                 print(
                                     f"Episode {episode_id} cancelled before recording."
                                 )
+                            if zero_force_active:
+                                leave_zero_force_to_init(
+                                    env,
+                                    init_pose6,
+                                    frequency=frequency,
+                                    duration=init_duration,
+                                    init_gripper=gripper_target,
+                                )
+                                zero_force_active = False
+                            break
+
+                        if stop_save and phase == "record_grasp" and episode_started:
+                            if n_steps < FRAMES_TOTAL:
+                                print(
+                                    f"Warning: only {n_steps} frames before save "
+                                    f"(observe expects {FRAMES_TOTAL})."
+                                )
+                            if save_episode(env, episode_id):
+                                append_episode_label(
+                                    output, task, episode_id, n_frames=n_steps
+                                )
+                                print(
+                                    f"Episode {episode_id} saved "
+                                    f"({n_steps} frames @ {frequency} Hz; "
+                                    f"obs={FRAMES_TOTAL} + grasp="
+                                    f"{max(0, n_steps - FRAMES_TOTAL)}). "
+                                    f"initial={task.initial_cup} "
+                                    f"final={task.final_cup} "
+                                    f"-> {labels_path(output)}"
+                                )
+                            leave_zero_force_to_init(
+                                env,
+                                init_pose6,
+                                frequency=frequency,
+                                duration=init_duration,
+                                init_gripper=gripper_target,
+                            )
+                            zero_force_active = False
                             break
 
                         obs = env.get_obs()
@@ -1616,47 +1737,49 @@ def main(
                         if recording_now and episode_started:
                             record_pose_action(env, obs)
                             n_steps += 1
-                            frames_needed -= 1
 
-                            if frames_needed <= 0:
-                                if phase == "record_frame0":
-                                    move_idx = 0
-                                    phase = "wait_move_0"
-                                    a, b = task.moves[0]
-                                    print(
-                                        f"Frame 0 done. Ready for move 1: "
-                                        f"swap {a} ({cup_name(a)}) <-> "
-                                        f"{b} ({cup_name(b)}). "
-                                        "Press Space, then swap."
-                                    )
-                                elif phase.startswith("record_move"):
-                                    if move_idx + 1 >= N_MOVES:
-                                        if n_steps != FRAMES_TOTAL:
+                            if phase == "record_grasp":
+                                # continuous recording until S
+                                pass
+                            else:
+                                frames_needed -= 1
+                                if frames_needed <= 0:
+                                    if phase == "record_frame0":
+                                        move_idx = 0
+                                        phase = "wait_move_0"
+                                        a, b = task.moves[0]
+                                        print(
+                                            f"Frame 0 done. Ready for move 1: "
+                                            f"swap {a} ({cup_name(a)}) <-> "
+                                            f"{b} ({cup_name(b)}). "
+                                            "Press Space, then swap."
+                                        )
+                                    elif phase.startswith("record_move"):
+                                        if move_idx + 1 >= N_MOVES:
+                                            if n_steps != FRAMES_TOTAL:
+                                                print(
+                                                    f"Warning: recorded {n_steps} "
+                                                    f"observe frames, expected "
+                                                    f"{FRAMES_TOTAL}."
+                                                )
+                                            phase = "wait_grasp"
                                             print(
-                                                f"Warning: recorded {n_steps} frames, "
-                                                f"expected {FRAMES_TOTAL}."
+                                                f"Observe done ({n_steps} frames). "
+                                                "Press Space to enter zero-force and "
+                                                f"grasp cup {task.final_cup} "
+                                                f"({cup_name(task.final_cup)})."
                                             )
-                                        if save_episode(env, episode_id):
-                                            append_episode_label(
-                                                output, task, episode_id
-                                            )
+                                        else:
+                                            move_idx += 1
+                                            phase = f"wait_move_{move_idx}"
+                                            a, b = task.moves[move_idx]
                                             print(
-                                                f"Episode {episode_id} saved "
-                                                f"({n_steps} frames @ {frequency} Hz). "
-                                                f"initial={task.initial_cup} "
-                                                f"final={task.final_cup} "
-                                                f"-> {labels_path(output)}"
+                                                f"Move {move_idx} done. Ready for "
+                                                f"move {move_idx + 1}: swap "
+                                                f"{a} ({cup_name(a)}) <-> "
+                                                f"{b} ({cup_name(b)}). "
+                                                "Press Space, then swap."
                                             )
-                                        break
-                                    move_idx += 1
-                                    phase = f"wait_move_{move_idx}"
-                                    a, b = task.moves[move_idx]
-                                    print(
-                                        f"Move {move_idx} done. Ready for move "
-                                        f"{move_idx + 1}: swap {a} ({cup_name(a)}) "
-                                        f"<-> {b} ({cup_name(b)}). "
-                                        "Press Space, then swap."
-                                    )
 
                         cup_lines, phase_text = phase_overlay(
                             task, phase, move_idx, n_steps
@@ -1692,14 +1815,22 @@ def main(
                     print("Interrupted — abort episode.")
                     if episode_started:
                         abort_episode(env)
-                    leave_drag_mode(env)
+                    if zero_force_active:
+                        leave_zero_force_to_init(
+                            env,
+                            init_pose6,
+                            frequency=frequency,
+                            duration=init_duration,
+                            init_gripper=gripper_target,
+                        )
+                    else:
+                        leave_drag_mode(env)
                     zero_force_active = False
 
                 print(
                     "Ready for next episode. Press C for a new task, "
                     "E to delete a saved episode, or Q to quit.\n"
                 )
-
 
 if __name__ == "__main__":
     main()
