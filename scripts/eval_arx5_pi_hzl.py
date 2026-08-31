@@ -1,895 +1,516 @@
-"""
-Usage:
-(umi): python scripts_real/eval_real_umi.py -i data/outputs/2023.10.26/02.25.30_train_diffusion_unet_timm_umi/checkpoints/latest.ckpt -o data_local/cup_test_data
+#!/usr/bin/env python3
+"""Deploy the real-wrist Pi0 semantic-memory policy on one ARX5 arm.
 
-================ Human in control ==============
-Robot movement:
-Move your SpaceMouse to move the robot EEF (locked in xy plane).
-Press SpaceMouse right button to unlock z axis.
-Press SpaceMouse left button to enable rotation axes.
-
-Recording control:
-Click the opencv window (make sure it's in focus).
-Press "C" to start evaluation (hand control over to policy).
-Press "Q" to exit program.
-
-================ Policy in control ==============
-Make sure you can hit the robot hardware emergency-stop button quickly! 
-
-Recording control:
-Press "S" to stop evaluation and gain control back.
+Controls
+--------
+F: capture initial frame, then start each of three 80-frame swap recordings
+C: start policy after the strict 241-frame history is ready
+S: stop policy and return to human control
+P: in human mode, return to init_pose and reset history for the next round
+Q: quit
 """
 
-# %%
-import sys
-import os
-from queue import Queue
+from __future__ import annotations
 
-from openpi_client.websocket_client_policy import WebsocketClientPolicy
-
-ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
-sys.path.append(ROOT_DIR)
-os.chdir(ROOT_DIR)
-
-# %%
-import os
-import pathlib
-import time
 from multiprocessing.managers import SharedMemoryManager
+import os
+from pathlib import Path
+import sys
+import time
 
 import click
 import cv2
 import numpy as np
-import scipy.spatial.transform as st
-from omegaconf import OmegaConf
-from utils.other_util import precise_wait
-from peripherals.keystroke_counter import KeystrokeCounter, Key, KeyCode
-from utils.real_inference_util import (
-    get_real_obs_dict,
-    get_real_obs_resolution,
-    get_real_umi_obs_dict,
-    get_real_umi_action,
-)
-from peripherals.spacemouse_shared_memory import Spacemouse
-from utils.pose_util import pose_to_mat, mat_to_pose
-from modules.arx5_env import Arx5Env
-import zmq
-from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Slerp
 
-OmegaConf.register_new_resolver("eval", eval, replace=True)
+ROOT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT_DIR))
+OPENPI_CLIENT_SRC = ROOT_DIR / "packages" / "openpi-client" / "src"
+if OPENPI_CLIENT_SRC.is_dir():
+    sys.path.insert(0, str(OPENPI_CLIENT_SRC))
+os.chdir(ROOT_DIR)
 
-# DEFAULT_GRIPPER_MAX_WIDTH = 0.11475166624692577
-DEFAULT_GRIPPER_MAX_WIDTH = 0.085
+from utils.shellgame_openpi import ACTION_DIM  # noqa: E402
+from utils.shellgame_openpi import ACTION_HORIZON  # noqa: E402
+from utils.shellgame_openpi import SWAP_FRAMES  # noqa: E402
+from utils.shellgame_openpi import ShellGameHistory  # noqa: E402
+from utils.shellgame_openpi import parse_csv_vector  # noqa: E402
+from utils.shellgame_openpi import relative_chunk_to_world  # noqa: E402
+from utils.shellgame_openpi import run_contract_self_test  # noqa: E402
+from utils.shellgame_openpi import validate_world_actions  # noqa: E402
+
+DEFAULT_INIT_POSE = "-0.006958,-0.002573,0.120019,2.464006,-2.497232,1.524022"
+DEFAULT_PROMPT = "Watch the shell game and lift the cup hiding the ball."
 
 
-def solve_table_collision(ee_pose, gripper_width, height_threshold):
-    finger_thickness = 25.5 / 1000
-    keypoints = list()
-    for dx in [-1, 1]:
-        for dy in [-1, 1]:
-            keypoints.append((dx * gripper_width / 2, dy * finger_thickness / 2, 0))
-    keypoints = np.asarray(keypoints)
-    rot_mat = st.Rotation.from_rotvec(ee_pose[3:6]).as_matrix()
-    transformed_keypoints = (
-        np.transpose(rot_mat @ np.transpose(keypoints)) + ee_pose[:3]
+def ease_in_out_quad(value: np.ndarray) -> np.ndarray:
+    value = np.asarray(value, dtype=np.float64)
+    return np.where(value < 0.5, 2.0 * value * value, 1.0 - ((-2.0 * value + 2.0) ** 2) / 2.0)
+
+
+def current_robot_pose_and_gripper(env) -> tuple[np.ndarray, float]:
+    state = env.get_robot_state()[0]
+    pose = np.asarray(state["ActualTCPPose"], dtype=np.float64).reshape(6)
+    gripper = float(state["gripper_position"])
+    return pose, gripper
+
+
+def hold_current_pose(env) -> None:
+    """Cancel queued ZMQ waypoints by driving each controller to its measured pose."""
+    states = env.get_robot_state()
+    for robot, state in zip(env.robots, states, strict=True):
+        pose = np.asarray(state["ActualTCPPose"], dtype=np.float64).reshape(6)
+        gripper = float(state["gripper_position"])
+        robot.servoL(
+            pose=pose,
+            gripper_pos=gripper,
+            duration=max(0.1, 1.0 / float(robot.frequency)),
+        )
+
+
+def move_to_pose(
+    env,
+    target_pose6: np.ndarray,
+    *,
+    duration: float,
+    frequency: float,
+    target_gripper: float | None,
+    gripper_min: float,
+    gripper_max: float,
+) -> None:
+    """Move to a fixed pose using smooth translation and shortest-path rotation."""
+    start_pose, start_gripper = current_robot_pose_and_gripper(env)
+    target_pose = np.asarray(target_pose6, dtype=np.float64).reshape(6)
+    target_gripper_value = (
+        start_gripper if target_gripper is None else float(np.clip(target_gripper, gripper_min, gripper_max))
     )
-    delta = max(height_threshold - np.min(transformed_keypoints[:, 2]), 0)
-    ee_pose[2] += delta
-    # ee_pose[0] += delta*8
-    ee_pose[0] += delta
+    steps = max(2, round(duration * frequency))
+    linear = np.linspace(0.0, 1.0, steps)
+    blend = ease_in_out_quad(linear)
+
+    positions = start_pose[:3] + blend[:, None] * (target_pose[:3] - start_pose[:3])
+    rotation_keyframes = Rotation.from_rotvec(np.stack([start_pose[3:], target_pose[3:]], axis=0))
+    rotations = Slerp([0.0, 1.0], rotation_keyframes)(blend).as_rotvec()
+    grippers = start_gripper + blend * (target_gripper_value - start_gripper)
+
+    actions = np.concatenate([positions, rotations, grippers[:, None]], axis=-1)
+    start_time = time.time() + 0.25
+    timestamps = start_time + np.arange(steps, dtype=np.float64) / frequency
+    env.exec_actions(actions=actions, timestamps=timestamps, compensate_latency=False)
+    time.sleep(max(0.0, timestamps[-1] - time.time()) + 0.3)
 
 
-def solve_sphere_collision(ee_poses, robots_config):
-    num_robot = len(robots_config)
-    this_that_mat = np.identity(4)
-    this_that_mat[:3, 3] = np.array([0, 0.89, 0])  # TODO: very hacky now!!!!
+def draw_status(frame: np.ndarray, lines: list[str]) -> np.ndarray:
+    image = np.asarray(frame).copy()
+    for index, text in enumerate(lines):
+        y = 24 + index * 24
+        cv2.putText(image, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(image, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+    return image
 
-    for this_robot_idx in range(num_robot):
-        for that_robot_idx in range(this_robot_idx + 1, num_robot):
-            this_ee_mat = pose_to_mat(ee_poses[this_robot_idx][:6])
-            this_sphere_mat_local = np.identity(4)
-            this_sphere_mat_local[:3, 3] = np.asarray(
-                robots_config[this_robot_idx]["sphere_center"]
-            )
-            this_sphere_mat_global = this_ee_mat @ this_sphere_mat_local
-            this_sphere_center = this_sphere_mat_global[:3, 3]
 
-            that_ee_mat = pose_to_mat(ee_poses[that_robot_idx][:6])
-            that_sphere_mat_local = np.identity(4)
-            that_sphere_mat_local[:3, 3] = np.asarray(
-                robots_config[that_robot_idx]["sphere_center"]
-            )
-            that_sphere_mat_global = this_that_mat @ that_ee_mat @ that_sphere_mat_local
-            that_sphere_center = that_sphere_mat_global[:3, 3]
+def run_policy(
+    *,
+    env,
+    client,
+    history: ShellGameHistory,
+    wrist_camera_index: int,
+    prompt: str,
+    frequency: float,
+    steps_per_inference: int,
+    action_lead_time: float,
+    max_duration: float,
+    max_inference_latency: float,
+    max_pos_speed: float,
+    max_rot_speed: float,
+    workspace_min: np.ndarray,
+    workspace_max: np.ndarray,
+    gripper_min: float,
+    gripper_max: float,
+    key_counter,
+    observe_only: bool,
+    warmup_done: bool,
+) -> tuple[bool, bool]:
+    """Run one policy episode. Returns (quit_requested, warmup_done)."""
+    from peripherals.keystroke_counter import KeyCode
 
-            distance = np.linalg.norm(that_sphere_center - this_sphere_center)
-            threshold = (
-                robots_config[this_robot_idx]["sphere_radius"]
-                + robots_config[that_robot_idx]["sphere_radius"]
-            )
-            # print(that_sphere_center, this_sphere_center)
-            if distance < threshold:
-                print("avoid collision between two arms")
-                half_delta = (threshold - distance) / 2
-                normal = (that_sphere_center - this_sphere_center) / distance
-                this_sphere_mat_global[:3, 3] -= half_delta * normal
-                that_sphere_mat_global[:3, 3] += half_delta * normal
+    if not history.ready:
+        print("History is incomplete; refusing to start policy")
+        return False, warmup_done
 
-                ee_poses[this_robot_idx][:6] = mat_to_pose(
-                    this_sphere_mat_global @ np.linalg.inv(this_sphere_mat_local)
+    camera_key = f"camera{wrist_camera_index}_rgb"
+
+    def infer_once() -> tuple[np.ndarray, np.ndarray, dict, float]:
+        obs = env.get_obs()
+        frame = obs[camera_key][-1]
+        anchor_pose = np.concatenate([obs["robot0_eef_pos"][-1], obs["robot0_eef_rot_axis_angle"][-1]], axis=-1).astype(
+            np.float64
+        )
+        gripper_width = float(np.asarray(obs["robot0_gripper_width"][-1]).reshape(-1)[0])
+        policy_obs = history.build_policy_observation(
+            current_frame=frame,
+            current_pose6=anchor_pose,
+            gripper_width=gripper_width,
+            prompt=prompt,
+        )
+        started = time.monotonic()
+        result = client.infer(policy_obs)
+        latency = time.monotonic() - started
+        raw_actions = np.asarray(result["actions"], dtype=np.float64)
+        if raw_actions.shape != (ACTION_HORIZON, ACTION_DIM):
+            raise ValueError(f"Policy returned {raw_actions.shape}, expected {(ACTION_HORIZON, ACTION_DIM)}")
+        return raw_actions, anchor_pose, obs, latency
+
+    if not warmup_done:
+        print("Compiling/warming policy with a throw-away inference; no action will be sent...")
+        _, _, _, warmup_latency = infer_once()
+        warmup_done = True
+        print(f"Policy warm-up complete in {warmup_latency:.3f}s; taking a fresh observation")
+
+    if observe_only:
+        actions, anchor, _, latency = infer_once()
+        world = relative_chunk_to_world(actions, anchor)
+        print(f"[observe-only] inference={latency:.3f}s, raw={actions.shape}")
+        print("[observe-only] first world target:", np.array2string(world[0], precision=5))
+        return False, warmup_done
+
+    episode_started = False
+    quit_requested = False
+    episode_start_time = time.monotonic()
+    try:
+        while True:
+            for key in key_counter.get_press_events():
+                if key == KeyCode(char="s"):
+                    print("S pressed: stopping policy")
+                    return False, warmup_done
+                if key == KeyCode(char="q"):
+                    quit_requested = True
+                    return True, warmup_done
+
+            actions, anchor_pose, obs, inference_latency = infer_once()
+            print(f"Inference latency: {inference_latency:.3f}s")
+            if inference_latency > max_inference_latency:
+                raise RuntimeError(
+                    f"Inference latency {inference_latency:.3f}s exceeds limit {max_inference_latency:.3f}s"
                 )
-                ee_poses[that_robot_idx][:6] = mat_to_pose(
-                    np.linalg.inv(this_that_mat)
-                    @ that_sphere_mat_global
-                    @ np.linalg.inv(that_sphere_mat_local)
-                )
 
-def easeInOutQuad(t: float) -> float:
-    t *= 2.0
-    if t < 1.0:
-        return 0.5 * t * t
-    t -= 1.0
-    return -0.5 * (t * (t - 2.0) - 1.0)
+            world_actions = relative_chunk_to_world(actions, anchor_pose)
+            world_actions[:, 6] = np.clip(world_actions[:, 6], gripper_min, gripper_max)
+            validate_world_actions(
+                world_actions,
+                anchor_pose6=anchor_pose,
+                dt=1.0 / frequency,
+                max_pos_speed=max_pos_speed,
+                max_rot_speed=max_rot_speed,
+                workspace_min=workspace_min,
+                workspace_max=workspace_max,
+            )
+
+            count = min(steps_per_inference, ACTION_HORIZON)
+            selected = world_actions[:count]
+            first_timestamp = time.time() + action_lead_time
+            timestamps = first_timestamp + np.arange(count, dtype=np.float64) / frequency
+            fresh = timestamps > time.time()
+            selected = selected[fresh]
+            timestamps = timestamps[fresh]
+            if not len(selected):
+                raise RuntimeError("All action waypoints became stale before submission")
+
+            if not episode_started:
+                env.start_episode(time.time())
+                episode_started = True
+            env.exec_actions(
+                actions=selected,
+                timestamps=timestamps,
+                compensate_latency=False,
+                dynamic_latency=False,
+            )
+            print(f"Submitted {len(selected)} safe waypoints")
+
+            view = draw_status(
+                obs[f"camera{wrist_camera_index}_rgb"][-1],
+                ["POLICY CONTROL", f"inference {inference_latency:.3f}s", "S: stop  Q: quit"],
+            )
+            cv2.imshow("ARX5 ShellGame", view[..., ::-1])
+            cv2.pollKey()
+
+            deadline = timestamps[-1]
+            while time.time() < deadline:
+                for key in key_counter.get_press_events():
+                    if key == KeyCode(char="s"):
+                        print("S pressed: stopping policy")
+                        return False, warmup_done
+                    if key == KeyCode(char="q"):
+                        quit_requested = True
+                        return True, warmup_done
+                time.sleep(0.01)
+
+            if time.monotonic() - episode_start_time >= max_duration:
+                print("Maximum policy duration reached")
+                break
+    finally:
+        # A fresh servoL target truncates the controller's queued
+        # interpolation, so S does not continue executing the old chunk.
+        hold_current_pose(env)
+        time.sleep(0.15)
+        if episode_started:
+            env.end_episode()
+        print("Policy stopped; human control restored. Restore the cups, then press P.")
+    return quit_requested, warmup_done
+
 
 @click.command()
-@click.option("--input", "-i", required=True, help="Path to checkpoint")
-@click.option("--output", "-o", required=True, help="Directory to save recording")
-@click.option("--policy_ip", default="localhost")
-@click.option("--policy_port", default=8123)
+@click.option("--output", "-o", default="data_local/shellgame_eval", show_default=True)
+@click.option("--policy-ip", default="127.0.0.1", show_default=True)
+@click.option("--policy-port", default=8000, show_default=True, type=int)
+@click.option("--robot-ip", default="127.0.0.1", show_default=True)
+@click.option("--robot-port", default=8765, show_default=True, type=int)
+@click.option("--camera-reorder", default="0", show_default=True)
+@click.option("--wrist-camera-index", default=0, show_default=True, type=int)
+@click.option("--frequency", default=20.0, show_default=True, type=float)
+@click.option("--steps-per-inference", default=8, show_default=True, type=click.IntRange(1, ACTION_HORIZON))
+@click.option("--action-lead-time", default=0.10, show_default=True, type=float)
+@click.option("--max-duration", default=30.0, show_default=True, type=float)
+@click.option("--max-inference-latency", default=3.0, show_default=True, type=float)
+@click.option("--prompt", default=DEFAULT_PROMPT, show_default=True)
 @click.option(
-    "--match_dataset",
-    "-m",
-    default=None,
-    help="Dataset used to overlay and adjust initial condition",
+    "--init-pose",
+    default=DEFAULT_INIT_POSE,
+    show_default=True,
+    type=str,
+    help="启动后缓动到的固定 TCP 位姿: x,y,z,rx,ry,rz (米 & 轴角弧度)",
 )
-@click.option(
-    "--match_episode",
-    "-me",
-    default=None,
-    type=int,
-    help="Match specific episode from the match dataset",
-)
-@click.option("--match_camera", "-mc", default=0, type=int)
-@click.option("--camera_reorder", "-cr", default="0")
-@click.option(
-    "--vis_camera_idx", default=0, type=int, help="Which RealSense camera to visualize."
-)
-@click.option(
-    "--init_joints",
-    "-j",
-    is_flag=True,
-    default=False,
-    help="Whether to initialize robot joint configuration in the beginning.",
-)
-@click.option(
-    "--steps_per_inference",
-    "-si",
-    default=8,
-    type=int,
-    help="Action horizon for inference.",
-)
-@click.option(
-    "--max_duration",
-    "-md",
-    default=2000000,
-    help="Max duration for each epoch in seconds.",
-)
-@click.option(
-    "--frequency", "-f", default=8, type=float, help="Control frequency in Hz."
-)
-@click.option(
-    "--command_latency",
-    "-cl",
-    default=0.01,
-    type=float,
-    help="Latency between receiving SapceMouse command to executing on Robot in Sec.",
-)
-@click.option("-nm", "--no_mirror", is_flag=True, default=False)
-@click.option("-sf", "--sim_fov", type=float, default=None)
-@click.option("-ci", "--camera_intrinsics", type=str, default=None)
-@click.option("--mirror_swap", is_flag=True, default=False)
-@click.option("--init_pose", type=str, default=None,
-              help="初始 EEF 位姿，格式: x,y,z,rx,ry,rz（米 & 轴角弧度）")
-@click.option("--init_gripper", type=float, default=None,
-              help="初始夹爪开度（米），例如 0.04")
-@click.option("--init_delta", type=str, default=None,
-              help="微调量: dx,dy,dz,drx,dry,drz（单位: 米/弧度；世界坐标系）；例如 0,0,0.02,0,0,0 表示上移 2cm")
-@click.option("--init_gripper_delta", type=float, default=0.0,
-              help="夹爪开度微调量（米），可为负，默认 0")
-@click.option("--gripper_min_width", type=float, default=0.0,
-              help="夹爪最小开度（米），所有夹爪命令都会被裁剪到这个下限")
-@click.option("--gripper_max_width", type=float, default=DEFAULT_GRIPPER_MAX_WIDTH,
-              help="夹爪最大开度（米），所有夹爪命令都会被裁剪到这个上限")
+@click.option("--init-gripper", default=None, type=float)
+@click.option("--init-duration", default=4.0, show_default=True, type=float)
+@click.option("--gripper-min-width", default=0.0, show_default=True, type=float)
+@click.option("--gripper-max-width", default=0.085, show_default=True, type=float)
+@click.option("--workspace-min", default="-0.50,-0.50,0.03", show_default=True)
+@click.option("--workspace-max", default="0.50,0.50,0.80", show_default=True)
+@click.option("--max-pos-speed", default=0.40, show_default=True, type=float)
+@click.option("--max-rot-speed", default=0.80, show_default=True, type=float)
+@click.option("--camera-obs-latency", default=0.17, show_default=True, type=float)
+@click.option("--robot-obs-latency", default=0.20, show_default=True, type=float)
+@click.option("--observe-only", is_flag=True, help="Run inference and print targets without commanding the robot.")
+@click.option("--self-test", is_flag=True, help="Validate transforms without opening cameras or robot hardware.")
 def main(
-    input,
-    output,
-    policy_ip,
-    policy_port,
-    match_dataset,
-    match_episode,
-    match_camera,
-    camera_reorder,
-    vis_camera_idx,
-    init_joints,
-    steps_per_inference,
-    max_duration,
-    frequency,
-    command_latency,
-    no_mirror,
-    sim_fov,
-    camera_intrinsics,
-    mirror_swap,
-    init_pose,
-    init_gripper,
-    init_delta,
-    init_gripper_delta,
-    gripper_min_width,
-    gripper_max_width,
-):
-    pid = os.getpid()
-    os.sched_setaffinity(pid, [7])
-    gripper_min_width = max(0.0, float(gripper_min_width))
-    max_gripper_width = float(gripper_max_width)
-    if max_gripper_width <= gripper_min_width:
-        raise click.BadParameter("--gripper_max_width must be greater than --gripper_min_width")
-    print(
-        f"Using gripper width range: [{gripper_min_width:.6f}, {max_gripper_width:.6f}] m"
-    )
-    gripper_speed = 0.02
-    cartesian_speed = 0.4
-    orientation_speed = 0.8
+    output: str,
+    policy_ip: str,
+    policy_port: int,
+    robot_ip: str,
+    robot_port: int,
+    camera_reorder: str,
+    wrist_camera_index: int,
+    frequency: float,
+    steps_per_inference: int,
+    action_lead_time: float,
+    max_duration: float,
+    max_inference_latency: float,
+    prompt: str,
+    init_pose: str,
+    init_gripper: float | None,
+    init_duration: float,
+    gripper_min_width: float,
+    gripper_max_width: float,
+    workspace_min: str,
+    workspace_max: str,
+    max_pos_speed: float,
+    max_rot_speed: float,
+    camera_obs_latency: float,
+    robot_obs_latency: float,
+    observe_only: bool,  # noqa: FBT001
+    self_test: bool,  # noqa: FBT001
+) -> None:
+    if self_test:
+        run_contract_self_test()
+        return
 
-    os.makedirs(output, exist_ok=True)
-    os.makedirs(os.path.join(output, "obs"), exist_ok=True)
-    os.makedirs(os.path.join(output, "action"), exist_ok=True)
+    from modules.arx5_env import Arx5Env
+    from openpi_client.websocket_client_policy import WebsocketClientPolicy
+    from peripherals.keystroke_counter import KeyCode
+    from peripherals.keystroke_counter import KeystrokeCounter
+    from utils.other_util import precise_wait
 
-    tx_left_right = np.array(
-        [
-            [0.99996206, 0.00661996, 0.00566226, -0.01676012],
-            [-0.00663261, 0.99997554, 0.0022186, -0.60552492],
-            [-0.00564743, -0.00225607, 0.99998151, -0.007277],
-            [0.0, 0.0, 0.0, 1.0],
-        ]
-    )
-    tx_robot1_robot0 = tx_left_right
+    if frequency <= 0 or init_duration <= 0:
+        raise click.BadParameter("frequency and init-duration must be positive")
+    if not 0 <= gripper_min_width < gripper_max_width:
+        raise click.BadParameter("invalid gripper width range")
+    if max_pos_speed <= 0 or max_rot_speed <= 0:
+        raise click.BadParameter("speed limits must be positive")
 
-    # load checkpoint
-    ckpt_path = input
-    if not ckpt_path.endswith(".ckpt"):
-        ckpt_path = os.path.join(ckpt_path, "checkpoints", "latest.ckpt")
-    cfg_path = ckpt_path.replace(".ckpt", ".yaml")
-    with open(cfg_path, "r") as f:
-        cfg = OmegaConf.load(f)
-    # import torch
-    # payload = torch.load(open(ckpt_path, 'rb'), map_location='cpu', pickle_module=dill)
-    # cfg = payload['cfg']
-    obs_pose_rep = cfg.task.pose_repr.obs_pose_repr
-    action_pose_repr = cfg.task.pose_repr.action_pose_repr
-    print("obs_pose_rep", obs_pose_rep)
-    print("action_pose_repr", action_pose_repr)
-    print("model_name:", cfg.policy.obs_encoder.model_name)
-    print("dataset_path:", cfg.task.dataset.dataset_path)
+    init_pose6 = parse_csv_vector(init_pose, size=6, name="--init-pose")
+    workspace_min3 = parse_csv_vector(workspace_min, size=3, name="--workspace-min")
+    workspace_max3 = parse_csv_vector(workspace_max, size=3, name="--workspace-max")
+    if np.any(workspace_min3 >= workspace_max3):
+        raise click.BadParameter("workspace-min must be smaller than workspace-max")
+    if np.any(init_pose6[:3] < workspace_min3) or np.any(init_pose6[:3] > workspace_max3):
+        raise click.BadParameter("init-pose is outside the configured workspace")
 
-    # setup experiment
-    dt = 1 / frequency
+    output_path = Path(output).expanduser().resolve()
+    output_path.mkdir(parents=True, exist_ok=True)
+    camera_order = [int(item.strip()) for item in camera_reorder.split(",")]
 
-    obs_res = get_real_obs_resolution(cfg.task.shape_meta)
+    print(f"Connecting to policy server ws://{policy_ip}:{policy_port}")
+    client = WebsocketClientPolicy(host=policy_ip, port=policy_port)
+    print("Policy server connected")
 
     robots_config = [
         {
             "robot_type": "arx5",
-            "robot_ip": "127.0.0.1",
-            "robot_port": 8765,
-            # "robot_obs_latency": 0.005,  # TODO: need to measure
-            # "robot_obs_latency": 0.1867,
-            # "robot_obs_latency": 0.1867,
-            "robot_obs_latency": 0.20,
-            # "robot_action_latency": 0.1,
-            # "robot_action_latency": 0.24,
-            # "robot_action_latency": 0.24,
+            "robot_ip": robot_ip,
+            "robot_port": robot_port,
+            "robot_obs_latency": robot_obs_latency,
             "robot_action_latency": 0.01,
-            #"tcp_offset": 0.18,
-            "tcp_offsett": 0,
-            "inference_latency": 0.3,
-            # "inference_latency": 0.03,
-            # 抖动与降级策略（新加的运行时参数，供你的控制循环使用）
-            "latency_guard": {
-                "action_warn": 0.40,
-                "action_drop": 1.10,
-                "obs_warn": 0.20,
-                "use_outlier_aware_predict": True,  # 尖峰时扩大外推
-                "expire_stale_actions": True,  # 过期动作不执行
-                "max_action_batch": 16,  # 正常
-                "max_action_batch_on_spike": 8  # 尖峰期降批
-            },
-            # "robot_action_latency": 0.04,  # TODO: need to measure
-            "height_threshold": 0.08,  # TODO: ncscseed to measure
-            # "height_threshold": 0.0,  # TODO: ncscseed to measure
-            "sphere_radius": 0.1,  # TODO: need to measure
-            "sphere_center": [0, -0.06, -0.185],  # TODO: need to measure
         }
     ]
 
-    # robots_config = [
-    #     {
-    #         "robot_type": "arx5",
-    #         "robot_ip": "127.0.0.1",
-    #         "robot_port": 8765,
-    #         "robot_obs_latency": 0.005,  # TODO: need to measure
-    #         "robot_action_latency": 0.04,  # TODO: need to measure
-    #         "height_threshold": -0.2,  # TODO: ncscseed to measure
-    #         "sphere_radius": 0.1,  # TODO: need to measure
-    #         "sphere_center": [0, -0.06, -0.185],  # TODO: need to measure
-    #     }
-    # ]
+    history = ShellGameHistory()
+    warmup_done = False
+    dt = 1.0 / frequency
 
-    # context = zmq.Context()
-    # socket = context.socket(zmq.REQ)
-    # socket.connect(f"tcp://{policy_ip}:{policy_port}")
-    # policy_ip = "127.0.0.1"
-    policy_ip = "192.168.0.22"
-    policy_port = 8123
-    openpi_policy = WebsocketClientPolicy(host=policy_ip, port=policy_port)
-
-    print("steps_per_inference:", steps_per_inference)
-    with SharedMemoryManager() as shm_manager:
-        with Spacemouse(
-            shm_manager=shm_manager, deadzone=0.1
-        ) as sm, KeystrokeCounter() as key_counter, Arx5Env(
-            output_dir=output,
-            robots_config=robots_config,
-            frequency=frequency,
-            obs_image_resolution=obs_res,
-            obs_float32=True,
-            camera_reorder=[int(x) for x in camera_reorder],
-            init_joints=init_joints,
-            enable_multi_cam_vis=False,
-            # latency
-            camera_obs_latency=0.17,
-            # obs
-            camera_obs_horizon=cfg.task.shape_meta.obs.camera0_rgb.horizon,
-            robot_obs_horizon=cfg.task.shape_meta.obs.robot0_eef_pos.horizon,
-            no_mirror=no_mirror,
-            # fisheye_converter=fisheye_converter,
-            mirror_swap=mirror_swap,
-            # action
-            max_pos_speed=4.0,
-            # max_pos_speed=2.0,
-            # max_pos_speed=1.0,
-            max_rot_speed=10.0,
-            # max_rot_speed=6.0,
-            # max_rot_speed=2.0,
-            shm_manager=shm_manager,
-        ) as env:
+    with SharedMemoryManager() as shm_manager:  # noqa: SIM117
+        with (
+            KeystrokeCounter() as key_counter,
+            Arx5Env(
+                output_dir=output_path,
+                robots_config=robots_config,
+                frequency=frequency,
+                obs_image_resolution=(224, 224),
+                max_obs_buffer_size=120,
+                obs_float32=False,
+                camera_reorder=camera_order,
+                init_joints=False,
+                enable_multi_cam_vis=False,
+                camera_obs_latency=camera_obs_latency,
+                camera_obs_horizon=1,
+                robot_obs_horizon=1,
+                max_pos_speed=max_pos_speed,
+                max_rot_speed=max_rot_speed,
+                shm_manager=shm_manager,
+            ) as env,
+        ):
             cv2.setNumThreads(2)
-            print("Waiting for camera")
-            time.sleep(1.0)
-
-            print("Waiting for env ready.")
+            print(f"Waiting for camera and ARX5 ZMQ controller tcp://{robot_ip}:{robot_port}...")
             while not env.is_ready:
                 time.sleep(0.1)
-            print("Env is ready")
 
-            if init_delta is not None or abs(init_gripper_delta) > 0.0:
-                # 解析微调量（世界系）
-                delta6 = np.zeros(6, dtype=np.float64)
-                if init_delta is not None:
-                    vals = [float(v) for v in init_delta.split(",")]
-                    assert len(vals) == 6, "--init_delta 需要 6 个数: dx,dy,dz,drx,dry,drz"
-                    delta6[:] = vals
+            print("Environment ready; moving to init_pose")
+            move_to_pose(
+                env,
+                init_pose6,
+                duration=init_duration,
+                frequency=frequency,
+                target_gripper=init_gripper,
+                gripper_min=gripper_min_width,
+                gripper_max=gripper_max_width,
+            )
+            print("At init_pose. Press F to capture the initial frame.")
 
-                # 当前状态
-                robot_states = env.get_robot_state()
-                n_robots = len(robot_states)
+            quit_requested = False
+            while not quit_requested:
+                target_pose, target_gripper = current_robot_pose_and_gripper(env)
+                start_policy = False
+                iteration = 0
+                loop_start = time.monotonic()
 
-                start_pose_all = []
-                start_grip_all = []
-                target_pose_all = []
-                target_grip_all = []
-
-                for ridx in range(n_robots):
-                    curr6 = robot_states[ridx]["ActualTCPPose"].astype(np.float64).copy()  # [x,y,z,rx,ry,rz]
-                    grip = float(robot_states[ridx]["gripper_position"])
-                    print('grip: ', grip)
-
-                    # 目标 = 当前 + 微调（平移直接相加；旋转用轴角左乘组合，表示绕世界坐标系小角度转动）
-                    tgt6 = curr6.copy()
-                    tgt6 += delta6
-                    # tgt6[:3] = curr6[:3] + delta6[:3]
-                    # dR = R.from_rotvec(delta6[3:6])
-                    # R_curr = R.from_rotvec(curr6[3:6])
-                    # R_tgt = dR * R_curr
-                    # tgt6[3:6] = R_tgt.as_rotvec()
-
-                    tgtg = np.clip(
-                        grip + init_gripper_delta, gripper_min_width, max_gripper_width
+                while not start_policy and not quit_requested:
+                    cycle_end = loop_start + (iteration + 1) * dt
+                    obs = env.get_obs()
+                    camera_key = f"camera{wrist_camera_index}_rgb"
+                    frame = obs[camera_key][-1]
+                    current_pose = np.concatenate(
+                        [obs["robot0_eef_pos"][-1], obs["robot0_eef_rot_axis_angle"][-1]], axis=-1
                     )
+                    message = ""
 
-                    start_pose_all.append(curr6)
-                    target_pose_all.append(tgt6)
-                    start_grip_all.append(grip)
-                    target_grip_all.append(tgtg)
+                    for key in key_counter.get_press_events():
+                        if key == KeyCode(char="q"):
+                            quit_requested = True
+                            break
+                        if key == KeyCode(char="f"):
+                            message = history.press_f(frame, current_pose)
+                            print(message)
+                        elif key == KeyCode(char="c"):
+                            if history.ready:
+                                start_policy = True
+                            else:
+                                message = f"History incomplete: {history.frame_count}/241"
+                                print(message)
+                        elif key == KeyCode(char="p"):
+                            print("P pressed: clearing history and returning to init_pose")
+                            history.reset()
+                            move_to_pose(
+                                env,
+                                init_pose6,
+                                duration=init_duration,
+                                frequency=frequency,
+                                target_gripper=init_gripper,
+                                gripper_min=gripper_min_width,
+                                gripper_max=gripper_max_width,
+                            )
+                            target_pose, target_gripper = current_robot_pose_and_gripper(env)
+                            loop_start = time.monotonic()
+                            iteration = 0
+                            message = "At init_pose; press F for the new initial frame"
+                            print(message)
 
-                start_pose_all = np.stack(start_pose_all, axis=0)
-                target_pose_all = np.stack(target_pose_all, axis=0)
-                start_grip_all = np.asarray(start_grip_all, dtype=np.float64)
-                target_grip_all = np.asarray(target_grip_all, dtype=np.float64)
-                print('start_pose_all:', start_pose_all)
-                print('target_pose_all:', target_pose_all)
+                    capture_message = history.capture_tick(frame)
+                    if capture_message and (history.ready or history.frame_count % 10 == 0 or not history.collecting):
+                        print(capture_message)
+                    if start_policy or quit_requested:
+                        break
 
-                # 生成缓动轨迹
-                warmup_sec = 2.5  # 微调用 2.5s，按需调整
-                steps = max(2, int(warmup_sec * frequency))
-                dt = 1.0 / frequency
+                    # Hold pose before F locks the viewpoint; no SpaceMouse teleop.
+                    if not history.locked:
+                        command = np.concatenate([target_pose, [target_gripper]])
+                        env.exec_actions(
+                            actions=[command],
+                            timestamps=[time.time() + dt],
+                            compensate_latency=False,
+                        )
 
-                actions = []
-                timestamps = []
-                t0 = time.time() + 0.3  # 给传输留余量
+                    lines = [
+                        history.status(),
+                        (
+                            f"remaining {(SWAP_FRAMES - len(history.active_segment or [])) / frequency:.1f}s"
+                            if history.collecting
+                            else ""
+                        ),
+                        message,
+                        "F: capture  C: policy  P: reset  Q: quit",
+                    ]
+                    view = draw_status(frame, [line for line in lines if line])
+                    cv2.imshow("ARX5 ShellGame", view[..., ::-1])
+                    cv2.pollKey()
+                    precise_wait(cycle_end)
+                    iteration += 1
 
-                for k in range(steps):
-                    s = k / (steps - 1)
-                    a = easeInOutQuad(s)
-
-                    pose_now = start_pose_all + a * (target_pose_all - start_pose_all)  # 线性插值 + 小角度足够
-                    grip_now = start_grip_all + a * (target_grip_all - start_grip_all)
-                    grip_now = np.clip(
-                        grip_now, gripper_min_width, max_gripper_width
-                    )
-
-                    cmd = np.zeros(7 * n_robots, dtype=np.float64)
-                    for ridx in range(n_robots):
-                        cmd[7 * ridx:7 * ridx + 6] = pose_now[ridx]
-                        # cmd[7 * ridx + 6] = grip_now[ridx]
-                        # cmd[7 * ridx + 6] = grip_now[ridx] + 0.02
-                        cmd[7 * ridx + 6] = grip_now[ridx]
-                    actions.append(cmd)
-                    timestamps.append(t0 + k * dt)
-
-                env.exec_actions(actions=np.asarray(actions),
-                                 timestamps=np.asarray(timestamps),
-                                 compensate_latency=False)
-                time.sleep(warmup_sec + 0.2)
-                print("微调完成，已到新的初始位姿。")
-                # --- 新增结束 ---
-
-            print(f"Warming up video recording")
-            video_dir = env.video_dir.joinpath("test")
-            video_dir.mkdir(exist_ok=True, parents=True)
-            n_cameras = env.camera.n_cameras
-            video_paths = []
-            for i in range(n_cameras):
-                video_path = str(video_dir.joinpath(f"{i}.mp4").absolute())
-                video_paths.append(video_path)
-            env.camera.start_recording(video_path=video_paths, start_time=time.time())
-
-            print(f"Warming up policy inference")
-            obs = env.get_obs()
-            episode_start_pose = list()
-            for robot_id in range(len(robots_config)):
-                pose = np.concatenate(
-                    [
-                        obs[f"robot{robot_id}_eef_pos"],
-                        obs[f"robot{robot_id}_eef_rot_axis_angle"],
-                    ],
-                    axis=-1,
-                )[-1]
-                episode_start_pose.append(pose)
-            obs_dict_np = get_real_umi_obs_dict(
-                env_obs=obs,
-                shape_meta=cfg.task.shape_meta,
-                obs_pose_repr=obs_pose_rep,
-                tx_robot1_robot0=tx_robot1_robot0,
-                episode_start_pose=episode_start_pose,
-            )
-
-            # socket.send_pyobj(obs_dict_np)
-
-            action = openpi_policy.infer(obs_dict_np)
-            print(
-                f"    obs_dict_np sent to PolicyInferenceNode at tcp://{policy_ip}:{policy_port}. Waiting for response."
-            )
-            action = action["actions"]
-            # start_time = time.monotonic()
-            # action = socket.recv_pyobj()
-            # if type(action) == str:
-            #     print(
-            #         f"Inference from PolicyInferenceNode failed: {action}. Please check the model."
-            #     )
-            #     exit(1)
-            # print(
-            #     f"Got response from PolicyInferenceNode. Inference time: {time.monotonic() - start_time:.3f} s"
-            # )
-
-            env.camera.stop_recording()
-            print(
-                f"Warming up video recording finished. Video stored to {env.video_dir.joinpath(str(0))}"
-            )
-
-            assert action.shape[-1] == 10 * len(robots_config)
-            action = get_real_umi_action(action, obs, action_pose_repr)
-            assert action.shape[-1] == 7 * len(robots_config)
-
-            print("Ready!")
-            while True:
-                # ========= human control loop ==========
-                print("Human in control!")
-                robot_states = env.get_robot_state()
-                target_pose = np.stack([rs["ActualTCPPose"] for rs in robot_states])
-
-                gripper_target_pos = np.asarray(
-                    [rs["gripper_position"] for rs in robot_states]
+                if quit_requested:
+                    break
+                quit_requested, warmup_done = run_policy(
+                    env=env,
+                    client=client,
+                    history=history,
+                    wrist_camera_index=wrist_camera_index,
+                    prompt=prompt,
+                    frequency=frequency,
+                    steps_per_inference=steps_per_inference,
+                    action_lead_time=action_lead_time,
+                    max_duration=max_duration,
+                    max_inference_latency=max_inference_latency,
+                    max_pos_speed=max_pos_speed,
+                    max_rot_speed=max_rot_speed,
+                    workspace_min=workspace_min3,
+                    workspace_max=workspace_max3,
+                    gripper_min=gripper_min_width,
+                    gripper_max=gripper_max_width,
+                    key_counter=key_counter,
+                    observe_only=observe_only,
+                    warmup_done=warmup_done,
                 )
 
-                control_robot_idx_list = [0]
-
-                t_start = time.monotonic()
-                iter_idx = 0
-                while True:
-                    # calculate timing
-                    t_cycle_end = t_start + (iter_idx + 1) * dt
-                    t_sample = t_cycle_end - command_latency
-                    t_command_target = t_cycle_end + dt
-
-                    # pump obs
-                    obs = env.get_obs()
-
-                    # visualize
-                    episode_id = env.replay_buffer.n_episodes
-                    os.makedirs(
-                        os.path.join(output, "obs", f"{episode_id}"), exist_ok=True
-                    )
-                    os.makedirs(
-                        os.path.join(output, "action", f"{episode_id}"), exist_ok=True
-                    )
-                    vis_img = obs[f"camera{match_camera}_rgb"][-1]
-                    obs_left_img = obs["camera0_rgb"][-1]
-                    obs_right_img = obs["camera0_rgb"][-1]
-                    vis_img = np.concatenate(
-                        [obs_left_img, obs_right_img, vis_img], axis=1
-                    )
-
-                    text = f"Episode: {episode_id}"
-                    cv2.putText(
-                        vis_img,
-                        text,
-                        (10, 20),
-                        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                        fontScale=0.5,
-                        lineType=cv2.LINE_AA,
-                        thickness=3,
-                        color=(0, 0, 0),
-                    )
-                    cv2.putText(
-                        vis_img,
-                        text,
-                        (10, 20),
-                        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                        fontScale=0.5,
-                        thickness=1,
-                        color=(255, 255, 255),
-                    )
-                    cv2.imshow("default", vis_img[..., ::-1])
-                    _ = cv2.pollKey()
-                    press_events = key_counter.get_press_events()
-                    start_policy = False
-                    for key_stroke in press_events:
-                        if key_stroke == KeyCode(char="q"):
-                            # Exit program
-                            env.end_episode()
-                            exit(0)
-                        elif key_stroke == KeyCode(char="c"):
-                            # Exit human control loop
-                            # hand control over to the policy
-                            start_policy = True
-                        elif key_stroke == KeyCode(char="e"):
-                            # Next episode
-                            if match_episode is not None:
-                                match_episode = min(
-                                    match_episode + 1, env.replay_buffer.n_episodes - 1
-                                )
-                        elif key_stroke == KeyCode(char="w"):
-                            # Prev episode
-                            if match_episode is not None:
-                                match_episode = max(match_episode - 1, 0)
-                        elif key_stroke == Key.backspace:
-                            if click.confirm("Are you sure to drop an episode?"):
-                                env.drop_episode()
-                                key_counter.clear()
-                        elif key_stroke == KeyCode(char="a"):
-                            control_robot_idx_list = list(range(target_pose.shape[0]))
-                        elif key_stroke == KeyCode(char="1"):
-                            control_robot_idx_list = [0]
-                        elif key_stroke == KeyCode(char="2"):
-                            control_robot_idx_list = [1]
-
-                    if start_policy:
-                        break
-                    precise_wait(t_sample)
-                    # get teleop command
-                    sm_state = sm.get_motion_state_transformed()
-                    # sm_state = get_filtered_spacemouse_output(sm)
-                    # print(sm_state)
-                    dpos = sm_state[:3] * (0.5 / frequency) * cartesian_speed
-                    drot_xyz = sm_state[3:] * (1.5 / frequency) * orientation_speed
-
-                    drot = st.Rotation.from_euler("xyz", drot_xyz)
-                    for robot_idx in control_robot_idx_list:
-                        target_pose[robot_idx, :3] += dpos
-                        target_pose[robot_idx, 3:] = (
-                            drot * st.Rotation.from_rotvec(target_pose[robot_idx, 3:])
-                        ).as_rotvec()
-                        # target_pose[robot_idx, 2] = np.maximum(target_pose[robot_idx, 2], 0.055)
-
-                    dpos = 0
-                    if sm.is_button_pressed(0) and sm.is_button_pressed(1):
-                        print("Reset robot arm to home. Please wait...")
-                        for robot_idx in control_robot_idx_list:
-                            env.robots[robot_idx].reset_to_home()
-                            robot_states = env.get_robot_state()
-                            target_pose[robot_idx] = np.stack(
-                                [rs["ActualTCPPose"] for rs in robot_states]
-                            )
-                            gripper_target_pos[robot_idx] = np.asarray(
-                                [rs["gripper_position"] for rs in robot_states]
-                            )
-
-                    elif sm.is_button_pressed(0):
-                        # close gripper
-                        dpos = -gripper_speed / frequency
-                    elif sm.is_button_pressed(1):
-                        dpos = gripper_speed / frequency
-                    for robot_idx in control_robot_idx_list:
-                        gripper_target_pos[robot_idx] = np.clip(
-                            gripper_target_pos[robot_idx] + dpos,
-                            gripper_min_width,
-                            max_gripper_width,
-                        )
-
-                    # # solve collision with table
-                    # for robot_idx in control_robot_idx_list:
-                    #     solve_table_collision(
-                    #         ee_pose=target_pose[robot_idx],
-                    #         gripper_width=gripper_target_pos[robot_idx],
-                    #         height_threshold=robots_config[robot_idx]['height_threshold'])
-
-                    # # solve collison between two robots
-                    # solve_sphere_collision(
-                    #     ee_poses=target_pose,
-                    #     robots_config=robots_config
-                    # )
-
-                    action = np.zeros((7 * target_pose.shape[0],))
-
-                    for robot_idx in range(target_pose.shape[0]):
-                        action[7 * robot_idx + 0 : 7 * robot_idx + 6] = target_pose[
-                            robot_idx
-                        ]
-                        action[7 * robot_idx + 6] = np.clip(
-                            gripper_target_pos[robot_idx],
-                            gripper_min_width,
-                            max_gripper_width,
-                        )
-
-                    # execute teleop command
-                    env.exec_actions(
-                        actions=[action],
-                        timestamps=[t_command_target - time.monotonic() + time.time()],
-                        compensate_latency=False,
-                    )
-                    precise_wait(t_cycle_end)
-                    iter_idx += 1
-
-                # ========== policy control loop ==============
-                try:
-                    # start episode
-                    start_delay = 1.0
-                    eval_t_start = time.time() + start_delay
-                    t_start = time.monotonic() + start_delay
-                    env.start_episode(eval_t_start)
-
-                    # get current pose
-                    obs = env.get_obs()
-                    episode_start_pose = list()
-                    for robot_id in range(len(robots_config)):
-                        pose = np.concatenate(
-                            [
-                                obs[f"robot{robot_id}_eef_pos"],
-                                obs[f"robot{robot_id}_eef_rot_axis_angle"],
-                            ],
-                            axis=-1,
-                        )[-1]
-                        episode_start_pose.append(pose)
-
-                    # wait for 1/30 sec to get the closest frame actually
-                    # reduces overall latency
-                    frame_latency = 1 / 60
-                    precise_wait(eval_t_start - frame_latency, time_func=time.time)
-                    print("Started!")
-                    iter_idx = 0
-                    perv_target_pose = None
-                    while True:
-                        # calculate timing
-                        t_cycle_end = t_start + (iter_idx + steps_per_inference) * dt
-
-                        # get obs
-                        obs = env.get_obs()
-                        obs_timestamps = obs["timestamp"]
-                        print(f"Obs latency {time.time() - obs_timestamps[-1]}")
-
-                        # run inference
-                        s = time.time()
-                        obs_dict_np = get_real_umi_obs_dict(
-                            env_obs=obs,
-                            shape_meta=cfg.task.shape_meta,
-                            obs_pose_repr=obs_pose_rep,
-                            tx_robot1_robot0=tx_robot1_robot0,
-                            episode_start_pose=episode_start_pose,
-                        )
-                        obs_data = {
-                            "obs_dict_np": obs_dict_np,
-                            "obs_pose_rep": obs_pose_rep,
-                            "obs": obs,
-                            "episode_start_pose": episode_start_pose,
-                            "tx_robot1_robot0": tx_robot1_robot0,
-                        }
-                        np.save(
-                            os.path.join(
-                                output, "obs", f"{episode_id}", f"{iter_idx}.npy"
-                            ),
-                            obs_data,
-                            allow_pickle=True,
-                        )
-
-                        # socket.send_pyobj(obs_dict_np)
-                        # raw_action = socket.recv_pyobj()
-                        start = time.time()
-                        raw_action = openpi_policy.infer(obs_dict_np)
-                        print(f"Inference time: {time.time() - start}")
-
-                        raw_action = raw_action["actions"]
-                        if type(raw_action) == str:
-                            print(
-                                f"Inference from PolicyInferenceNode failed: {raw_action}. Please check the model."
-                            )
-                            env.end_episode()
-                            break
-                        # print('obs: ', obs)
-                        action = get_real_umi_action(raw_action, obs, action_pose_repr)
-                        action_data = {
-                            "action": action,
-                            "raw_action": raw_action,
-                            "action_pose_repr": action_pose_repr,
-                        }
-                        
-                        action_np = action_data["action"]
-                        # 对夹爪开度进行阈值判定（第二维的最后一个值）
-                        # action_np[:, -1] = np.where(action_np[:, -1] < 0.055, 0.025, 0.11)
-                        action_np[:, -1] = np.where(action_np[:, -1] < 0.05, 0.011, 0.085)
-                        # action_np[:, -1] = np.where(action_np[:, -1] < 0.04, 0.02, 0.085)
-                        # action_np[:,  2] += float(-0.002)
-                        action_np[:,  2] += float(-0.008)
-                        # action_np[:,  0] += float(-0.007)
-                        # action_np[:, -1] = 0.03
-
-                        # action_np[:, -1] -= 0.005
-                        # action_np[:, -1] = np.where(acction_np[:, -1] < 0.06, 0.01, 0.11)
-                        # action_np[:, -1] -= 0.005
-                        action_data["action"] = action_np
-
-                        print(f"action: {action_np}")
-
-                        np.save(
-                            os.path.join(
-                                output, "action", f"{episode_id}", f"{iter_idx}.npy"
-                            ),
-                            action_data,
-                            allow_pickle=True,
-                        )
-                        # print("Inference latency:", time.time() - s)
-                        # print("*" * 100)
-                        # print("action: ", action)
-                        # print("*" * 100)
-
-                        # convert policy action to env actions
-                        this_target_poses = action
-                        assert this_target_poses.shape[1] == len(robots_config) * 7
-                        this_target_poses[:, 6::7] = np.clip(
-                            this_target_poses[:, 6::7],
-                            gripper_min_width,
-                            max_gripper_width,
-                        )
-                        # for target_pose in this_target_poses:
-                        #     for robot_idx in range(len(robots_config)):
-                        #         solve_table_collision(
-                        #             ee_pose=target_pose[robot_idx * 7: robot_idx * 7 + 6],
-                        #             gripper_width=target_pose[robot_idx * 7 + 6],
-                        #             height_threshold=robots_config[robot_idx]['height_threshold']
-                        #         )
-
-                            # solve collison between tsqwo robots
-                            # solve_sphere_collision(
-                            #     ee_poses=target_pose.reshape([len(robots_config), -1]),
-                            #     robots_config=robots_config
-                            # )
-
-                        # deal with timing
-                        # the same step actions are always the target for
-                        action_timestamps = (
-                            np.arange(len(action), dtype=np.float64)
-                        ) * dt + obs_timestamps[-1]
-                        # action_exec_latency = 0.01
-                        # curr_time = time.time()
-                        # is_new = action_timestamps > (curr_time + action_exec_latency)
-                        # if np.sum(is_new) == 0:
-                        #     # exceeded time budget, still do something
-                        #     this_target_poses = this_target_poses[[-1]]
-                        #     # schedule on next available step
-                        #     next_step_idx = int(np.ceil((curr_time - eval_t_start) / dt))
-                        #     action_timestamp = eval_t_start + (next_step_idx) * dt
-                        #     print('Over budget', action_timestamp - curr_time)
-                        #     action_timestamps = np.array([action_timestamp])
-                        # else:
-                        #     this_target_poses = this_target_poses[is_new]
-                        #     action_timestamps = action_timestamps[is_new]
-
-                        # execute actions
-                        env.exec_actions(
-                            actions=this_target_poses,
-                            timestamps=action_timestamps,
-                            # compensate_latency=True
-                            dynamic_latency=True,
-                        )
-                        print(f"Submitted {len(this_target_poses)} steps of actions.")
-
-                        # visualize
-                        episode_id = env.replay_buffer.n_episodes
-                        obs_left_img = obs["camera0_rgb"][-1]
-                        obs_right_img = obs["camera0_rgb"][-1]
-                        vis_img = np.concatenate([obs_left_img, obs_right_img], axis=1)
-                        text = "Episode: {}, Time: {:.1f}".format(
-                            episode_id, time.monotonic() - t_start
-                        )
-                        cv2.putText(
-                            vis_img,
-                            text,
-                            (10, 20),
-                            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                            fontScale=0.5,
-                            thickness=1,
-                            color=(255, 255, 255),
-                        )
-                        cv2.imshow("default", vis_img[..., ::-1])
-
-                        _ = cv2.pollKey()
-                        press_events = key_counter.get_press_events()
-                        stop_episode = False
-                        for key_stroke in press_events:
-                            if key_stroke == KeyCode(char="s"):
-                                # Stop episode
-                                # Hand control back to human
-                                print("Stopped.")
-                                stop_episode = True
-
-                        t_since_start = time.time() - eval_t_start
-                        if t_since_start > max_duration:
-                            print("Max Duration reached.")
-                            stop_episode = True
-                        if stop_episode:
-                            env.end_episode()
-                            break
-
-                        # wait for execution
-                        precise_wait(t_cycle_end - frame_latency)
-                        iter_idx += steps_per_inference
-
-                except KeyboardInterrupt:
-                    print("Interrupted!")
-                    # stop robot.
-                    env.end_episode()
-
-                print("Stopped.")
+    cv2.destroyAllWindows()
 
 
-# %%
 if __name__ == "__main__":
     main()

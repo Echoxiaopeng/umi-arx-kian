@@ -32,9 +32,9 @@ python python/communication/zmq_server_ac_one.py X5 can3 --gripper-open-readout 
     python scripts/collect_drag_umi.py -o data/collect_demo --no_init_pose
 
     # 如果上面报错，则执行下面：
-    cd /data1/projects/umi-arx-kian/modules/arx_x5_python
+    cd /home/lenovo/kian/umi-arx-kian/modules/arx_x5_python
     source setup.sh
-    cd /data1/projects/umi-arx-kian
+    cd /home/lenovo/kian/umi-arx-kian
     python scripts/collect_drag_umi.py --init_pose ...
 
 键盘:
@@ -241,7 +241,7 @@ def _default_robots_config():
             "robot_type": "arx5",
             "robot_ip": "127.0.0.1",
             "robot_port": 8765,
-            "can_port": "can3",
+            "can_port": "can0",
             "arm_type": 0,
             "reset_to_home_on_start": True,
             "robot_obs_latency": 0.1867,

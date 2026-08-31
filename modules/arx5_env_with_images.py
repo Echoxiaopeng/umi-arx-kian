@@ -43,14 +43,18 @@ class Arx5EnvWithImages(Arx5Env):
         Images will be saved as numpy arrays in the zarr file.
     """
     
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, drop_uninitialized_actions: bool = False, **kwargs):
         """
         Args:
-            save_images: Whether to save images to zarr (default: True)
+            drop_uninitialized_actions: If True, end_episode drops action-grid
+                slots that were never written (all-zero). Use for segmented
+                recording (e.g. cup collect) where wait gaps leave holes in
+                TimestampActionAccumulator.
             *args, **kwargs: Arguments passed to Arx5Env
         """
         super().__init__(*args, **kwargs)
         self.image_accumulator: Optional[ImageAccumulator] = None
+        self.drop_uninitialized_actions = bool(drop_uninitialized_actions)
     
     def start_episode(self, start_time=None):
         """Start recording and initialize image accumulator."""
@@ -159,7 +163,27 @@ class Arx5EnvWithImages(Arx5Env):
                 # === Save images to zarr ===
                 if self.image_accumulator is not None:
                     self._add_images_to_episode(episode, timestamps)
-                
+
+                if self.drop_uninitialized_actions:
+                    episode, n_dropped = self._drop_uninitialized_action_steps(
+                        episode
+                    )
+                    n_kept = int(episode["action"].shape[0])
+                    if n_dropped > 0:
+                        print(
+                            f"Dropped {n_dropped} uninitialized (wait-gap) "
+                            f"action steps; kept {n_kept}."
+                        )
+                    if n_kept == 0:
+                        print(
+                            "No valid action steps after dropping "
+                            "uninitialized slots; episode not saved."
+                        )
+                        self.obs_accumulator = None
+                        self.action_accumulator = None
+                        self.image_accumulator = None
+                        return
+
                 self.replay_buffer.add_episode(episode, compressors="disk")
                 episode_id = self.replay_buffer.n_episodes - 1
                 print(f"Episode {episode_id} saved!")
@@ -167,6 +191,30 @@ class Arx5EnvWithImages(Arx5Env):
             self.obs_accumulator = None
             self.action_accumulator = None
             self.image_accumulator = None
+
+    @staticmethod
+    def _drop_uninitialized_action_steps(episode: dict):
+        """
+        TimestampActionAccumulator leaves never-written slots as all-zero.
+        Segmented record/wait FSMs only put actions during record_*; wait gaps
+        must be removed so zarr indices match recorded frames / labels.
+        """
+        actions = np.asarray(episode["action"])
+        if actions.ndim != 2 or actions.shape[0] == 0:
+            return episode, 0
+        # Unwritten slots are exactly 0; real TCP poses are not all-zero.
+        valid = np.any(actions != 0, axis=1)
+        n_dropped = int((~valid).sum())
+        if n_dropped == 0:
+            return episode, 0
+        out = {}
+        for key, value in episode.items():
+            arr = np.asarray(value)
+            if arr.shape[0] == actions.shape[0]:
+                out[key] = arr[valid]
+            else:
+                out[key] = value
+        return out, n_dropped
     
     def _add_images_to_episode(self, episode: dict, timestamps: np.ndarray):
         """
