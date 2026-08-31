@@ -14,6 +14,9 @@
     conda activate Lingbot
     python scripts/visualize_trajectory_rerun.py --episode 0
 
+    python scripts/visualize_trajectory_rerun.py \
+  --zarr_path data/cup_demo/replay_buffer.zarr \
+  --episode 0
 SSH 远程（推荐 Web Viewer）:
     # 终端 1：服务器上启动
     python scripts/visualize_trajectory_rerun.py --episode 0 --web
