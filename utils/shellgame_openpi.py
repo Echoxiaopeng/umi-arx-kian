@@ -21,6 +21,70 @@ ACTION_HORIZON = 16
 ACTION_DIM = 10
 
 
+def shift_pose_along_tcp_z(pose6: np.ndarray, distance: float) -> np.ndarray:
+    """Shift a world pose along its local TCP Z axis without changing rotation."""
+    pose = np.asarray(pose6, dtype=np.float64).reshape(6).copy()
+    if abs(float(distance)) > 1e-12:
+        pose[:3] += Rotation.from_rotvec(pose[3:6]).apply(
+            np.array([0.0, 0.0, float(distance)], dtype=np.float64)
+        )
+    return pose
+
+
+def eef_pose_to_link6(pose6: np.ndarray, eef_offset: float) -> np.ndarray:
+    """Convert a ZMQ eef control-point pose to the Direct-training link6 pose."""
+    return shift_pose_along_tcp_z(pose6, -float(eef_offset))
+
+
+def link6_pose_to_eef(pose6: np.ndarray, eef_offset: float) -> np.ndarray:
+    """Convert a Direct-training link6 pose to the ZMQ eef control-point pose."""
+    return shift_pose_along_tcp_z(pose6, float(eef_offset))
+
+
+def link6_actions_to_eef(actions: np.ndarray, eef_offset: float) -> np.ndarray:
+    """Convert absolute link6 waypoints [..., xyz, rotvec, ...] to ZMQ eef."""
+    result = np.asarray(actions, dtype=np.float64).copy()
+    if result.ndim != 2 or result.shape[1] < 6:
+        raise ValueError(f"Expected action array shaped (N, >=6), got {result.shape}")
+    for index in range(len(result)):
+        result[index, :6] = link6_pose_to_eef(result[index, :6], eef_offset)
+    return result
+
+
+def direct_link6_pose_to_zmq_link6(
+    direct_pose6: np.ndarray,
+    origin_offset: np.ndarray,
+) -> np.ndarray:
+    """Map Direct link6 xyz+rotvec into the ZMQ link6 frame via a fixed translation."""
+    direct = np.asarray(direct_pose6, dtype=np.float64).reshape(6).copy()
+    offset = np.asarray(origin_offset, dtype=np.float64).reshape(3)
+    out = direct.copy()
+    out[:3] = direct[:3] + offset
+    return out
+
+
+def direct_link6_pose_to_zmq_eef(
+    direct_pose6: np.ndarray,
+    origin_offset: np.ndarray,
+    eef_offset: float,
+) -> np.ndarray:
+    """Convert a Direct-collected init pose into a ZMQ eef command pose."""
+    link6_zmq = direct_link6_pose_to_zmq_link6(direct_pose6, origin_offset)
+    return link6_pose_to_eef(link6_zmq, eef_offset)
+
+
+def zmq_eef_pose_to_direct_link6(
+    eef_pose6: np.ndarray,
+    origin_offset: np.ndarray,
+    eef_offset: float,
+) -> np.ndarray:
+    """Inverse of direct_link6_pose_to_zmq_eef for calibration helpers."""
+    link6_zmq = eef_pose_to_link6(eef_pose6, eef_offset)
+    direct = link6_zmq.copy()
+    direct[:3] = link6_zmq[:3] - np.asarray(origin_offset, dtype=np.float64).reshape(3)
+    return direct
+
+
 def parse_csv_vector(value: str, *, size: int, name: str) -> np.ndarray:
     try:
         result = np.asarray([float(item.strip()) for item in value.split(",")], dtype=np.float64)
@@ -76,20 +140,30 @@ def validate_world_actions(
     max_rot_speed: float,
     workspace_min: np.ndarray,
     workspace_max: np.ndarray,
+    max_waypoints: int = ACTION_HORIZON,
 ) -> None:
     """Reject unsafe chunks instead of silently changing policy geometry."""
     actions = np.asarray(world_actions, dtype=np.float64)
-    if actions.shape != (ACTION_HORIZON, 7) or not np.all(np.isfinite(actions)):
+    if actions.ndim != 2 or actions.shape[1] != 7 or not np.all(np.isfinite(actions)):
         raise ValueError(f"Invalid world action shape/content: {actions.shape}")
+    if len(actions) < max_waypoints:
+        raise ValueError(
+            f"Need at least {max_waypoints} waypoints for validation, got {len(actions)}"
+        )
 
-    xyz = actions[:, :3]
+    max_waypoints = int(max_waypoints)
+    if not 1 <= max_waypoints <= len(actions):
+        raise ValueError(f"max_waypoints must be in [1, {len(actions)}], got {max_waypoints}")
+
+    selected = actions[:max_waypoints]
+    xyz = selected[:, :3]
     outside = (xyz < workspace_min[None]) | (xyz > workspace_max[None])
     if np.any(outside):
         bad = int(np.flatnonzero(np.any(outside, axis=1))[0])
         raise ValueError(f"Waypoint {bad} is outside workspace: {xyz[bad]}")
 
     poses = np.concatenate(
-        [np.asarray(anchor_pose6, dtype=np.float64).reshape(1, 6), actions[:, :6]],
+        [np.asarray(anchor_pose6, dtype=np.float64).reshape(1, 6), selected[:, :6]],
         axis=0,
     )
     position_steps = np.linalg.norm(np.diff(poses[:, :3], axis=0), axis=-1)
@@ -102,13 +176,49 @@ def validate_world_actions(
     if np.any(position_steps > max_position_step):
         index = int(np.argmax(position_steps))
         raise ValueError(
-            f"Waypoint {index} translation step {position_steps[index]:.4f} m exceeds {max_position_step:.4f} m"
+            f"Executed segment {index}->{index + 1} translation step "
+            f"{position_steps[index]:.4f} m exceeds {max_position_step:.4f} m"
         )
     if np.any(rotation_steps > max_rotation_step):
         index = int(np.argmax(rotation_steps))
         raise ValueError(
-            f"Waypoint {index} rotation step {rotation_steps[index]:.4f} rad exceeds {max_rotation_step:.4f} rad"
+            f"Executed segment {index}->{index + 1} rotation step "
+            f"{rotation_steps[index]:.4f} rad exceeds {max_rotation_step:.4f} rad"
         )
+
+
+def select_safe_waypoint_count(
+    world_actions: np.ndarray,
+    *,
+    anchor_pose6: np.ndarray,
+    dt: float,
+    max_pos_speed: float,
+    max_rot_speed: float,
+    workspace_min: np.ndarray,
+    workspace_max: np.ndarray,
+    max_waypoints: int,
+) -> tuple[int, str | None]:
+    """Return the longest safe prefix length and the rejection reason if truncated."""
+    max_waypoints = min(int(max_waypoints), len(world_actions))
+    last_error: str | None = None
+    for count in range(max_waypoints, 0, -1):
+        try:
+            validate_world_actions(
+                world_actions,
+                anchor_pose6=anchor_pose6,
+                dt=dt,
+                max_pos_speed=max_pos_speed,
+                max_rot_speed=max_rot_speed,
+                workspace_min=workspace_min,
+                workspace_max=workspace_max,
+                max_waypoints=count,
+            )
+            if count < max_waypoints:
+                return count, last_error
+            return count, None
+        except ValueError as exc:
+            last_error = str(exc)
+    return 0, last_error
 
 
 @dataclass
@@ -145,6 +255,20 @@ class ShellGameHistory:
         self.episode_start_pose6 = None
         self.swap_segments.clear()
         self.active_segment = None
+
+    def seed_dummy_history(self, frame: np.ndarray, current_pose6: np.ndarray) -> None:
+        """Fill the required 241-frame history with duplicates for alignment smoke tests."""
+        self.reset()
+        dummy = image_to_uint8(frame)
+        pose6 = np.asarray(current_pose6, dtype=np.float64).reshape(6).copy()
+        self.initial_frame = dummy.copy()
+        self.episode_start_pose6 = pose6
+        self.swap_segments = [[dummy.copy() for _ in range(SWAP_FRAMES)] for _ in range(NUM_SWAPS)]
+        self.active_segment = None
+        if not self.ready:
+            raise RuntimeError(
+                f"Failed to seed dummy history: {self.frame_count}/{HISTORY_FRAMES} frames"
+            )
 
     def press_f(self, frame: np.ndarray, current_pose6: np.ndarray) -> str:
         if self.collecting:
@@ -246,4 +370,66 @@ def run_contract_self_test() -> None:
     relative_actions[:, 0] = 0.01
     world = relative_chunk_to_world(relative_actions, start)
     np.testing.assert_allclose(world[:, 0], start[0] + 0.01, atol=1e-6)
+
+    eef_offset = 0.145
+    eef_anchor = np.array([0.24, 0.03, 0.15, 0.2, -0.3, 0.4], dtype=np.float64)
+    link6_anchor = eef_pose_to_link6(eef_anchor, eef_offset)
+    np.testing.assert_allclose(
+        link6_pose_to_eef(link6_anchor, eef_offset),
+        eef_anchor,
+        atol=1e-9,
+    )
+
+    identity_actions = np.zeros((ACTION_HORIZON, ACTION_DIM), dtype=np.float64)
+    identity_actions[:, 3] = 1.0
+    identity_actions[:, 7] = 1.0
+    identity_link6 = relative_chunk_to_world(identity_actions, link6_anchor)
+    identity_eef = link6_actions_to_eef(identity_link6, eef_offset)
+    np.testing.assert_allclose(
+        identity_eef[:, :6],
+        np.tile(eef_anchor, (ACTION_HORIZON, 1)),
+        atol=1e-8,
+    )
+
+    rotated_actions = identity_actions.copy()
+    rotated_actions[:, 3:9] = np.asarray(
+        mat_to_pose10d(
+            pose_to_mat(np.array([0.0, 0.0, 0.0, 0.0, 0.25, 0.0]))
+        )[3:9]
+    )
+    rotated_link6 = relative_chunk_to_world(rotated_actions, link6_anchor)
+    rotated_eef = link6_actions_to_eef(rotated_link6, eef_offset)
+    expected_first_eef = link6_pose_to_eef(rotated_link6[0, :6], eef_offset)
+    np.testing.assert_allclose(rotated_eef[0, :6], expected_first_eef, atol=1e-9)
+
+    # ZMQ may expose an equivalent long-angle rotvec. Compare geometry, not
+    # raw rotvec components, because the decoded waypoint is canonicalized.
+    long_angle_eef = np.array(
+        [0.241, 0.0332, 0.1468, 2.6911, -2.4087, 2.2298],
+        dtype=np.float64,
+    )
+    long_angle_link6 = eef_pose_to_link6(long_angle_eef, eef_offset)
+    long_angle_link6_targets = relative_chunk_to_world(
+        identity_actions,
+        long_angle_link6,
+    )
+    long_angle_eef_targets = link6_actions_to_eef(
+        long_angle_link6_targets,
+        eef_offset,
+    )
+    np.testing.assert_allclose(
+        long_angle_eef_targets[:, :3],
+        np.tile(long_angle_eef[:3], (ACTION_HORIZON, 1)),
+        atol=1e-9,
+    )
+    target_rotations = Rotation.from_rotvec(long_angle_eef_targets[:, 3:6])
+    anchor_rotation = Rotation.from_rotvec(long_angle_eef[3:6])
+    rotation_errors = (anchor_rotation.inv() * target_rotations).magnitude()
+    np.testing.assert_allclose(rotation_errors, 0.0, atol=1e-9)
+
+    origin = np.array([0.095, 0.001, 0.158], dtype=np.float64)
+    direct_init = np.array([0.0, 0.0, 0.12, 0.2, -0.3, 0.4], dtype=np.float64)
+    zmq_init = direct_link6_pose_to_zmq_eef(direct_init, origin, eef_offset)
+    roundtrip = zmq_eef_pose_to_direct_link6(zmq_init, origin, eef_offset)
+    np.testing.assert_allclose(roundtrip, direct_init, atol=1e-9)
     print("ShellGame OpenPI contract self-test passed")

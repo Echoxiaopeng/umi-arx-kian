@@ -34,13 +34,18 @@ os.chdir(ROOT_DIR)
 from utils.shellgame_openpi import ACTION_DIM  # noqa: E402
 from utils.shellgame_openpi import ACTION_HORIZON  # noqa: E402
 from utils.shellgame_openpi import SWAP_FRAMES  # noqa: E402
+from utils.shellgame_openpi import TOTAL_MODEL_FRAMES  # noqa: E402
 from utils.shellgame_openpi import ShellGameHistory  # noqa: E402
+from utils.shellgame_openpi import direct_link6_pose_to_zmq_eef  # noqa: E402
+from utils.shellgame_openpi import eef_pose_to_link6  # noqa: E402
+from utils.shellgame_openpi import link6_actions_to_eef  # noqa: E402
 from utils.shellgame_openpi import parse_csv_vector  # noqa: E402
 from utils.shellgame_openpi import relative_chunk_to_world  # noqa: E402
 from utils.shellgame_openpi import run_contract_self_test  # noqa: E402
+from utils.shellgame_openpi import select_safe_waypoint_count  # noqa: E402
 from utils.shellgame_openpi import validate_world_actions  # noqa: E402
 
-DEFAULT_INIT_POSE = "-0.006958,-0.002573,0.120019,2.464006,-2.497232,1.524022"
+DEFAULT_EEF_OFFSET = 0.145
 DEFAULT_PROMPT = "Watch the shell game and lift the cup hiding the ball."
 
 
@@ -128,6 +133,7 @@ def run_policy(
     workspace_max: np.ndarray,
     gripper_min: float,
     gripper_max: float,
+    eef_offset: float,
     key_counter,
     observe_only: bool,
     warmup_done: bool,
@@ -141,38 +147,48 @@ def run_policy(
 
     camera_key = f"camera{wrist_camera_index}_rgb"
 
-    def infer_once() -> tuple[np.ndarray, np.ndarray, dict, float]:
+    def infer_once(*, label: str = "infer") -> tuple[np.ndarray, np.ndarray, np.ndarray, dict, float]:
         obs = env.get_obs()
         frame = obs[camera_key][-1]
-        anchor_pose = np.concatenate([obs["robot0_eef_pos"][-1], obs["robot0_eef_rot_axis_angle"][-1]], axis=-1).astype(
+        anchor_eef = np.concatenate([obs["robot0_eef_pos"][-1], obs["robot0_eef_rot_axis_angle"][-1]], axis=-1).astype(
             np.float64
         )
+        anchor_link6 = eef_pose_to_link6(anchor_eef, eef_offset)
         gripper_width = float(np.asarray(obs["robot0_gripper_width"][-1]).reshape(-1)[0])
         policy_obs = history.build_policy_observation(
             current_frame=frame,
-            current_pose6=anchor_pose,
+            current_pose6=anchor_link6,
             gripper_width=gripper_width,
             prompt=prompt,
         )
+        print(
+            f"[policy] {label}: sending {TOTAL_MODEL_FRAMES} frames to policy server "
+            f"(first call may take 1-3 min while the model compiles)..."
+        )
+        sys.stdout.flush()
         started = time.monotonic()
         result = client.infer(policy_obs)
         latency = time.monotonic() - started
         raw_actions = np.asarray(result["actions"], dtype=np.float64)
         if raw_actions.shape != (ACTION_HORIZON, ACTION_DIM):
             raise ValueError(f"Policy returned {raw_actions.shape}, expected {(ACTION_HORIZON, ACTION_DIM)}")
-        return raw_actions, anchor_pose, obs, latency
+        return raw_actions, anchor_link6, anchor_eef, obs, latency
 
-    if not warmup_done:
+    if not warmup_done and not observe_only:
         print("Compiling/warming policy with a throw-away inference; no action will be sent...")
-        _, _, _, warmup_latency = infer_once()
+        _, _, _, _, warmup_latency = infer_once(label="warmup")
         warmup_done = True
         print(f"Policy warm-up complete in {warmup_latency:.3f}s; taking a fresh observation")
 
     if observe_only:
-        actions, anchor, _, latency = infer_once()
-        world = relative_chunk_to_world(actions, anchor)
+        actions, anchor_link6, anchor_eef, _, latency = infer_once(label="observe-only")
+        world_link6 = relative_chunk_to_world(actions, anchor_link6)
+        world_eef = link6_actions_to_eef(world_link6, eef_offset)
         print(f"[observe-only] inference={latency:.3f}s, raw={actions.shape}")
-        print("[observe-only] first world target:", np.array2string(world[0], precision=5))
+        print("[observe-only] anchor ZMQ eef:", np.array2string(anchor_eef, precision=5))
+        print("[observe-only] anchor link6: ", np.array2string(anchor_link6, precision=5))
+        print("[observe-only] first link6 target:", np.array2string(world_link6[0], precision=5))
+        print("[observe-only] first ZMQ eef command:", np.array2string(world_eef[0], precision=5))
         return False, warmup_done
 
     episode_started = False
@@ -188,27 +204,36 @@ def run_policy(
                     quit_requested = True
                     return True, warmup_done
 
-            actions, anchor_pose, obs, inference_latency = infer_once()
+            actions, anchor_link6, anchor_eef, obs, inference_latency = infer_once(label="policy")
             print(f"Inference latency: {inference_latency:.3f}s")
             if inference_latency > max_inference_latency:
                 raise RuntimeError(
                     f"Inference latency {inference_latency:.3f}s exceeds limit {max_inference_latency:.3f}s"
                 )
 
-            world_actions = relative_chunk_to_world(actions, anchor_pose)
+            world_link6 = relative_chunk_to_world(actions, anchor_link6)
+            world_actions = link6_actions_to_eef(world_link6, eef_offset)
             world_actions[:, 6] = np.clip(world_actions[:, 6], gripper_min, gripper_max)
-            validate_world_actions(
+
+            count = min(steps_per_inference, ACTION_HORIZON)
+            safe_count, safety_reason = select_safe_waypoint_count(
                 world_actions,
-                anchor_pose6=anchor_pose,
+                anchor_pose6=anchor_eef,
                 dt=1.0 / frequency,
                 max_pos_speed=max_pos_speed,
                 max_rot_speed=max_rot_speed,
                 workspace_min=workspace_min,
                 workspace_max=workspace_max,
+                max_waypoints=count,
             )
-
-            count = min(steps_per_inference, ACTION_HORIZON)
-            selected = world_actions[:count]
+            if safe_count == 0:
+                print(f"[SAFETY] rejected chunk, holding pose: {safety_reason}")
+                continue
+            if safety_reason is not None:
+                print(
+                    f"[SAFETY] truncated {count}->{safe_count} waypoints: {safety_reason}"
+                )
+            selected = world_actions[:safe_count]
             first_timestamp = time.time() + action_lead_time
             timestamps = first_timestamp + np.arange(count, dtype=np.float64) / frequency
             fresh = timestamps > time.time()
@@ -276,10 +301,34 @@ def run_policy(
 @click.option("--prompt", default=DEFAULT_PROMPT, show_default=True)
 @click.option(
     "--init-pose",
-    default=DEFAULT_INIT_POSE,
-    show_default=True,
+    default=None,
     type=str,
-    help="启动后缓动到的固定 TCP 位姿: x,y,z,rx,ry,rz (米 & 轴角弧度)",
+    help="初始 TCP 位姿 x,y,z,rx,ry,rz。省略时保持当前位置。",
+)
+@click.option(
+    "--init-pose-frame",
+    type=click.Choice(["zmq", "direct"], case_sensitive=False),
+    default="zmq",
+    show_default=True,
+    help="init-pose 坐标系: zmq=eef 绝对位姿; direct=Direct 采集 link6 位姿。",
+)
+@click.option(
+    "--direct-zmq-origin",
+    default=None,
+    type=str,
+    help=(
+        "Direct→ZMQ 的 link6 原点平移 x,y,z (米)。"
+        "init-pose-frame=direct 时必填，除非使用 --calibrate-direct-origin。"
+    ),
+)
+@click.option(
+    "--calibrate-direct-origin",
+    is_flag=True,
+    help=(
+        "启动时用当前 ZMQ 位姿标定 direct-zmq-origin: "
+        "origin = zmq_link6_now - direct_init_xyz。"
+        "请先把臂放到与 --init-pose 对应的 Direct 物理构型。"
+    ),
 )
 @click.option("--init-gripper", default=None, type=float)
 @click.option("--init-duration", default=4.0, show_default=True, type=float)
@@ -291,7 +340,19 @@ def run_policy(
 @click.option("--max-rot-speed", default=0.80, show_default=True, type=float)
 @click.option("--camera-obs-latency", default=0.17, show_default=True, type=float)
 @click.option("--robot-obs-latency", default=0.20, show_default=True, type=float)
+@click.option(
+    "--eef-offset",
+    default=DEFAULT_EEF_OFFSET,
+    show_default=True,
+    type=float,
+    help="ZMQ eef 相对 Direct link6 沿 TCP Z 的偏移（米）；设为 0 关闭。",
+)
 @click.option("--observe-only", is_flag=True, help="Run inference and print targets without commanding the robot.")
+@click.option(
+    "--observe-only-quick",
+    is_flag=True,
+    help="With --observe-only: seed dummy 241-frame history and infer once right after startup.",
+)
 @click.option("--self-test", is_flag=True, help="Validate transforms without opening cameras or robot hardware.")
 def main(
     output: str,
@@ -307,7 +368,10 @@ def main(
     max_duration: float,
     max_inference_latency: float,
     prompt: str,
-    init_pose: str,
+    init_pose: str | None,
+    init_pose_frame: str,
+    direct_zmq_origin: str | None,
+    calibrate_direct_origin: bool,  # noqa: FBT001
     init_gripper: float | None,
     init_duration: float,
     gripper_min_width: float,
@@ -318,12 +382,16 @@ def main(
     max_rot_speed: float,
     camera_obs_latency: float,
     robot_obs_latency: float,
+    eef_offset: float,
     observe_only: bool,  # noqa: FBT001
+    observe_only_quick: bool,  # noqa: FBT001
     self_test: bool,  # noqa: FBT001
 ) -> None:
     if self_test:
         run_contract_self_test()
         return
+    if observe_only_quick and not observe_only:
+        raise click.BadParameter("--observe-only-quick requires --observe-only")
 
     from modules.arx5_env import Arx5Env
     from openpi_client.websocket_client_policy import WebsocketClientPolicy
@@ -337,14 +405,55 @@ def main(
         raise click.BadParameter("invalid gripper width range")
     if max_pos_speed <= 0 or max_rot_speed <= 0:
         raise click.BadParameter("speed limits must be positive")
+    if eef_offset < 0:
+        raise click.BadParameter("--eef-offset must be non-negative")
+    init_pose_frame = init_pose_frame.lower()
+    if calibrate_direct_origin and init_pose is None:
+        raise click.BadParameter("--calibrate-direct-origin requires --init-pose")
 
-    init_pose6 = parse_csv_vector(init_pose, size=6, name="--init-pose")
+    init_pose6_raw = (
+        None
+        if init_pose is None
+        else parse_csv_vector(init_pose, size=6, name="--init-pose")
+    )
+    direct_origin3: np.ndarray | None = None
+    if direct_zmq_origin is not None:
+        direct_origin3 = parse_csv_vector(
+            direct_zmq_origin, size=3, name="--direct-zmq-origin"
+        )
+    if init_pose6_raw is not None and init_pose_frame == "direct":
+        if direct_origin3 is None and not calibrate_direct_origin:
+            raise click.BadParameter(
+                "init-pose-frame=direct requires --direct-zmq-origin "
+                "or --calibrate-direct-origin"
+            )
+    elif init_pose_frame != "zmq":
+        raise click.BadParameter(f"unsupported init-pose-frame: {init_pose_frame}")
+    elif init_pose6_raw is not None and init_pose_frame == "zmq" and calibrate_direct_origin:
+        raise click.BadParameter("--calibrate-direct-origin only works with init-pose-frame=direct")
+
+    init_pose6 = init_pose6_raw
+    if (
+        init_pose6_raw is not None
+        and init_pose_frame == "direct"
+        and direct_origin3 is not None
+    ):
+        init_pose6 = direct_link6_pose_to_zmq_eef(
+            init_pose6_raw,
+            direct_origin3,
+            eef_offset,
+        )
+        print(
+            "[ALIGN] converted Direct init pose → ZMQ eef: "
+            f"{np.array2string(init_pose6, precision=6, separator=',')}"
+        )
+        print(
+            f"[ALIGN] direct-zmq-origin={np.array2string(direct_origin3, precision=6, separator=',')}"
+        )
     workspace_min3 = parse_csv_vector(workspace_min, size=3, name="--workspace-min")
     workspace_max3 = parse_csv_vector(workspace_max, size=3, name="--workspace-max")
     if np.any(workspace_min3 >= workspace_max3):
         raise click.BadParameter("workspace-min must be smaller than workspace-max")
-    if np.any(init_pose6[:3] < workspace_min3) or np.any(init_pose6[:3] > workspace_max3):
-        raise click.BadParameter("init-pose is outside the configured workspace")
 
     output_path = Path(output).expanduser().resolve()
     output_path.mkdir(parents=True, exist_ok=True)
@@ -353,6 +462,21 @@ def main(
     print(f"Connecting to policy server ws://{policy_ip}:{policy_port}")
     client = WebsocketClientPolicy(host=policy_ip, port=policy_port)
     print("Policy server connected")
+    print(
+        "[ALIGN] Direct/ZMQ world-origin difference cancels in relative SE(3); "
+        f"link6<->eef offset={eef_offset:.3f}m along TCP Z"
+    )
+    if observe_only:
+        if observe_only_quick:
+            print(
+                "[observe-only] quick mode: will infer once immediately after env ready "
+                "(dummy 241-frame history, no robot motion)."
+            )
+        else:
+            print(
+                "[observe-only] full mode: press F → capture 3×80 swap frames → C "
+                "to print inference targets (no robot motion)."
+            )
 
     robots_config = [
         {
@@ -394,17 +518,94 @@ def main(
             while not env.is_ready:
                 time.sleep(0.1)
 
-            print("Environment ready; moving to init_pose")
-            move_to_pose(
-                env,
-                init_pose6,
-                duration=init_duration,
-                frequency=frequency,
-                target_gripper=init_gripper,
-                gripper_min=gripper_min_width,
-                gripper_max=gripper_max_width,
-            )
+            if init_pose6_raw is not None and init_pose_frame == "direct" and calibrate_direct_origin:
+                live_eef, _ = current_robot_pose_and_gripper(env)
+                live_link6 = eef_pose_to_link6(live_eef, eef_offset)
+                direct_origin3 = live_link6[:3] - init_pose6_raw[:3]
+                init_pose6 = direct_link6_pose_to_zmq_eef(
+                    init_pose6_raw,
+                    direct_origin3,
+                    eef_offset,
+                )
+                print(
+                    "[ALIGN] calibrated direct-zmq-origin from current pose: "
+                    f"{np.array2string(direct_origin3, precision=6, separator=',')}"
+                )
+                print(
+                    "[ALIGN] converted Direct init pose → ZMQ eef: "
+                    f"{np.array2string(init_pose6, precision=6, separator=',')}"
+                )
+
+            if init_pose6 is not None and (
+                np.any(init_pose6[:3] < workspace_min3)
+                or np.any(init_pose6[:3] > workspace_max3)
+            ):
+                raise click.BadParameter("init-pose is outside the configured workspace")
+
+            if init_pose6 is None:
+                init_pose6, startup_gripper = current_robot_pose_and_gripper(env)
+                if init_gripper is None:
+                    init_gripper = startup_gripper
+                print(
+                    "Environment ready; no --init-pose supplied. "
+                    "Holding the current ZMQ eef pose as init_pose."
+                )
+            else:
+                print("Environment ready; moving to explicit ZMQ eef init_pose")
+                move_to_pose(
+                    env,
+                    init_pose6,
+                    duration=init_duration,
+                    frequency=frequency,
+                    target_gripper=init_gripper,
+                    gripper_min=gripper_min_width,
+                    gripper_max=gripper_max_width,
+                )
+            if observe_only_quick:
+                obs = env.get_obs()
+                camera_key = f"camera{wrist_camera_index}_rgb"
+                frame = obs[camera_key][-1]
+                current_pose = np.concatenate(
+                    [obs["robot0_eef_pos"][-1], obs["robot0_eef_rot_axis_angle"][-1]],
+                    axis=-1,
+                )
+                current_link6_pose = eef_pose_to_link6(current_pose, eef_offset)
+                history.seed_dummy_history(frame, current_link6_pose)
+                print(
+                    "[observe-only] dummy history seeded; running one alignment inference..."
+                )
+                run_policy(
+                    env=env,
+                    client=client,
+                    history=history,
+                    wrist_camera_index=wrist_camera_index,
+                    prompt=prompt,
+                    frequency=frequency,
+                    steps_per_inference=steps_per_inference,
+                    action_lead_time=action_lead_time,
+                    max_duration=max_duration,
+                    max_inference_latency=max_inference_latency,
+                    max_pos_speed=max_pos_speed,
+                    max_rot_speed=max_rot_speed,
+                    workspace_min=workspace_min3,
+                    workspace_max=workspace_max3,
+                    gripper_min=gripper_min_width,
+                    gripper_max=gripper_max_width,
+                    eef_offset=eef_offset,
+                    key_counter=key_counter,
+                    observe_only=True,
+                    warmup_done=True,
+                )
+                print("[observe-only] done.")
+                cv2.destroyAllWindows()
+                return
+
             print("At init_pose. Press F to capture the initial frame.")
+            if observe_only:
+                print(
+                    "[observe-only] waiting for 241-frame history before inference; "
+                    "or restart with --observe-only-quick"
+                )
 
             quit_requested = False
             while not quit_requested:
@@ -421,6 +622,7 @@ def main(
                     current_pose = np.concatenate(
                         [obs["robot0_eef_pos"][-1], obs["robot0_eef_rot_axis_angle"][-1]], axis=-1
                     )
+                    current_link6_pose = eef_pose_to_link6(current_pose, eef_offset)
                     message = ""
 
                     for key in key_counter.get_press_events():
@@ -428,7 +630,7 @@ def main(
                             quit_requested = True
                             break
                         if key == KeyCode(char="f"):
-                            message = history.press_f(frame, current_pose)
+                            message = history.press_f(frame, current_link6_pose)
                             print(message)
                         elif key == KeyCode(char="c"):
                             if history.ready:
@@ -504,6 +706,7 @@ def main(
                     workspace_max=workspace_max3,
                     gripper_min=gripper_min_width,
                     gripper_max=gripper_max_width,
+                    eef_offset=eef_offset,
                     key_counter=key_counter,
                     observe_only=observe_only,
                     warmup_done=warmup_done,

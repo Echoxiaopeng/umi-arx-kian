@@ -5,7 +5,7 @@ ARX5 三杯挪杯采数脚本（臂固定拍图；人按脚本出题挪杯；同
 观察段机械臂固定拍图；满 61 帧后立刻进零力，继续录夹取轨迹，按 S 整段保存。
 
 协议（每条 episode）:
-  1. C 出题 → 方块随机放在 initial_cup；第 1 次交换必须包含该杯
+  1. C 出题 → 方块固定放最左杯 (0)；第 1 次交换从杯 0 开始
   2. F → 录第 0 帧（静止）
   3. 显示 Move k → F → 人交换两杯，同时录 frames_per_move 帧（×3）
   4. F → 进入零力，人拖臂夹取 final_cup 上的杯子（持续录）
@@ -22,21 +22,6 @@ ARX5 三杯挪杯采数脚本（臂固定拍图；人按脚本出题挪杯；同
 
     python scripts/collect_drag_umi_cup.py -o data/cup_demo \\
         --frames_per_move 30 --frequency 10 --seed 0
-export DISPLAY=:1
-export XAUTHORITY=/run/user/1000/gdm/Xauthority
-
-conda activate umi-arx
-cd ~/kian/umi-arx-kian
-source /home/lenovo/kian/umi-arx-kian/scripts/setup.sh
-
-python scripts/collect_drag_umi_cup.py -o data/cup_demo
-
-
-conda activate umi-arx-kian
-source $CONDA_PREFIX/setup.bash          # 设置 AMENT_PREFIX_PATH 等
-source scripts/setup.sh                  # arx_x5_python / LD_LIBRARY_PATH
-# 确认 can 已 up，且与脚本 can_port 一致（默认 can3）
-python scripts/collect_drag_umi_cup.py -o data/cup_demo
 
 键盘:
   C = 出下一题并进入摆放阶段
@@ -88,7 +73,7 @@ from utils.other_util import precise_wait  # noqa: E402
 CUP_NAMES = ("left", "middle", "right")
 N_CUPS = 3
 N_MOVES = 3
-DEFAULT_FRAMES_PER_MOVE = 80
+DEFAULT_FRAMES_PER_MOVE = 20
 FRAMES_PER_MOVE = DEFAULT_FRAMES_PER_MOVE
 FRAMES_TOTAL = 1 + N_MOVES * FRAMES_PER_MOVE  # 1 + 3 * frames_per_move
 LABELS_FILENAME = "labels.jsonl"
@@ -140,18 +125,17 @@ def apply_swaps(initial_cup: int, moves: list[tuple[int, int]] | tuple[tuple[int
 
 def sample_cup_task(rng: random.Random) -> CupTask:
     """
-    方块初始杯位在 0/1/2 中均匀随机；第 1 次交换必须包含该杯。
+    方块始终从最左杯 (0) 开始；第 1 次交换必须包含杯 0。
     后两次交换在三个槽位中均匀随机选一对。
     """
-    initial = int(rng.randrange(N_CUPS))
+    initial = 0  # always leftmost on frame 0
     moves: list[tuple[int, int]] = []
-    # First swap must include the cup that currently holds the block.
-    other = int(rng.choice([c for c in range(N_CUPS) if c != initial]))
-    a, b = sorted((initial, other))
-    moves.append((int(a), int(b)))
+    # First swap starts from the left cup.
+    other = rng.choice([1, 2])
+    moves.append((0, int(other)))
     for _ in range(N_MOVES - 1):
         a, b = rng.sample(range(N_CUPS), 2)
-        # keep smaller index first for stable display
+        # keep smaller index first for stable display when 0 is involved
         if a > b:
             a, b = b, a
         moves.append((int(a), int(b)))
@@ -310,29 +294,16 @@ def draw_cup_slot_markers(
     *,
     highlight_cups: set[int] | None = None,
     cam_offset_x: int = 0,
-    recording: bool = False,
 ) -> None:
-    """Draw 0/1/2 slot markers on the preview (camera-image coordinates).
-
-    Highlighted cups use cyan/orange while waiting; switch to red while
-    recording so the operator can tell the segment is live.
-    """
+    """Draw 0/1/2 slot markers on the preview (camera-image coordinates)."""
     highlight_cups = highlight_cups or set()
     radius = max(12, min(vis.shape[0], vis.shape[1]) // 12)
     for cup_id, (x, y) in enumerate(positions):
         cx = int(cam_offset_x + x)
         cy = int(y)
         active = cup_id in highlight_cups
-        # Colors are RGB (cam buffer is RGB; imshow does [...::-1] → BGR).
-        if active and recording:
-            ring = (255, 0, 0)  # red while recording
-            fill = (180, 0, 0)
-        elif active:
-            ring = (0, 255, 255)
-            fill = (0, 180, 255)
-        else:
-            ring = (255, 255, 255)
-            fill = (40, 40, 40)
+        ring = (0, 255, 255) if active else (255, 255, 255)
+        fill = (0, 180, 255) if active else (40, 40, 40)
         cv2.circle(vis, (cx, cy), radius, ring, 2, lineType=cv2.LINE_AA)
         cv2.circle(vis, (cx, cy), max(radius - 3, 1), fill, -1, lineType=cv2.LINE_AA)
         label = str(cup_id)
@@ -593,16 +564,57 @@ def format_pose_cli(pose6: np.ndarray, grip: float | None = None) -> str:
     return f"--init_pose {pose_s} --init_gripper {float(grip):.6f}"
 
 
-def print_current_pose(env: Arx5EnvWithImages, *, tag: str = "pose") -> None:
-    """打印可复制的 init 位姿（命令坐标系 ActualTCPPose）。"""
-    for robot_idx, (pose, grip) in enumerate(tcp_pose_grip_from_robot_state(env)):
+def print_current_pose(
+    env: Arx5EnvWithImages,
+    *,
+    tag: str = "pose",
+    obs: dict | None = None,
+) -> None:
+    """
+    打印控制器 ActualTCPPose，以及 get_obs 里将写入 zarr 的 eef 位姿，便于对照。
+
+    ctrl = 即时 tcp_pose（复制 --init_pose 用这条）
+    save = obs 的 eef_pos / eef_rot_axis_angle / gripper（与 record_pose_action 同源）
+    """
+    ctrl_list = tcp_pose_grip_from_robot_state(env)
+    if obs is None:
+        try:
+            obs = env.get_obs()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{tag}] get_obs failed, only printing ctrl: {exc}")
+            obs = None
+
+    save_list = (
+        tcp_pose_grip_from_obs(obs, len(ctrl_list)) if obs is not None else None
+    )
+
+    for robot_idx, (pose, grip) in enumerate(ctrl_list):
         print(
-            f"[{tag}] robot{robot_idx} "
+            f"[{tag}] robot{robot_idx} ctrl "
             f"pos=[{pose[0]:.4f},{pose[1]:.4f},{pose[2]:.4f}] "
             f"rotvec=[{pose[3]:.4f},{pose[4]:.4f},{pose[5]:.4f}] "
             f"grip={grip:.4f}"
         )
-        print(f"[{tag}] copy: {format_pose_cli(pose, grip)}")
+        print(f"[{tag}] copy(ctrl): {format_pose_cli(pose, grip)}")
+        if save_list is None:
+            continue
+        save_pose, save_grip = save_list[robot_idx]
+        print(
+            f"[{tag}] robot{robot_idx} save "
+            f"pos=[{save_pose[0]:.4f},{save_pose[1]:.4f},{save_pose[2]:.4f}] "
+            f"rotvec=[{save_pose[3]:.4f},{save_pose[4]:.4f},{save_pose[5]:.4f}] "
+            f"grip={save_grip:.4f}"
+        )
+        dpos = save_pose[:3] - pose[:3]
+        drot = save_pose[3:6] - pose[3:6]
+        print(
+            f"[{tag}] robot{robot_idx} delta(save-ctrl) "
+            f"pos=[{dpos[0]:+.4f},{dpos[1]:+.4f},{dpos[2]:+.4f}] "
+            f"|dpos|={float(np.linalg.norm(dpos)):.4f} "
+            f"rotvec=[{drot[0]:+.4f},{drot[1]:+.4f},{drot[2]:+.4f}] "
+            f"|drot|={float(np.linalg.norm(drot)):.4f} "
+            f"dgrip={save_grip - grip:+.4f}"
+        )
 
 
 def ease_in_out_quad(t: float) -> float:
@@ -1061,7 +1073,6 @@ def make_vis_image(
             scaled_positions,
             highlight_cups=highlight_cups,
             cam_offset_x=int(round(cup_cam_offset_x * scale)),
-            recording=recording,
         )
 
     if recording:
@@ -1091,8 +1102,7 @@ def make_vis_image(
     panel = np.full((panel_h, w, 3), 28, dtype=np.uint8)
     font = cv2.FONT_HERSHEY_SIMPLEX
 
-    # Panel is RGB (same as cam); imshow flips to BGR.
-    status_color = (255, 0, 0) if recording else (0, 200, 255)
+    status_color = (0, 0, 255) if recording else (0, 200, 255)
     if n_steps <= FRAMES_TOTAL:
         frames_text = f"frames={n_steps}/{FRAMES_TOTAL}"
     else:
@@ -1247,7 +1257,7 @@ def phase_overlay(
 @click.option(
     "--frequency",
     "-f",
-    default=20.0,
+    default=10.0,
     type=float,
     help="采数频率 Hz（默认 10）",
 )
@@ -1292,7 +1302,7 @@ def phase_overlay(
 )
 @click.option(
     "--init_gripper",
-    default=0.1062,
+    default=0.000604,
     show_default=True,
     type=float,
     help="启动时目标夹爪开度（米）",
@@ -1443,8 +1453,6 @@ def main(
             max_pos_speed=4.0,
             max_rot_speed=10.0,
             shm_manager=shm_manager,
-            # record_*/wait_* 分段：只保留写过 action 的步，等待段图像不进 zarr
-            drop_uninitialized_actions=True,
         ) as env:
             key_source = term_keys if terminal_keys else key_counter
 
@@ -1599,7 +1607,7 @@ def main(
                         if pose_print_enabled:
                             now = time.monotonic()
                             if now - last_pose_print_t >= pose_print_interval:
-                                print_current_pose(env, tag="live")
+                                print_current_pose(env, tag="live", obs=obs)
                                 last_pose_print_t = now
                         n_saved = env.replay_buffer.n_episodes
                         delete_prompt = None
@@ -1792,7 +1800,7 @@ def main(
                         obs = env.get_obs()
                         if pose_print_enabled:
                             if now - last_pose_print_t >= pose_print_interval:
-                                print_current_pose(env, tag="rec")
+                                print_current_pose(env, tag="rec", obs=obs)
                                 last_pose_print_t = now
 
                         recording_now = phase.startswith("record_")
