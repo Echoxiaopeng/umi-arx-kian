@@ -46,9 +46,11 @@ os.chdir(ROOT_DIR)
 
 from utils.shellgame_openpi import ACTION_DIM  # noqa: E402
 from utils.shellgame_openpi import ACTION_HORIZON  # noqa: E402
+from utils.shellgame_openpi import HISTORY_FRAMES  # noqa: E402
 from utils.shellgame_openpi import SWAP_FRAMES  # noqa: E402
 from utils.shellgame_openpi import TOTAL_MODEL_FRAMES  # noqa: E402
 from utils.shellgame_openpi import ShellGameHistory  # noqa: E402
+from utils.shellgame_openpi import ShellGamePolicyClient  # noqa: E402
 from utils.shellgame_openpi import direct_link6_pose_to_zmq_eef  # noqa: E402
 from utils.shellgame_openpi import eef_pose_to_link6  # noqa: E402
 from utils.shellgame_openpi import link6_actions_to_eef  # noqa: E402
@@ -347,7 +349,7 @@ def print_action_debug(
 
 def warmup_policy_server(
     *,
-    client,
+    policy_client: ShellGamePolicyClient,
     env,
     wrist_camera_index: int,
     prompt: str,
@@ -357,7 +359,7 @@ def warmup_policy_server(
     gripper_max: float,
     direct_gripper_full_open: float,
 ) -> float:
-    """Send one throw-away 242-frame request so JAX compiles before grasp control."""
+    """Warm the policy server before grasp control (cache+step or full infer)."""
     camera_key = f"camera{wrist_camera_index}_rgb"
     obs = env.get_obs()
     frame = obs[camera_key][-1]
@@ -376,32 +378,54 @@ def warmup_policy_server(
 
     warmup_history = ShellGameHistory()
     warmup_history.seed_dummy_history(frame, current_link6_pose)
-    policy_obs = warmup_history.build_policy_observation(
-        current_frame=frame,
-        current_pose6=current_link6_pose,
-        gripper_width=gripper_width,
-        prompt=prompt,
-    )
-    print(
-        f"[warmup] sending {TOTAL_MODEL_FRAMES} frames to policy server "
-        "(first run may take 1-3 min while the model compiles; arm will not move)..."
-    )
-    sys.stdout.flush()
     started = time.monotonic()
-    result = client.infer(policy_obs)
+    if policy_client.cached_infer_enabled:
+        print(
+            f"[warmup] uploading {HISTORY_FRAMES} history frames + one step infer "
+            "(first run may take 1-3 min while the model compiles; arm will not move)..."
+        )
+        sys.stdout.flush()
+        policy_client.upload_history(warmup_history, prompt=prompt)
+        result = policy_client.infer_step(
+            warmup_history,
+            current_frame=frame,
+            current_pose6=current_link6_pose,
+            gripper_width=gripper_width,
+            prompt=prompt,
+        )
+    else:
+        policy_obs = warmup_history.build_policy_observation(
+            current_frame=frame,
+            current_pose6=current_link6_pose,
+            gripper_width=gripper_width,
+            prompt=prompt,
+        )
+        print(
+            f"[warmup] sending {TOTAL_MODEL_FRAMES} frames to policy server "
+            "(first run may take 1-3 min while the model compiles; arm will not move)..."
+        )
+        sys.stdout.flush()
+        result = policy_client.infer_full(
+            warmup_history,
+            current_frame=frame,
+            current_pose6=current_link6_pose,
+            gripper_width=gripper_width,
+            prompt=prompt,
+        )
     latency = time.monotonic() - started
     raw_actions = np.asarray(result["actions"], dtype=np.float64)
     if raw_actions.shape != (ACTION_HORIZON, ACTION_DIM):
         raise ValueError(f"Warmup returned {raw_actions.shape}, expected {(ACTION_HORIZON, ACTION_DIM)}")
     print(f"[warmup] policy server ready in {latency:.1f}s")
     sys.stdout.flush()
+    policy_client.reset_session()
     return latency
 
 
 def run_policy(
     *,
     env,
-    client,
+    policy_client: ShellGamePolicyClient,
     history: ShellGameHistory,
     wrist_camera_index: int,
     prompt: str,
@@ -432,7 +456,7 @@ def run_policy(
 
     camera_key = f"camera{wrist_camera_index}_rgb"
 
-    def infer_once(*, label: str = "infer") -> tuple[np.ndarray, np.ndarray, np.ndarray, dict, float, float]:
+    def infer_once(*, label: str = "infer") -> tuple[np.ndarray, np.ndarray, np.ndarray, dict, float, float, float]:
         obs = env.get_obs()
         frame = obs[camera_key][-1]
         anchor_eef = np.concatenate([obs["robot0_eef_pos"][-1], obs["robot0_eef_rot_axis_angle"][-1]], axis=-1).astype(
@@ -451,28 +475,41 @@ def run_policy(
             )
         else:
             gripper_width = gripper_width_zmq
-        policy_obs = history.build_policy_observation(
+        if policy_client.cached_infer_enabled:
+            print(f"[policy] {label}: sending 1 current frame (cached history on server)")
+        else:
+            print(
+                f"[policy] {label}: sending {TOTAL_MODEL_FRAMES} frames to policy server "
+                f"(first call may take 1-3 min while the model compiles)..."
+            )
+        sys.stdout.flush()
+        started = time.monotonic()
+        result = policy_client.infer_step(
+            history,
             current_frame=frame,
             current_pose6=anchor_link6,
             gripper_width=gripper_width,
             prompt=prompt,
         )
-        print(
-            f"[policy] {label}: sending {TOTAL_MODEL_FRAMES} frames to policy server "
-            f"(first call may take 1-3 min while the model compiles)..."
-        )
-        sys.stdout.flush()
-        started = time.monotonic()
-        result = client.infer(policy_obs)
-
-        print("Memory 预测最终杯子:", result["memory"]["predicted_final_cup"])
-        print("置信度:", result["memory"]["predicted_final_cup_probabilities"])
-        
+        if "memory" in result:
+            print("Memory 预测最终杯子:", result["memory"]["predicted_final_cup"])
+            print("置信度:", result["memory"]["predicted_final_cup_probabilities"])
         latency = time.monotonic() - started
         raw_actions = np.asarray(result["actions"], dtype=np.float64)
         if raw_actions.shape != (ACTION_HORIZON, ACTION_DIM):
             raise ValueError(f"Policy returned {raw_actions.shape}, expected {(ACTION_HORIZON, ACTION_DIM)}")
         return raw_actions, anchor_link6, anchor_eef, obs, latency, gripper_width, gripper_width_zmq
+
+    if policy_client.cached_infer_enabled:
+        print(f"[cache] uploading {HISTORY_FRAMES} history frames to policy server...")
+        sys.stdout.flush()
+        cache_started = time.monotonic()
+        cache_result = policy_client.upload_history(history, prompt=prompt)
+        cache_latency = time.monotonic() - cache_started
+        print(f"[cache] history cached in {cache_latency:.3f}s")
+        if "memory" in cache_result:
+            print("Memory 预测最终杯子:", cache_result["memory"]["predicted_final_cup"])
+            print("置信度:", cache_result["memory"]["predicted_final_cup_probabilities"])
 
     if not warmup_done and not observe_only:
         print("Compiling/warming policy with a throw-away inference; no action will be sent...")
@@ -646,6 +683,7 @@ def run_policy(
                 print("Maximum policy duration reached")
                 break
     finally:
+        policy_client.reset_session()
         # A fresh servoL target truncates the controller's queued
         # interpolation, so S does not continue executing the old chunk.
         hold_current_pose(env)
@@ -758,6 +796,12 @@ def run_policy(
     type=float,
     help="WebSocket ping/close timeout (s) while waiting for server warmup inference.",
 )
+@click.option(
+    "--cached-infer/--no-cached-infer",
+    default=True,
+    show_default=True,
+    help="Upload 241-frame history once, then send only current frame+state each step.",
+)
 @click.option("--self-test", is_flag=True, help="Validate transforms without opening cameras or robot hardware.")
 def main(
     output: str,
@@ -794,6 +838,7 @@ def main(
     observe_only_quick: bool,  # noqa: FBT001
     skip_server_warmup: bool,  # noqa: FBT001
     server_warmup_timeout: float,
+    cached_infer: bool,  # noqa: FBT001
     self_test: bool,  # noqa: FBT001
 ) -> None:
     if self_test:
@@ -874,6 +919,12 @@ def main(
         close_timeout=server_warmup_timeout,
     )
     print("Policy server connected")
+    policy_client = ShellGamePolicyClient(client, cached_infer=cached_infer)
+    if cached_infer:
+        if policy_client.cached_infer_enabled:
+            print("[cache] server supports cached ShellGame inference")
+        else:
+            print("[cache] server lacks cached infer support; falling back to full 242-frame infer")
     print(
         "[ALIGN] Direct/ZMQ world-origin difference cancels in relative SE(3); "
         f"link6<->eef offset={eef_offset:.3f}m along TCP Z"
@@ -983,7 +1034,7 @@ def main(
             current_link6_pose = eef_pose_to_link6(live_eef, eef_offset)
             if not skip_server_warmup:
                 warmup_policy_server(
-                    client=client,
+                    policy_client=policy_client,
                     env=env,
                     wrist_camera_index=wrist_camera_index,
                     prompt=prompt,
@@ -1009,7 +1060,7 @@ def main(
                 )
                 run_policy(
                     env=env,
-                    client=client,
+                    policy_client=policy_client,
                     history=history,
                     wrist_camera_index=wrist_camera_index,
                     prompt=prompt,
@@ -1083,6 +1134,7 @@ def main(
                                 print(message)
                         elif key == KeyCode(char="p"):
                             print("P pressed: clearing history and returning to init_pose")
+                            policy_client.reset_session()
                             history.reset()
                             move_to_pose(
                                 env,
@@ -1134,7 +1186,7 @@ def main(
                     break
                 quit_requested, warmup_done = run_policy(
                     env=env,
-                    client=client,
+                    policy_client=policy_client,
                     history=history,
                     wrist_camera_index=wrist_camera_index,
                     prompt=prompt,
