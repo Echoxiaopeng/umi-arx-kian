@@ -73,7 +73,7 @@ from utils.other_util import precise_wait  # noqa: E402
 CUP_NAMES = ("left", "middle", "right")
 N_CUPS = 3
 N_MOVES = 3
-DEFAULT_FRAMES_PER_MOVE = 20
+DEFAULT_FRAMES_PER_MOVE = 80
 FRAMES_PER_MOVE = DEFAULT_FRAMES_PER_MOVE
 FRAMES_TOTAL = 1 + N_MOVES * FRAMES_PER_MOVE  # 1 + 3 * frames_per_move
 LABELS_FILENAME = "labels.jsonl"
@@ -571,12 +571,14 @@ def print_current_pose(
     obs: dict | None = None,
 ) -> None:
     """
-    打印控制器 ActualTCPPose，以及 get_obs 里将写入 zarr 的 eef 位姿，便于对照。
+    打印控制器 ActualTCPPose / ActualQ，以及 get_obs 里将写入 zarr 的 eef 位姿，便于对照。
 
     ctrl = 即时 tcp_pose（复制 --init_pose 用这条）
+    joints = 即时 ActualQ（关节角，弧度）
     save = obs 的 eef_pos / eef_rot_axis_angle / gripper（与 record_pose_action 同源）
     """
     ctrl_list = tcp_pose_grip_from_robot_state(env)
+    robot_states = env.get_robot_state()
     if obs is None:
         try:
             obs = env.get_obs()
@@ -596,6 +598,11 @@ def print_current_pose(
             f"grip={grip:.4f}"
         )
         print(f"[{tag}] copy(ctrl): {format_pose_cli(pose, grip)}")
+        q = np.asarray(robot_states[robot_idx]["ActualQ"], dtype=np.float64).reshape(-1)
+        q_s = ",".join(f"{v:.6f}" for v in q)
+        q_deg = ",".join(f"{np.degrees(v):.2f}" for v in q)
+        print(f"[{tag}] robot{robot_idx} joints(rad)=[{q_s}]")
+        print(f"[{tag}] robot{robot_idx} joints(deg)=[{q_deg}]")
         if save_list is None:
             continue
         save_pose, save_grip = save_list[robot_idx]
@@ -1257,7 +1264,7 @@ def phase_overlay(
 @click.option(
     "--frequency",
     "-f",
-    default=10.0,
+    default=20.0,
     type=float,
     help="采数频率 Hz（默认 10）",
 )
@@ -1302,7 +1309,8 @@ def phase_overlay(
 )
 @click.option(
     "--init_gripper",
-    default=0.000604,
+    # default=0.000604,
+    default=0.085,
     show_default=True,
     type=float,
     help="启动时目标夹爪开度（米）",

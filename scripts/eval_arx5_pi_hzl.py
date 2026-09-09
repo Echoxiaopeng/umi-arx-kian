@@ -3,12 +3,22 @@
 
 python scripts/eval_arx5_pi_hzl.py  --direct-zmq-origin 0.2389,-0.0208,0.1624 --eef-offset 0.145  --steps-per-inference 4  
 
+
+export DISPLAY=:1
+export XAUTHORITY=/run/user/1000/gdm/Xauthority
+
+cd /home/lenovo/kian/umi-arx-kian
+conda activate umi-arx
 python scripts/eval_arx5_pi_hzl.py \
   --eef-offset 0.145 \
   --direct-zmq-origin 0.094905,-0.002323,0.158023 \
-  --steps-per-inference 4 \
-  --max-duration 120 \
+  --steps-per-inference 8 \
+  --max-duration 240 \
   --max-pos-speed 0.4 \
+  --no-cached-infer
+
+  
+  --max-inference-latency 8 \
   --policy-ip 112.91.138.78
 Controls
 --------
@@ -21,10 +31,16 @@ Q: quit
 Startup defaults to the Direct-collected init pose and converts it to ZMQ before moving.
 After init move, a throw-away 242-frame request warms the policy server (JAX compile)
 before F/history collection; use --skip-server-warmup to disable.
+
+Session logs (stdout+stderr) are tee'd to ``data_local/shellgame_eval/logs/`` (gitignored).
+
+
+sudo slcand -o -f -s8 /dev/arxcan0 can0 && sudo ifconfig can0 up
 """
 
 from __future__ import annotations
 
+import datetime as dt
 from multiprocessing.managers import SharedMemoryManager
 import os
 from pathlib import Path
@@ -69,6 +85,64 @@ DEFAULT_DIRECT_GRIPPER_FULL_OPEN = 0.11
 # Direct-collected link6 init pose (requires --direct-zmq-origin or --calibrate-direct-origin).
 DEFAULT_INIT_POSE = "-0.006958,-0.002573,0.120019,2.464006,-2.497232,1.524022"
 DEFAULT_PROMPT = "The shell game has ended. Grasp and lift the cup containing the ball."
+EVAL_LOG_DIR = ROOT_DIR / "data_local" / "shellgame_eval" / "logs"
+
+
+class _SessionLogTee:
+    """Mirror stdout/stderr to a session log file while keeping terminal output."""
+
+    def __init__(self, *streams) -> None:
+        self._streams = streams
+
+    def write(self, value: str) -> int:
+        for stream in self._streams:
+            stream.write(value)
+            stream.flush()
+        return len(value)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            stream.flush()
+
+    def isatty(self) -> bool:
+        return any(bool(getattr(stream, "isatty", lambda: False)()) for stream in self._streams)
+
+
+_session_log_stream = None
+_original_stdout = sys.stdout
+_original_stderr = sys.stderr
+
+
+def _install_session_log() -> Path:
+    """Write the full eval session (stdout+stderr) under data_local/ (gitignored)."""
+    global _session_log_stream, _original_stdout, _original_stderr
+    EVAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = EVAL_LOG_DIR / f"eval_arx5_pi_hzl_{dt.datetime.now():%Y%m%d_%H%M%S}.log"
+    _session_log_stream = log_path.open("a", encoding="utf-8", buffering=1)
+    _original_stdout = sys.stdout
+    _original_stderr = sys.stderr
+    sys.stdout = _SessionLogTee(_original_stdout, _session_log_stream)
+    sys.stderr = _SessionLogTee(_original_stderr, _session_log_stream)
+    header = (
+        f"=== eval_arx5_pi_hzl session {dt.datetime.now().isoformat(timespec='seconds')} ===\n"
+        f"cwd: {Path.cwd()}\n"
+        f"argv: {' '.join(sys.argv)}\n"
+        f"log: {log_path}\n"
+        "===\n"
+    )
+    sys.stdout.write(header)
+    return log_path
+
+
+def _close_session_log() -> None:
+    global _session_log_stream
+    if _session_log_stream is None:
+        return
+    sys.stdout = _original_stdout
+    sys.stderr = _original_stderr
+    _session_log_stream.flush()
+    _session_log_stream.close()
+    _session_log_stream = None
 
 
 def zmq_gripper_to_direct(
@@ -766,7 +840,7 @@ def run_policy(
     help="Direct collector full-open width (m) for --gripper-scale.",
 )
 @click.option("--workspace-min", default="-0.50,-0.50,0.03", show_default=True)
-@click.option("--workspace-max", default="0.50,0.50,0.80", show_default=True)
+@click.option("--workspace-max", default="0.80,0.80,0.80", show_default=True)
 @click.option("--max-pos-speed", default=0.40, show_default=True, type=float)
 @click.option("--max-rot-speed", default=0.80, show_default=True, type=float)
 @click.option("--camera-obs-latency", default=0.17, show_default=True, type=float)
@@ -1213,4 +1287,9 @@ def main(
 
 
 if __name__ == "__main__":
-    main()
+    session_log_path = _install_session_log()
+    print(f"[log] full session output -> {session_log_path}")
+    try:
+        main()
+    finally:
+        _close_session_log()

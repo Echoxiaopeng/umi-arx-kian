@@ -23,9 +23,46 @@ Examples
   python scripts/replay_cup_demo_grasp.py --backend zmq \
     --direct-zmq-origin 0.094905,-0.002323,0.158023 --eef-offset 0.145
 
+conda activate umi-arx
+cd ~/kian/umi-arx-kian
+
+python scripts/replay_cup_demo_grasp.py \
+  --trajectory-source convert-inline \
+  --episode 0 --backend zmq \
+  --direct-zmq-origin 0.094905,-0.002323,0.158023 --eef-offset 0.145
+ 
+
+
   # Calibrate origin from current ZMQ pose vs demo grasp-start xyz
   python scripts/replay_cup_demo_grasp.py --backend zmq --calibrate-direct-origin \\
     --eef-offset 0.145
+
+Environment
+-----------
+  * verify-only / LeRobot conversion: openpi ``uv run`` env is fine.
+  * real robot replay: use the umi-arx conda env (has ``atomics`` for Direct CAN)::
+
+      conda activate umi-arx
+      cd ~/kian/umi-arx-kian
+      python scripts/replay_cup_demo_grasp.py --trajectory-source convert-inline ...
+
+  For ``lerobot-relative`` on the robot, also ``pip install pyarrow`` in umi-arx.
+
+  Direct backend also needs the ARX SDK shared libs on ``LD_LIBRARY_PATH``. This script
+  sets that automatically; if import still fails, run::
+
+      cd ~/kian/umi-arx-kian/modules/arx_x5_python && source setup.sh
+      cd ~/kian/umi-arx-kian
+      python scripts/replay_cup_demo_grasp.py ...
+
+Motion sequence (Direct and ZMQ)
+--------------------------------
+  1. ``--move-to-init`` (default on): smooth move to collect ``init_pose``
+  2. ``approach_grasp_start``: smooth move to decoded grasp-start
+  3. replay grasp waypoints
+
+  With ``--backend zmq --calibrate-direct-origin``, origin is calibrated from
+  *current pose vs init_pose* (same as eval_arx5_pi_hzl), not grasp-start.
 """
 
 from __future__ import annotations
@@ -54,9 +91,17 @@ os.chdir(ROOT_DIR)
 from utils.shellgame_openpi import direct_link6_pose_to_zmq_eef  # noqa: E402
 from utils.shellgame_openpi import eef_pose_to_link6  # noqa: E402
 from utils.shellgame_openpi import parse_csv_vector  # noqa: E402
+from utils.shellgame_lerobot_convert import (  # noqa: E402
+    OBSERVE_FRAMES,
+    build_grasp_trajectory_from_lerobot,
+    summarize_roundtrip_errors,
+)
 
 DEFAULT_DEMO = ROOT_DIR / "data" / "cup_demo"
 DEFAULT_EEF_OFFSET = 0.145
+ARX_SDK_ROOT = ROOT_DIR / "modules" / "arx_x5_python"
+ARX_SDK_LIB_DIR = ARX_SDK_ROOT / "bimanual" / "api" / "arx_x5_src"
+ARX_SDK_PY_DIR = ARX_SDK_ROOT / "bimanual" / "api" / "arx_x5_python"
 DEFAULT_ZMQ_GRIPPER_MIN = 0.0
 DEFAULT_ZMQ_GRIPPER_MAX = 0.085
 # Direct SingleArmClient: real_pos/5*0.11 → width at fully open real_pos=5
@@ -250,6 +295,78 @@ def merge_action_and_eef_poses(
             n_eef += 1
     print(f"[traj] merged source: action rows={n_action}, eef fallback rows={n_eef}")
     return poses, grippers
+
+
+def print_roundtrip_summary(stats: dict[str, float], *, pos_tol_m: float, rot_tol_rad: float) -> None:
+    print("[verify] round-trip stats:")
+    print(
+        f"  max_pos_err={stats['max_pos_err_m'] * 1000:.3f} mm  "
+        f"mean_pos_err={stats['mean_pos_err_m'] * 1000:.3f} mm"
+    )
+    print(
+        f"  max_rot_err={np.rad2deg(stats['max_rot_err_rad']):.3f} deg  "
+        f"mean_rot_err={np.rad2deg(stats['mean_rot_err_rad']):.3f} deg"
+    )
+    print(
+        f"  max_grip_err={stats['max_grip_err_m'] * 1000:.3f} mm  "
+        f"mean_grip_err={stats['mean_grip_err_m'] * 1000:.3f} mm"
+    )
+    if stats["max_pos_err_m"] <= pos_tol_m and stats["max_rot_err_rad"] <= rot_tol_rad:
+        print("[verdict] relative→absolute round-trip OK")
+    else:
+        print("[verdict] relative→absolute round-trip FAILED — check conversion / pose utils")
+
+
+def load_relative_grasp_trajectory(
+    demo_dir: Path,
+    *,
+    episode: int,
+    trajectory_source: str,
+    lerobot_dir: Path | None,
+) -> tuple[np.ndarray, np.ndarray, float, dict[str, float] | None]:
+    trajectory_source = trajectory_source.lower()
+    if trajectory_source == "recorded":
+        raise ValueError("load_relative_grasp_trajectory does not handle recorded source")
+
+    arrays = load_episode_arrays(demo_dir, episode)
+    label_rows = load_labels(demo_dir)
+    label = next((row for row in label_rows if int(row["episode_id"]) == int(episode)), None)
+    if label is None:
+        raise ValueError(f"episode {episode} not found in labels")
+
+    lerobot_path = lerobot_dir.expanduser().resolve() if lerobot_dir is not None else None
+    if trajectory_source == "lerobot-relative":
+        if lerobot_path is None:
+            raise ValueError("lerobot-relative requires --lerobot-dir")
+    elif trajectory_source != "convert-inline":
+        raise ValueError(f"unknown trajectory_source: {trajectory_source}")
+
+    poses, grippers, _anchors, converted = build_grasp_trajectory_from_lerobot(
+        demo_dir,
+        episode_index=episode,
+        lerobot_dir=lerobot_path if trajectory_source == "lerobot-relative" else None,
+    )
+    stats = summarize_roundtrip_errors(
+        converted=converted,
+        positions=arrays["eef_pos"],
+        rotvecs=arrays["eef_rot"],
+        gripper=arrays["gripper"],
+        raw_actions=arrays["action"],
+    )
+
+    ts = arrays["timestamp"]
+    grasp_start = int(label.get("grasp_start_frame", OBSERVE_FRAMES))
+    grasp_ts = ts[grasp_start:]
+    if len(grasp_ts) >= 2:
+        dt = float(np.median(np.diff(grasp_ts)))
+    else:
+        dt = 0.1
+    if not np.isfinite(dt) or dt <= 1e-4:
+        dt = 0.1
+
+    for i in range(len(poses)):
+        poses[i, 3:6] = canonical_rotvec(poses[i, 3:6])
+    return poses, grippers.astype(np.float64), dt, stats
 
 
 def ease_in_out_quad(value: np.ndarray) -> np.ndarray:
@@ -557,9 +674,84 @@ def replay_grasp_segment(
     return stats
 
 
+def init_command_pose6(
+    init_pose6_direct: np.ndarray,
+    *,
+    backend: str,
+    direct_origin3: np.ndarray | None,
+    eef_offset: float,
+) -> np.ndarray:
+    """Map collect-time Direct init pose into the command frame of the backend."""
+    init_pose6_direct = np.asarray(init_pose6_direct, dtype=np.float64).reshape(6)
+    if backend == "direct":
+        return init_pose6_direct.copy()
+    if backend != "zmq":
+        raise ValueError(backend)
+    if direct_origin3 is None:
+        raise ValueError("zmq init move requires --direct-zmq-origin or --calibrate-direct-origin")
+    return direct_link6_pose_to_zmq_eef(init_pose6_direct, direct_origin3, eef_offset)
+
+
+def ensure_arx_sdk_env(*, reexec: bool = True) -> None:
+    """Match modules/arx_x5_python/setup.sh so libarx_x5_src.so resolves.
+
+    Linux reads LD_LIBRARY_PATH at process start, so set it via re-exec when needed.
+    """
+    lib_dir = str(ARX_SDK_LIB_DIR)
+    py_dir = str(ARX_SDK_PY_DIR)
+    if not (ARX_SDK_LIB_DIR / "libarx_x5_src.so").is_file():
+        raise click.ClickException(
+            f"ARX SDK library not found: {ARX_SDK_LIB_DIR / 'libarx_x5_src.so'}"
+        )
+
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    py_path = os.environ.get("PYTHONPATH", "")
+    needs_ld = lib_dir not in ld_path.split(":")
+    needs_py = py_dir not in py_path.split(":")
+    if not needs_ld and not needs_py:
+        return
+
+    if not reexec or os.environ.get("REPLAY_ARX_REEXEC") == "1":
+        if needs_ld:
+            os.environ["LD_LIBRARY_PATH"] = f"{lib_dir}:/usr/local/lib:{ld_path}".rstrip(":")
+        if needs_py:
+            os.environ["PYTHONPATH"] = f"{py_dir}:{py_path}".rstrip(":")
+        return
+
+    env = os.environ.copy()
+    env["REPLAY_ARX_REEXEC"] = "1"
+    env["LD_LIBRARY_PATH"] = f"{lib_dir}:/usr/local/lib:{ld_path}".rstrip(":")
+    env["PYTHONPATH"] = f"{py_dir}:{py_path}".rstrip(":")
+    os.execve(sys.executable, [sys.executable, *sys.argv], env)
+
+
 def make_robot(backend: str, shm_manager: SharedMemoryManager, **kwargs):
     if backend == "direct":
-        from modules.arx5_controller_direct import Arx5ControllerDirect
+        ensure_arx_sdk_env()
+        try:
+            from modules.arx5_controller_direct import Arx5ControllerDirect
+        except ImportError as exc:
+            msg = str(exc)
+            hint = (
+                "  cd ~/kian/umi-arx-kian/modules/arx_x5_python && source setup.sh\n"
+                "  cd ~/kian/umi-arx-kian\n"
+                "  python scripts/replay_cup_demo_grasp.py ..."
+            )
+            if "libkdl_parser" in msg or "libarx_x5_src" in msg:
+                hint = (
+                    "  The ARX Direct SDK native libs are missing or incomplete.\n"
+                    "  Same fix as collect_drag_umi.py:\n"
+                    "    cd ~/kian/umi-arx-kian/modules/arx_x5_python && source setup.sh\n"
+                    "    cd ~/kian/umi-arx-kian/bimanual && ./build.sh   # if libkdl_parser.so missing\n"
+                    "  Or replay via ZMQ instead (no Direct SDK):\n"
+                    "    python scripts/replay_cup_demo_grasp.py --backend zmq "
+                    "--calibrate-direct-origin --eef-offset 0.145 ..."
+                )
+            raise click.ClickException(
+                f"Direct backend failed to import the ARX SDK.\n"
+                f"  underlying error: {exc}\n"
+                f"  Try:\n{hint}"
+            ) from exc
 
         return Arx5ControllerDirect(
             shm_manager=shm_manager,
@@ -599,11 +791,37 @@ def make_robot(backend: str, shm_manager: SharedMemoryManager, **kwargs):
     show_default=True,
     help="auto=action when valid else eef (best for Direct); eef=obs only; action=command only.",
 )
+@click.option(
+    "--trajectory-source",
+    type=click.Choice(["recorded", "lerobot-relative", "convert-inline"], case_sensitive=False),
+    default="recorded",
+    show_default=True,
+    help=(
+        "recorded=zarr absolute trajectory; lerobot-relative=decode LeRobot actions; "
+        "convert-inline=decode in-memory relative conversion from zarr."
+    ),
+)
+@click.option(
+    "--lerobot-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="LeRobot dataset directory produced by convert_real_shellgame_zarr_to_lerobot.py",
+)
+@click.option(
+    "--verify-only",
+    is_flag=True,
+    help="For relative sources: print round-trip error summary and exit without robot motion.",
+)
+@click.option("--verify-pos-tol-m", default=1e-3, show_default=True, type=float)
+@click.option("--verify-rot-tol-rad", default=1e-3, show_default=True, type=float)
 @click.option("--direct-zmq-origin", default=None, type=str, help="x,y,z meters for Direct→ZMQ.")
 @click.option(
     "--calibrate-direct-origin",
     is_flag=True,
-    help="With zmq: origin = live_zmq_link6_xyz - demo_grasp_start_xyz (arm must match grasp start).",
+    help=(
+        "With zmq: origin = live_zmq_link6_xyz - init_pose_direct_xyz (same as eval_arx5_pi_hzl); "
+        "works from home, then --move-to-init goes to init_pose."
+    ),
 )
 @click.option("--eef-offset", default=DEFAULT_EEF_OFFSET, show_default=True, type=float)
 @click.option(
@@ -654,9 +872,9 @@ def make_robot(backend: str, shm_manager: SharedMemoryManager, **kwargs):
 @click.option("--approach-duration", default=3.0, show_default=True, type=float)
 @click.option(
     "--move-to-init/--no-move-to-init",
-    default=False,
+    default=True,
     show_default=True,
-    help="Direct:缓动到采集默认 init_pose 后再去 grasp-start（臂在 home 时建议开启）。",
+    help="Smooth move to collect init_pose before approach/replay (Direct and ZMQ).",
 )
 @click.option(
     "--init-pose",
@@ -677,6 +895,11 @@ def main(
     episode: int,
     backend: str | None,
     source: str,
+    trajectory_source: str,
+    lerobot_dir: Path | None,
+    verify_only: bool,  # noqa: FBT001
+    verify_pos_tol_m: float,
+    verify_rot_tol_rad: float,
     direct_zmq_origin: str | None,
     calibrate_direct_origin: bool,  # noqa: FBT001
     eef_offset: float,
@@ -709,22 +932,49 @@ def main(
         raise click.BadParameter("gripper-min-width must be < gripper-max-width")
 
     arrays = load_episode_arrays(demo_dir, episode)
-    grasp_start = int(label.get("grasp_start_frame", 0))
-    raw_poses, raw_grippers, dt = build_grasp_trajectory(
-        arrays, grasp_start_frame=grasp_start, source=source.lower()
-    )
+    grasp_start = int(label.get("grasp_start_frame", OBSERVE_FRAMES))
+    roundtrip_stats: dict[str, float] | None = None
+    trajectory_source = trajectory_source.lower()
+
+    if trajectory_source == "recorded":
+        raw_poses, raw_grippers, dt = build_grasp_trajectory(
+            arrays, grasp_start_frame=grasp_start, source=source.lower()
+        )
+    else:
+        raw_poses, raw_grippers, dt, roundtrip_stats = load_relative_grasp_trajectory(
+            demo_dir,
+            episode=episode,
+            trajectory_source=trajectory_source,
+            lerobot_dir=lerobot_dir,
+        )
 
     print("=" * 64)
     print(f"demo={demo_dir}")
     print(f"episode={episode} label={label}")
-    print(f"zarr_frames={len(arrays['eef_pos'])} grasp_start={grasp_start} source={source}")
-    print_traj_summary(label="recorded_direct", poses=raw_poses, grippers=raw_grippers, dt=dt)
-    print_gripper_motion_summary("recorded_direct", raw_grippers)
+    print(
+        f"zarr_frames={len(arrays['eef_pos'])} grasp_start={grasp_start} "
+        f"trajectory_source={trajectory_source} recorded_source={source}"
+    )
+    traj_label = "decoded_relative" if trajectory_source != "recorded" else "recorded_direct"
+    print_traj_summary(label=traj_label, poses=raw_poses, grippers=raw_grippers, dt=dt)
+    print_gripper_motion_summary(traj_label, raw_grippers)
+    if roundtrip_stats is not None:
+        print_roundtrip_summary(
+            roundtrip_stats,
+            pos_tol_m=verify_pos_tol_m,
+            rot_tol_rad=verify_rot_tol_rad,
+        )
+
+    if verify_only:
+        if trajectory_source == "recorded":
+            raise click.ClickException("--verify-only requires a relative trajectory source")
+        print("[verify-only] done; no robot motion.")
+        return
 
     if backend is None:
         if dry_run:
             backend = "direct"
-            print("[dry-run] backend not set; showing recorded Direct poses only")
+            print("[dry-run] backend not set; showing trajectory only")
         else:
             raise click.ClickException("Please pass --backend direct|zmq (or --dry-run)")
 
@@ -798,31 +1048,60 @@ def main(
                 robot.set_end_control()
                 time.sleep(0.1)
 
-            if backend == "direct" and move_to_init:
-                init_pose6 = parse_csv_vector(init_pose, size=6, name="--init-pose")
-                print(
-                    f"[init] moving to collect init_pose "
-                    f"{np.array2string(init_pose6, precision=4)} ({init_duration:.1f}s)..."
-                )
-                move_smooth(
-                    robot,
-                    init_pose6,
-                    float(init_gripper),
-                    duration=init_duration,
-                    frequency=20.0,
-                )
-
+            init_pose6_direct = parse_csv_vector(init_pose, size=6, name="--init-pose")
             live = np.asarray(robot.get_state()["ActualTCPPose"], dtype=np.float64).reshape(6)
             live_grip = float(robot.get_state()["gripper_position"])
             print(f"[live] pose={np.array2string(live, precision=4)} grip={live_grip:.4f}")
 
             if backend == "zmq" and calibrate_direct_origin:
                 live_link6 = eef_pose_to_link6(live, eef_offset)
-                direct_origin3 = live_link6[:3] - raw_poses[0, :3]
+                direct_origin3 = live_link6[:3] - init_pose6_direct[:3]
+                init_pose_zmq = direct_link6_pose_to_zmq_eef(
+                    init_pose6_direct,
+                    direct_origin3,
+                    eef_offset,
+                )
                 print(
-                    "[ALIGN] calibrated direct-zmq-origin from live ZMQ vs demo grasp-start: "
+                    "[ALIGN] calibrated direct-zmq-origin from live pose vs init_pose: "
                     f"{np.array2string(direct_origin3, precision=6, separator=',')}"
                 )
+                print(
+                    "[ALIGN] converted Direct init_pose → ZMQ eef: "
+                    f"{np.array2string(init_pose_zmq, precision=6, separator=',')}"
+                )
+
+            if backend == "zmq" and direct_origin3 is None:
+                raise click.ClickException(
+                    "zmq backend requires --direct-zmq-origin or --calibrate-direct-origin"
+                )
+
+            if move_to_init:
+                cmd_init = init_command_pose6(
+                    init_pose6_direct,
+                    backend=backend,
+                    direct_origin3=direct_origin3,
+                    eef_offset=eef_offset,
+                )
+                init_grip_cmd = float(init_gripper)
+                if backend == "zmq":
+                    init_grip_cmd = float(
+                        np.clip(init_gripper, gripper_min_width, gripper_max_width)
+                    )
+                print(
+                    f"[init] moving to collect init_pose "
+                    f"{np.array2string(cmd_init, precision=4)} ({init_duration:.1f}s) "
+                    f"grip={init_grip_cmd:.4f}..."
+                )
+                move_smooth(
+                    robot,
+                    cmd_init,
+                    init_grip_cmd,
+                    duration=init_duration,
+                    frequency=20.0,
+                )
+                after = np.asarray(robot.get_state()["ActualTCPPose"], dtype=np.float64).reshape(6)
+                init_err = float(np.linalg.norm(after[:3] - cmd_init[:3]))
+                print(f"[init] done; |Δxyz|={init_err * 1000:.1f} mm")
 
             cmd_poses = convert_poses_for_backend(
                 raw_poses,

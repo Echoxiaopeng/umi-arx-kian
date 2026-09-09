@@ -1,0 +1,5 @@
+python scripts/eval_arx5_pi_hzl_debug.py \
+  --direct-zmq-origin 0.2389,-0.0208,0.1624 \
+  --eef-offset 0.145 \
+  --steps-per-inference 1 \
+  --max-duration 3

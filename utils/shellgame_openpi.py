@@ -116,6 +116,33 @@ def relative_pose10(start_pose6: np.ndarray, current_pose6: np.ndarray) -> np.nd
     return np.asarray(mat_to_pose10d(relative), dtype=np.float32)
 
 
+def relative_action_to_world(action10: np.ndarray, anchor_pose6: np.ndarray) -> np.ndarray:
+    """Decode one current-relative EEF10 action to world xyz+rotvec+gripper."""
+    action10 = np.asarray(action10, dtype=np.float64).reshape(10)
+    anchor = pose_to_mat(np.asarray(anchor_pose6, dtype=np.float64).reshape(6))
+    world_mat = anchor @ pose10d_to_mat(action10[:9])
+    world_pose6 = np.asarray(mat_to_pose(world_mat), dtype=np.float64)
+    return np.concatenate([world_pose6, [float(action10[9])]], dtype=np.float64)
+
+
+def relative_actions_sequence_to_world(
+    actions: np.ndarray,
+    anchors: np.ndarray,
+) -> np.ndarray:
+    """Decode a sequence of current-relative EEF10 actions using per-step anchors."""
+    actions = np.asarray(actions, dtype=np.float64)
+    anchors = np.asarray(anchors, dtype=np.float64)
+    if actions.ndim != 2 or actions.shape[1] != ACTION_DIM:
+        raise ValueError(f"Expected actions shaped (N, {ACTION_DIM}), got {actions.shape}")
+    if anchors.shape != (len(actions), 6):
+        raise ValueError(f"Expected anchors shaped ({len(actions)}, 6), got {anchors.shape}")
+
+    world = np.empty((len(actions), 7), dtype=np.float64)
+    for index in range(len(actions)):
+        world[index] = relative_action_to_world(actions[index], anchors[index])
+    return world
+
+
 def relative_chunk_to_world(action_chunk: np.ndarray, anchor_pose6: np.ndarray) -> np.ndarray:
     """Restore current-relative EEF10 targets to world xyz+rotvec+gripper."""
     actions = np.asarray(action_chunk, dtype=np.float64)
@@ -339,6 +366,117 @@ class ShellGameHistory:
             observation[f"left_wrist_0_rgb_{index}"] = frame
         return observation
 
+    def build_history_upload_observation(self, *, prompt: str) -> dict[str, np.ndarray | str]:
+        """Build a one-time 241-frame history upload for cached server inference."""
+        if not self.ready:
+            raise RuntimeError(f"History is incomplete: {self.frame_count}/{HISTORY_FRAMES}")
+        observation: dict[str, np.ndarray | str] = {
+            "mode": "reset_history",
+            "prompt": prompt,
+        }
+        for index, frame in enumerate(self.frames()):
+            observation[f"left_wrist_0_rgb_{index}"] = frame
+        if len([key for key in observation if key.startswith("left_wrist_0_rgb_")]) != HISTORY_FRAMES:
+            raise RuntimeError(f"Expected {HISTORY_FRAMES} history frames for upload")
+        return observation
+
+    def build_step_observation(
+        self,
+        *,
+        current_frame: np.ndarray,
+        current_pose6: np.ndarray,
+        gripper_width: float,
+        prompt: str,
+    ) -> dict[str, np.ndarray | str]:
+        """Build a single-frame step observation for cached server inference."""
+        if self.episode_start_pose6 is None:
+            raise RuntimeError("Episode start pose is missing")
+        state_pose9 = relative_pose10(self.episode_start_pose6, current_pose6)
+        return {
+            "mode": "infer_step",
+            "prompt": prompt,
+            "left_wrist_0_rgb": image_to_uint8(current_frame),
+            "robot0_eef_pos": state_pose9[:3],
+            "robot0_eef_rot_axis_angle": state_pose9[3:9],
+            "robot0_gripper_width": np.asarray([gripper_width], dtype=np.float32),
+        }
+
+
+class ShellGamePolicyClient:
+    """WebSocket client wrapper for cached ShellGame history upload + step infer."""
+
+    def __init__(self, client, *, cached_infer: bool = True) -> None:
+        self._client = client
+        self._cached_infer = cached_infer
+        self._server_supports_cache = bool(
+            client.get_server_metadata().get("supports_cached_infer", False)
+        )
+        self._history_uploaded = False
+
+    @property
+    def cached_infer_enabled(self) -> bool:
+        return self._cached_infer and self._server_supports_cache
+
+    def reset_session(self) -> None:
+        if self.cached_infer_enabled:
+            self._client.infer({"mode": "reset"})
+        self._history_uploaded = False
+
+    def upload_history(self, history: ShellGameHistory, *, prompt: str) -> dict:
+        if not self.cached_infer_enabled:
+            raise RuntimeError("Cached infer is disabled or unsupported by the server")
+        result = self._client.infer(history.build_history_upload_observation(prompt=prompt))
+        self._history_uploaded = bool(result.get("cache_ready", False))
+        if not self._history_uploaded:
+            raise RuntimeError(f"Server failed to cache history: {result!r}")
+        return result
+
+    def infer_step(
+        self,
+        history: ShellGameHistory,
+        *,
+        current_frame: np.ndarray,
+        current_pose6: np.ndarray,
+        gripper_width: float,
+        prompt: str,
+    ) -> dict:
+        if self.cached_infer_enabled:
+            if not self._history_uploaded:
+                raise RuntimeError("History cache missing; call upload_history first")
+            return self._client.infer(
+                history.build_step_observation(
+                    current_frame=current_frame,
+                    current_pose6=current_pose6,
+                    gripper_width=gripper_width,
+                    prompt=prompt,
+                )
+            )
+        return self.infer_full(
+            history,
+            current_frame=current_frame,
+            current_pose6=current_pose6,
+            gripper_width=gripper_width,
+            prompt=prompt,
+        )
+
+    def infer_full(
+        self,
+        history: ShellGameHistory,
+        *,
+        current_frame: np.ndarray,
+        current_pose6: np.ndarray,
+        gripper_width: float,
+        prompt: str,
+    ) -> dict:
+        return self._client.infer(
+            history.build_policy_observation(
+                current_frame=current_frame,
+                current_pose6=current_pose6,
+                gripper_width=gripper_width,
+                prompt=prompt,
+            )
+        )
+
 
 def run_contract_self_test() -> None:
     history = ShellGameHistory()
@@ -363,6 +501,19 @@ def run_contract_self_test() -> None:
     image_keys = [key for key in obs if key.startswith("left_wrist_0_rgb_")]
     assert len(image_keys) == TOTAL_MODEL_FRAMES
     np.testing.assert_allclose(obs["robot0_eef_pos"], [0.02, 0.0, 0.0], atol=1e-6)
+
+    history_obs = history.build_history_upload_observation(prompt="test")
+    assert history_obs["mode"] == "reset_history"
+    assert len([key for key in history_obs if key.startswith("left_wrist_0_rgb_")]) == HISTORY_FRAMES
+
+    step_obs = history.build_step_observation(
+        current_frame=image,
+        current_pose6=current,
+        gripper_width=0.04,
+        prompt="test",
+    )
+    assert step_obs["mode"] == "infer_step"
+    assert step_obs["left_wrist_0_rgb"].shape == (224, 224, 3)
 
     relative_actions = np.zeros((ACTION_HORIZON, ACTION_DIM), dtype=np.float64)
     relative_actions[:, 3] = 1.0

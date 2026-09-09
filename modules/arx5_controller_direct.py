@@ -287,12 +287,13 @@ class Arx5ControllerDirect(mp.Process):
             iter_idx = 0
             keep_running = True
             is_gravity_compensation = False  # 追踪重力补偿状态
+            is_damping = False  # 阻尼模式下停止下发 tcp_pose，否则 protect_mode 会被覆盖
             
             while keep_running:
                 t_now = time.monotonic()
                 
-                # 只有在非重力补偿模式下才发送位姿命令
-                if not is_gravity_compensation:
+                # 只有在非重力补偿/非阻尼模式下才发送位姿命令
+                if not is_gravity_compensation and not is_damping:
                     pose_cmd = pose_interp(t_now)
                     gripper_cmd = float(gripper_pos_interp(t_now)[0])
                     self.robot_client.set_tcp_pose(pose_cmd, gripper_cmd)
@@ -330,6 +331,7 @@ class Arx5ControllerDirect(mp.Process):
                         break
                         
                     elif cmd == Command.SERVOL.value:
+                        is_damping = False
                         target_pose = command["target_pose"]
                         duration = float(command["duration"])
                         curr_time = t_now + dt
@@ -349,6 +351,7 @@ class Arx5ControllerDirect(mp.Process):
                             print(f"[Arx5ControllerDirect] New pose target: {target_pose}")
                             
                     elif cmd == Command.SCHEDULE_WAYPOINT.value:
+                        is_damping = False
                         target_pose = command["target_pose"]
                         target_time = float(command["target_time"])
                         target_time = time.monotonic() - time.time() + target_time
@@ -398,6 +401,7 @@ class Arx5ControllerDirect(mp.Process):
                         )
                         self.reset_success.value = True
                         is_gravity_compensation = False
+                        is_damping = False
 
                     elif cmd == Command.ADD_WAYPOINT.value:
                         if len(self.waypoint_buffer) > 0:
@@ -471,12 +475,14 @@ class Arx5ControllerDirect(mp.Process):
                         
                         # 设置重力补偿标志，停止下发 tcp_pose 命令
                         is_gravity_compensation = True
+                        is_damping = False
                         self.waypoint_buffer = []
 
                     elif cmd == Command.SET_END_CONTROL.value:
                         self.robot_client.set_end_control()
                         print("[Arx5ControllerDirect] set_end_control -> True")
                         is_gravity_compensation = False
+                        is_damping = False
                         self.waypoint_buffer = []
                         self.ring_buffer.clear()
 
@@ -509,6 +515,8 @@ class Arx5ControllerDirect(mp.Process):
                     elif cmd == Command.SET_TO_DAMPING.value:
                         self.robot_client.set_to_damping()
                         print(f"[Arx5ControllerDirect] set_to_damping")
+                        is_gravity_compensation = False
+                        is_damping = True
                         self.waypoint_buffer = []
 
                     else:

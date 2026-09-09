@@ -11,3 +11,5 @@ collect_demo/
 lingbot_umi_output/
 light_wam_output/
 data_local/
+# eval_arx5_pi_hzl.py tee logs (under data_local/, listed explicitly)
+data_local/shellgame_eval/logs/

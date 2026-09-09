@@ -59,7 +59,9 @@ def print_pose_block(tag: str, ee: np.ndarray, tcp: np.ndarray, grip: float, joi
     ee_rv = R.from_euler("xyz", ee_rpy).as_rotvec()
 
     print(f"\n===== {tag} =====")
-    print(f"gripper_pos = {grip:.4f}")
+    print(f"gripper_pos = {grip:.6f} m  (ZMQ opening width; larger=more open)")
+    print(f"             ~{grip * 1000.0:.1f} mm | vs max 0.085m: {100.0 * grip / 0.085:.1f}%")
+    print(f"copy: --init-gripper {grip:.6f}")
     print(f"joint_pos   = {fmt3(joints, prec=3)} rad")
     print(f"             {fmt_deg(joints)} deg")
     print("--- EE  (ZMQ raw: xyz + rpy) ---")
@@ -71,6 +73,10 @@ def print_pose_block(tag: str, ee: np.ndarray, tcp: np.ndarray, grip: float, joi
     print(f"  rotvec    = {fmt3(tcp_rv)}  |angle|={rotvec_angle_deg(tcp_rv):.1f} deg")
     print(f"  as_rpy    = {fmt3(tcp_rpy)} rad  |  {fmt_deg(tcp_rpy)} deg")
     print(f"  |pos|     = {np.linalg.norm(tcp_pos):.4f} m")
+    print(
+        "copy: --init-pose "
+        + ",".join(f"{v:.6f}" for v in tcp)
+    )
 
 
 def print_delta(ref_tcp: np.ndarray, cur_tcp: np.ndarray) -> None:
