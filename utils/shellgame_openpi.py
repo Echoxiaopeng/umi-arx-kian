@@ -423,7 +423,8 @@ class ShellGameHistory:
         *,
         prompt: str,
         image_key_style: str = "m6",
-    ) -> dict[str, np.ndarray | str]:
+        force_cup: str | int | None = None,
+    ) -> dict[str, np.ndarray | str | int]:
         """Build a one-time 241-frame history upload for cached server inference."""
         if not self.ready:
             raise RuntimeError(f"History is incomplete: {self.frame_count}/{HISTORY_FRAMES}")
@@ -433,10 +434,12 @@ class ShellGameHistory:
             prefix = LEGACY_VIDEO_FRAME_KEY_PREFIX
         else:
             raise ValueError(f"Unknown image_key_style={image_key_style!r}")
-        observation: dict[str, np.ndarray | str] = {
+        observation: dict[str, np.ndarray | str | int] = {
             "mode": "reset_history",
             "prompt": prompt,
         }
+        if force_cup is not None:
+            observation["force_cup"] = force_cup
         for index, frame in enumerate(self.frames()):
             observation[f"{prefix}{index}"] = frame
         if len([key for key in observation if key.startswith(prefix)]) != HISTORY_FRAMES:
@@ -508,13 +511,20 @@ class ShellGamePolicyClient:
         finally:
             self._history_uploaded = False
 
-    def upload_history(self, history: ShellGameHistory, *, prompt: str) -> dict:
+    def upload_history(
+        self,
+        history: ShellGameHistory,
+        *,
+        prompt: str,
+        force_cup: str | int | None = None,
+    ) -> dict:
         if not self.cached_infer_enabled:
             raise RuntimeError("Cached infer is disabled or unsupported by the server")
         result = self._client.infer(
             history.build_history_upload_observation(
                 prompt=prompt,
                 image_key_style=self._image_key_style,
+                force_cup=force_cup,
             )
         )
         self._history_uploaded = bool(result.get("cache_ready", False))

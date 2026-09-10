@@ -23,10 +23,13 @@ python scripts/eval_arx5_pi_hzl_v2.py \
   --rtc-s-min 8 \
   --steps-per-inference 8 \
   --max-duration 600 \
-  --action-lead-time 0.0 \
+  --action-lead-time 0.05 \
   --frequency 20 \
   --server-warmup-timeout 600 \
+  --grasp-only \
+  --grasp-cup left \
   --cached-infer 2>&1 | tee shellgame_grasp_h16_rtc_trace.log
+
 
 
 
@@ -38,22 +41,28 @@ python scripts/eval_arx5_pi_hzl_v2.py \
   --init-pose-frame direct \
   --direct-zmq-origin 0.094905,-0.002323,0.158023 \
   --eef-offset 0.145 \
-  --steps-per-inference 8 \
+  --steps-per-inference 16 \
   --max-duration 600 \
   --action-lead-time 0.0 \
   --frequency 20 \
   --auto-capture \
   --server-warmup-timeout 600 \
+  --grasp-only \
+  --grasp-cup middle \
   --cached-infer 2>&1 | tee shellgame_grasp_h16_rtc_trace.log
+
 
 Controls
 --------
 F (auto, default): one F saves the initial frame and continuously records all 3×80 swaps; policy auto-starts at 241
 F (manual, --manual-capture): capture initial frame, then each F starts one swap; press C to run policy
-C: (manual mode) start policy after the strict 241-frame history is ready
+C: start policy (manual capture, or --grasp-only after dummy history is seeded)
 S: stop policy and return to human control
 P: in human mode, return to init_pose and reset history for the next round
 Q: quit
+--grasp-only --grasp-cup {left,middle,right}: skip F/swap capture; seed dummy 241 frames;
+  server skips MEM and freezes the direction prompt to the chosen cup (restart
+  serve_shellgame_real_m6_cached.py so force_cup support is loaded).
 
 Startup defaults to the Direct-collected init pose and converts it to ZMQ before moving.
 After init move, a throw-away 242-frame request warms the policy server (JAX compile)
@@ -255,25 +264,33 @@ def print_memory_prediction(memory: dict, *, source: str) -> None:
         f"{CUP_DISPLAY_NAMES[index]}={probability:.3f}"
         for index, probability in enumerate(probabilities)
     )
+    forced = bool(memory.get("forced_cup", False))
+    tag = f"[MEM:{source}|forced]" if forced else f"[MEM:{source}]"
     print(
-        f"[MEM:{source}] 最终方块位置={CUP_DISPLAY_NAMES[final_index]} "
+        f"{tag} 最终方块位置={CUP_DISPLAY_NAMES[final_index]} "
         f"confidence={probabilities[final_index]:.3f} | {probability_text}"
     )
+
+    if forced:
+        prompt = memory.get("direction_prompt")
+        if prompt:
+            print(f"{tag} direction_prompt={prompt!r}")
+        return
 
     if "initial_cup" in memory:
         initial_index = int(memory["initial_cup"])
         initial_probabilities = np.asarray(memory["initial_cup_probabilities"], dtype=np.float64)
         print(
-            f"[MEM:{source}] 初始位置={CUP_DISPLAY_NAMES[initial_index]} "
+            f"{tag} 初始位置={CUP_DISPLAY_NAMES[initial_index]} "
             f"confidence={initial_probabilities[initial_index]:.3f}"
         )
     if "stage_cups" in memory:
         stage_text = " -> ".join(
             CUP_DISPLAY_NAMES[int(index)] for index in memory["stage_cups"]
         )
-        print(f"[MEM:{source}] 三阶段位置={stage_text}")
+        print(f"{tag} 三阶段位置={stage_text}")
     if "swap_pair_names" in memory:
-        print(f"[MEM:{source}] 三次交换={memory['swap_pair_names']}")
+        print(f"{tag} 三次交换={memory['swap_pair_names']}")
 
 
 def make_eval_vis(
@@ -786,6 +803,7 @@ def run_policy(
     rtc_delay_buffer_size: int = 8,
     rtc_initial_delay_steps: int = 4,
     rtc_max_guidance_weight: float = 5.0,
+    force_cup: str | None = None,
 ) -> tuple[bool, bool, dict | None]:
     """Run one policy episode. Returns (quit_requested, warmup_done, last_memory)."""
     from peripherals.keystroke_counter import KeyCode
@@ -936,10 +954,18 @@ def run_policy(
         return raw_actions, anchor_link6, anchor_eef, obs, latency, gripper_width, gripper_width_zmq
 
     if policy_client.cached_infer_enabled:
-        print(f"[cache] uploading {HISTORY_FRAMES} history frames to policy server...")
+        if force_cup is not None:
+            print(
+                f"[cache] uploading {HISTORY_FRAMES} history frames "
+                f"(force_cup={force_cup}, skip MEM)..."
+            )
+        else:
+            print(f"[cache] uploading {HISTORY_FRAMES} history frames to policy server...")
         sys.stdout.flush()
         cache_started = time.monotonic()
-        cache_result = policy_client.upload_history(history, prompt=prompt)
+        cache_result = policy_client.upload_history(
+            history, prompt=prompt, force_cup=force_cup
+        )
         cache_latency = time.monotonic() - cache_started
         print(f"[cache] history cached in {cache_latency:.3f}s")
         if "memory" in cache_result:
@@ -948,7 +974,7 @@ def run_policy(
             live_obs = env.get_obs()
             show_policy_view(
                 live_obs[camera_key][-1],
-                status="READY MEM",
+                status="READY MEM" if force_cup is None else f"FORCE {force_cup.upper()}",
                 help_text="History uploaded; starting policy  |  S: stop  Q: quit",
                 detail_lines=[f"cache upload {cache_latency:.3f}s"],
             )
@@ -1514,6 +1540,21 @@ def run_policy(
     ),
 )
 @click.option(
+    "--grasp-only/--full-shellgame",
+    default=False,
+    show_default=True,
+    help=(
+        "Skip shell-game F/swap capture. Seeds a dummy 241-frame history and "
+        "requires --grasp-cup so the server skips MEM and freezes that cup prompt."
+    ),
+)
+@click.option(
+    "--grasp-cup",
+    default=None,
+    type=click.Choice(["left", "middle", "right"], case_sensitive=False),
+    help="Cup to grasp when using --grasp-only (also usable to force_cup on real history).",
+)
+@click.option(
     "--vis-scale",
     default=DEFAULT_VIS_SCALE,
     show_default=True,
@@ -1577,6 +1618,8 @@ def main(
     server_warmup_timeout: float,
     cached_infer: bool,  # noqa: FBT001
     auto_capture: bool,  # noqa: FBT001
+    grasp_only: bool,  # noqa: FBT001
+    grasp_cup: str | None,
     vis_scale: float,
     panel_height: int,
     cup_overlay_xy: str | None,
@@ -1587,6 +1630,13 @@ def main(
         return
     if observe_only_quick and not observe_only:
         raise click.BadParameter("--observe-only-quick requires --observe-only")
+    if grasp_only and observe_only:
+        raise click.BadParameter("--grasp-only cannot be combined with --observe-only")
+    if grasp_only and not grasp_cup:
+        raise click.BadParameter("--grasp-only requires --grasp-cup {left,middle,right}")
+    if grasp_cup is not None:
+        grasp_cup = grasp_cup.lower()
+    force_cup = grasp_cup
 
     from modules.arx5_env import Arx5Env
     from openpi_client.websocket_client_policy import WebsocketClientPolicy
@@ -1724,7 +1774,12 @@ def main(
                 "[observe-only] full mode: press F → capture 3×80 swap frames → C "
                 "to print inference targets (no robot motion)."
             )
-    if auto_capture:
+    if grasp_only:
+        print(
+            f"[grasp-only] skip shell-game capture; dummy 241 history + force_cup={force_cup}. "
+            "Press C to start grasp, P to reset, Q to quit."
+        )
+    elif auto_capture:
         print(
             "[capture] auto mode: one F starts continuous recording "
             f"(1 + {NUM_SWAPS * SWAP_FRAMES} frames), then policy starts automatically"
@@ -1891,11 +1946,25 @@ def main(
                 f_hint = "Press F to auto-capture; policy starts when history is ready."
             else:
                 f_hint = "Press F to capture the initial frame."
-            if observe_only:
+            if grasp_only:
+                obs = env.get_obs()
+                camera_key = f"camera{wrist_camera_index}_rgb"
+                frame = obs[camera_key][-1]
+                current_pose = np.concatenate(
+                    [obs["robot0_eef_pos"][-1], obs["robot0_eef_rot_axis_angle"][-1]],
+                    axis=-1,
+                )
+                current_link6_pose = eef_pose_to_link6(current_pose, eef_offset)
+                history.seed_dummy_history(frame, current_link6_pose)
+                print(
+                    f"[grasp-only] seeded dummy {HISTORY_FRAMES}-frame history; "
+                    f"force_cup={force_cup}. Press C to start grasp."
+                )
+            elif observe_only:
                 print(f"At current pose. {f_hint}")
             else:
                 print(f"At init_pose. {f_hint}")
-            if observe_only:
+            if observe_only and not grasp_only:
                 print(
                     "[observe-only] waiting for 241-frame history before inference; "
                     "or restart with --observe-only-quick"
@@ -1925,6 +1994,12 @@ def main(
                             quit_requested = True
                             break
                         if key == KeyCode(char="f"):
+                            if grasp_only:
+                                print(
+                                    "[grasp-only] F ignored; history already seeded. "
+                                    "Press C to start, or P to re-seed."
+                                )
+                                continue
                             message = history.press_f(frame, current_link6_pose)
                             print_init_link6_alignment(
                                 "press-F",
@@ -1960,11 +2035,28 @@ def main(
                             target_pose, target_gripper = current_robot_pose_and_gripper(env)
                             loop_start = time.monotonic()
                             iteration = 0
-                            message = (
-                                "At init_pose; press F to auto-capture"
-                                if auto_capture
-                                else "At init_pose; press F for the new initial frame"
-                            )
+                            if grasp_only:
+                                seed_obs = env.get_obs()
+                                seed_frame = seed_obs[camera_key][-1]
+                                seed_pose = np.concatenate(
+                                    [
+                                        seed_obs["robot0_eef_pos"][-1],
+                                        seed_obs["robot0_eef_rot_axis_angle"][-1],
+                                    ],
+                                    axis=-1,
+                                )
+                                seed_link6 = eef_pose_to_link6(seed_pose, eef_offset)
+                                history.seed_dummy_history(seed_frame, seed_link6)
+                                message = (
+                                    f"[grasp-only] re-seeded dummy history; "
+                                    f"force_cup={force_cup}. Press C to start."
+                                )
+                            else:
+                                message = (
+                                    "At init_pose; press F to auto-capture"
+                                    if auto_capture
+                                    else "At init_pose; press F for the new initial frame"
+                                )
                             print(message)
 
                     capture_message = history.capture_tick(frame)
@@ -1973,6 +2065,7 @@ def main(
                     # Only auto-start on the ready transition, not while already ready after S.
                     if (
                         auto_capture
+                        and not grasp_only
                         and history.ready
                         and not was_ready
                         and not quit_requested
@@ -1992,7 +2085,9 @@ def main(
                             compensate_latency=False,
                         )
 
-                    if auto_capture:
+                    if grasp_only:
+                        help_text = f"C: grasp({force_cup})  P: reset  Q: quit"
+                    elif auto_capture:
                         help_text = "F: auto-capture→policy  P: reset  Q: quit"
                     else:
                         help_text = "F: capture  C: policy  P: reset  Q: quit"
@@ -2064,6 +2159,7 @@ def main(
                     rtc_delay_buffer_size=rtc_delay_buffer_size,
                     rtc_initial_delay_steps=rtc_initial_delay_steps,
                     rtc_max_guidance_weight=rtc_max_guidance_weight,
+                    force_cup=force_cup,
                 )
 
     cv2.destroyAllWindows()
