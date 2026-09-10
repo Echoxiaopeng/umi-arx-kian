@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Deploy the real-wrist Pi0 semantic-memory policy on one ARX5 arm.
-# 推理
+'''Deploy the real-wrist Pi0 semantic-memory policy on one ARX5 arm.
+# 推理 (M6 cached + RTC soft inpainting)
 .venv/bin/python scripts/mem/serve_shellgame_real_m6_cached.py \
 --checkpoint /home/lenovo/kian/openpi-umi-icrl/checkpoints/cup_grasp_0907_prompt_only_h16_from14999_v1/12000   \
 --condition-mode prompt_only   \
 --action-horizon 16   \
---port 8017 
+--port 8017
 
-# 中间层
+# 中间层 (RTC)
 deactivate
 conda activate umi-arx
 
@@ -19,17 +19,36 @@ python scripts/eval_arx5_pi_hzl_v2.py \
   --init-pose-frame direct \
   --direct-zmq-origin 0.094905,-0.002323,0.158023 \
   --eef-offset 0.145 \
-  --steps-per-inference 16 \
+  --rtc \
+  --rtc-s-min 8 \
+  --steps-per-inference 8 \
   --max-duration 600 \
   --action-lead-time 0.0 \
   --frequency 20 \
   --server-warmup-timeout 600 \
-  --cached-infer 2>&1 | tee shellgame_grasp_h16_trace.log
+  --cached-infer 2>&1 | tee shellgame_grasp_h16_rtc_trace.log
 
+
+
+python scripts/eval_arx5_pi_hzl_v2.py \
+  --policy-ip 127.0.0.1 \
+  --policy-port 8017 \
+  --robot-ip 127.0.0.1 \
+  --robot-port 8765 \
+  --init-pose-frame direct \
+  --direct-zmq-origin 0.094905,-0.002323,0.158023 \
+  --eef-offset 0.145 \
+  --steps-per-inference 8 \
+  --max-duration 600 \
+  --action-lead-time 0.0 \
+  --frequency 20 \
+  --auto-capture \
+  --server-warmup-timeout 600 \
+  --cached-infer 2>&1 | tee shellgame_grasp_h16_rtc_trace.log
 
 Controls
 --------
-F (auto, default): start continuous capture; when 241 frames are ready, policy starts automatically
+F (auto, default): one F saves the initial frame and continuously records all 3×80 swaps; policy auto-starts at 241
 F (manual, --manual-capture): capture initial frame, then each F starts one swap; press C to run policy
 C: (manual mode) start policy after the strict 241-frame history is ready
 S: stop policy and return to human control
@@ -39,7 +58,10 @@ Q: quit
 Startup defaults to the Direct-collected init pose and converts it to ZMQ before moving.
 After init move, a throw-away 242-frame request warms the policy server (JAX compile)
 before F/history collection; use --skip-server-warmup to disable.
-"""
+
+RTC (Black et al. 2025) overlaps inference with execution and soft-inpaints the next
+chunk against the unexecuted leftover, so chunk boundaries stay continuous under delay.
+'''
 
 from __future__ import annotations
 
@@ -77,6 +99,8 @@ from utils.shellgame_openpi import relative_chunk_to_world  # noqa: E402
 from utils.shellgame_openpi import relative_pose10  # noqa: E402
 from utils.shellgame_openpi import run_contract_self_test  # noqa: E402
 from utils.shellgame_openpi import select_safe_waypoint_count  # noqa: E402
+from utils.shellgame_rtc import RTCInferenceWorker  # noqa: E402
+from utils.shellgame_rtc import build_rtc_chunk  # noqa: E402
 
 DEFAULT_EEF_OFFSET = 0.145
 DEFAULT_ZMQ_GRIPPER_MIN = 0.0
@@ -757,6 +781,11 @@ def run_policy(
     vis_scale: float = DEFAULT_VIS_SCALE,
     panel_height: int = DEFAULT_PANEL_HEIGHT,
     cup_overlay_positions: list[tuple[int, int]] | None = None,
+    rtc: bool = False,
+    rtc_s_min: int = 8,
+    rtc_delay_buffer_size: int = 8,
+    rtc_initial_delay_steps: int = 4,
+    rtc_max_guidance_weight: float = 5.0,
 ) -> tuple[bool, bool, dict | None]:
     """Run one policy episode. Returns (quit_requested, warmup_done, last_memory)."""
     from peripherals.keystroke_counter import KeyCode
@@ -798,7 +827,37 @@ def run_policy(
         value = float(values[-1])
         return value if np.isfinite(value) else None
 
-    def infer_once(*, label: str = "infer") -> tuple[np.ndarray, np.ndarray, np.ndarray, dict, float, float, float]:
+    def _gripper_to_policy(gripper_width_zmq: float) -> float:
+        if gripper_scale:
+            return float(
+                zmq_gripper_to_direct(
+                    gripper_width_zmq,
+                    gripper_min=gripper_min,
+                    gripper_max=gripper_max,
+                    direct_full_open=direct_gripper_full_open,
+                )
+            )
+        return float(gripper_width_zmq)
+
+    def _world_eef_from_link6(world_link6: np.ndarray) -> np.ndarray:
+        world_actions = link6_actions_to_eef(world_link6, eef_offset)
+        if gripper_scale:
+            world_actions[:, 6] = direct_gripper_to_zmq(
+                world_actions[:, 6],
+                gripper_min=gripper_min,
+                gripper_max=gripper_max,
+                direct_full_open=direct_gripper_full_open,
+            )
+        world_actions[:, 6] = np.clip(world_actions[:, 6], gripper_min, gripper_max)
+        return world_actions
+
+    def infer_once(
+        *,
+        label: str = "infer",
+        rtc_prev_chunk: np.ndarray | None = None,
+        rtc_inference_delay: int = 0,
+        rtc_execution_horizon: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict, float, float, float]:
         nonlocal last_infer_frame, last_memory
         obs = env.get_obs()
         obs_received_wall = time.time()
@@ -832,17 +891,7 @@ def run_policy(
         )
         anchor_link6 = eef_pose_to_link6(anchor_eef, eef_offset)
         gripper_width_zmq = float(np.asarray(obs["robot0_gripper_width"][-1]).reshape(-1)[0])
-        if gripper_scale:
-            gripper_width = float(
-                zmq_gripper_to_direct(
-                    gripper_width_zmq,
-                    gripper_min=gripper_min,
-                    gripper_max=gripper_max,
-                    direct_full_open=direct_gripper_full_open,
-                )
-            )
-        else:
-            gripper_width = gripper_width_zmq
+        gripper_width = _gripper_to_policy(gripper_width_zmq)
         if policy_client.cached_infer_enabled:
             print(f"[policy] {label}: sending 1 current frame (cached history on server)")
         else:
@@ -858,6 +907,10 @@ def run_policy(
             current_pose6=anchor_link6,
             gripper_width=gripper_width,
             prompt=prompt,
+            rtc_prev_chunk=rtc_prev_chunk,
+            rtc_inference_delay=rtc_inference_delay,
+            rtc_execution_horizon=rtc_execution_horizon,
+            rtc_max_guidance_weight=rtc_max_guidance_weight,
         )
         latency = time.monotonic() - started
         obs_age_after_ms = (
@@ -941,6 +994,179 @@ def run_policy(
             gripper_scale=gripper_scale,
         )
         return False, warmup_done, last_memory
+
+    if rtc:
+        if not policy_client.rtc_enabled:
+            print("[RTC] WARNING: server metadata lacks supports_rtc; continuing anyway")
+        print(
+            f"[RTC] enabled: s_min={rtc_s_min}, delay_buf={rtc_delay_buffer_size}, "
+            f"d_init={rtc_initial_delay_steps}, max_gw={rtc_max_guidance_weight}"
+        )
+        episode_started = False
+        quit_requested = False
+        episode_start_time = time.monotonic()
+        worker: RTCInferenceWorker | None = None
+
+        def _get_obs_bundle() -> dict:
+            obs = env.get_obs()
+            frame = np.asarray(obs[camera_key][-1])
+            anchor_eef = np.concatenate(
+                [obs["robot0_eef_pos"][-1], obs["robot0_eef_rot_axis_angle"][-1]],
+                axis=-1,
+            ).astype(np.float64)
+            anchor_link6 = eef_pose_to_link6(anchor_eef, eef_offset)
+            gripper_width_zmq = float(np.asarray(obs["robot0_gripper_width"][-1]).reshape(-1)[0])
+            return {
+                "obs": obs,
+                "frame": frame,
+                "anchor_eef": anchor_eef,
+                "anchor_link6": anchor_link6,
+                "gripper_width": _gripper_to_policy(gripper_width_zmq),
+                "gripper_width_zmq": gripper_width_zmq,
+            }
+
+        def _rtc_infer_fn(*, obs_bundle, rtc_prev_chunk, rtc_inference_delay, rtc_execution_horizon):
+            started = time.monotonic()
+            result = policy_client.infer_step(
+                history,
+                current_frame=obs_bundle["frame"],
+                current_pose6=obs_bundle["anchor_link6"],
+                gripper_width=obs_bundle["gripper_width"],
+                prompt=prompt,
+                rtc_prev_chunk=rtc_prev_chunk,
+                rtc_inference_delay=rtc_inference_delay,
+                rtc_execution_horizon=rtc_execution_horizon,
+                rtc_max_guidance_weight=rtc_max_guidance_weight,
+            )
+            latency = time.monotonic() - started
+            actions = np.asarray(result["actions"], dtype=np.float64)
+            if "memory" in result:
+                nonlocal last_memory
+                last_memory = result["memory"]
+            return actions, obs_bundle["anchor_link6"], latency
+
+        try:
+            actions, anchor_link6, anchor_eef, obs, latency, gripper_width, gripper_width_zmq = (
+                infer_once(label="rtc-init")
+            )
+            if latency > max_inference_latency:
+                raise RuntimeError(
+                    f"Inference latency {latency:.3f}s exceeds limit {max_inference_latency:.3f}s"
+                )
+            current = build_rtc_chunk(actions, anchor_link6)
+            cursor = 0
+            worker = RTCInferenceWorker(
+                _rtc_infer_fn,
+                frequency=frequency,
+                s_min=rtc_s_min,
+                delay_buffer_size=rtc_delay_buffer_size,
+                initial_delay_steps=max(rtc_initial_delay_steps, int(np.ceil(latency * frequency))),
+            )
+            print(f"[RTC] initial chunk H={len(current.relative_actions)}, latency={latency:.3f}s")
+
+            while True:
+                for key in key_counter.get_press_events():
+                    if key == KeyCode(char="s"):
+                        print("S pressed: stopping policy")
+                        return False, warmup_done, last_memory
+                    if key == KeyCode(char="q"):
+                        quit_requested = True
+                        return True, warmup_done, last_memory
+
+                polled = worker.poll()
+                if polled is not None:
+                    current, observed_delay, s_used = polled
+                    cursor = 0
+                    print(
+                        f"[RTC] swapped chunk: delay={observed_delay}, s={s_used}, "
+                        f"remaining={len(current.relative_actions)}, "
+                        f"latency={worker.last_latency_s:.3f}s"
+                    )
+
+                if cursor >= len(current.world_link6):
+                    print("[RTC] exhausted chunk; forcing replan")
+                    worker.maybe_start(
+                        executed_since_chunk=max(cursor, worker.s_min),
+                        current_chunk=current,
+                        get_obs_bundle=_get_obs_bundle,
+                    )
+                    time.sleep(0.01)
+                    continue
+
+                live = env.get_obs()
+                live_eef = np.concatenate(
+                    [live["robot0_eef_pos"][-1], live["robot0_eef_rot_axis_angle"][-1]],
+                    axis=-1,
+                ).astype(np.float64)
+                world_eef = _world_eef_from_link6(current.world_link6[cursor : cursor + 1])
+                safe_count, safety_reason = select_safe_waypoint_count(
+                    world_eef,
+                    anchor_pose6=live_eef,
+                    dt=1.0 / frequency,
+                    max_pos_speed=max_pos_speed,
+                    max_rot_speed=max_rot_speed,
+                    workspace_min=workspace_min,
+                    workspace_max=workspace_max,
+                    max_waypoints=1,
+                )
+                if safe_count == 0:
+                    print(f"[SAFETY][RTC] rejected waypoint: {safety_reason}")
+                    time.sleep(1.0 / frequency)
+                    continue
+
+                first_timestamp = time.time() + action_lead_time
+                if not episode_started:
+                    env.start_episode(time.time())
+                    episode_started = True
+                env.exec_actions(
+                    actions=world_eef[:1],
+                    timestamps=np.asarray([first_timestamp], dtype=np.float64),
+                    compensate_latency=False,
+                    dynamic_latency=False,
+                )
+                cursor += 1
+                worker.maybe_start(
+                    executed_since_chunk=cursor,
+                    current_chunk=current,
+                    get_obs_bundle=_get_obs_bundle,
+                )
+
+                show_policy_view(
+                    live[camera_key][-1],
+                    status="RTC CONTROL",
+                    help_text="S: stop  Q: quit",
+                    detail_lines=[
+                        f"cursor {cursor}/{len(current.relative_actions)}, "
+                        f"delay~{worker.delay_estimate}, "
+                        f"last_infer {worker.last_latency_s:.3f}s",
+                    ],
+                )
+
+                deadline = first_timestamp + 0.5 / frequency
+                while time.time() < deadline:
+                    for key in key_counter.get_press_events():
+                        if key == KeyCode(char="s"):
+                            print("S pressed: stopping policy")
+                            return False, warmup_done, last_memory
+                        if key == KeyCode(char="q"):
+                            quit_requested = True
+                            return True, warmup_done, last_memory
+                    time.sleep(0.005)
+
+                if time.monotonic() - episode_start_time >= max_duration:
+                    print("Maximum policy duration reached")
+                    break
+        finally:
+            # Wait for in-flight RTC infer so reset_session does not race ws.recv().
+            if worker is not None:
+                worker.close(wait=True, timeout_s=max(5.0, max_inference_latency + 1.0))
+            policy_client.reset_session()
+            hold_current_pose(env)
+            time.sleep(0.15)
+            if episode_started:
+                env.end_episode()
+            print("Policy stopped; human control restored. Restore the cups, then press P.")
+        return quit_requested, warmup_done, last_memory
 
     episode_started = False
     quit_requested = False
@@ -1145,6 +1371,23 @@ def run_policy(
 @click.option("--action-lead-time", default=0.10, show_default=True, type=float)
 @click.option("--max-duration", default=30.0, show_default=True, type=float)
 @click.option("--max-inference-latency", default=3.0, show_default=True, type=float)
+@click.option(
+    "--rtc/--no-rtc",
+    default=False,
+    show_default=True,
+    help="Enable Real-Time Chunking (async infer + soft prefix inpainting).",
+)
+@click.option("--rtc-s-min", default=8, show_default=True, type=click.IntRange(1, 32))
+@click.option("--rtc-delay-buffer-size", default=8, show_default=True, type=click.IntRange(1, 64))
+@click.option("--rtc-initial-delay-steps", default=4, show_default=True, type=click.IntRange(1, 32))
+@click.option("--rtc-max-guidance-weight", default=5.0, show_default=True, type=float)
+@click.option(
+    "--image-key-style",
+    type=click.Choice(["m6", "legacy"], case_sensitive=False),
+    default="m6",
+    show_default=True,
+    help="Cached image key naming: m6=left_wrist_0_rgb_0_*, legacy=left_wrist_0_rgb_*.",
+)
 @click.option("--prompt", default=DEFAULT_PROMPT, show_default=True)
 @click.option(
     "--init-pose",
@@ -1304,6 +1547,12 @@ def main(
     action_lead_time: float,
     max_duration: float,
     max_inference_latency: float,
+    rtc: bool,  # noqa: FBT001
+    rtc_s_min: int,
+    rtc_delay_buffer_size: int,
+    rtc_initial_delay_steps: int,
+    rtc_max_guidance_weight: float,
+    image_key_style: str,
     prompt: str,
     init_pose: str | None,
     init_pose_frame: str,
@@ -1435,12 +1684,21 @@ def main(
         close_timeout=server_warmup_timeout,
     )
     print("Policy server connected")
-    policy_client = ShellGamePolicyClient(client, cached_infer=cached_infer)
+    policy_client = ShellGamePolicyClient(
+        client,
+        cached_infer=cached_infer,
+        image_key_style=image_key_style,
+    )
     if cached_infer:
         if policy_client.cached_infer_enabled:
             print("[cache] server supports cached ShellGame inference")
         else:
             print("[cache] server lacks cached infer support; falling back to full 242-frame infer")
+    if rtc:
+        print(
+            f"[RTC] client flag on (server_supports_rtc={policy_client.rtc_enabled}, "
+            f"image_key_style={image_key_style})"
+        )
     print(
         "[ALIGN] Direct/ZMQ world-origin difference cancels in relative SE(3); "
         f"link6<->eef offset={eef_offset:.3f}m along TCP Z"
@@ -1623,6 +1881,7 @@ def main(
                     vis_scale=vis_scale,
                     panel_height=panel_height,
                     cup_overlay_positions=cup_overlay_positions,
+                    rtc=False,
                 )
                 print("[observe-only] done.")
                 cv2.destroyAllWindows()
@@ -1800,6 +2059,11 @@ def main(
                     vis_scale=vis_scale,
                     panel_height=panel_height,
                     cup_overlay_positions=cup_overlay_positions,
+                    rtc=rtc,
+                    rtc_s_min=rtc_s_min,
+                    rtc_delay_buffer_size=rtc_delay_buffer_size,
+                    rtc_initial_delay_steps=rtc_initial_delay_steps,
+                    rtc_max_guidance_weight=rtc_max_guidance_weight,
                 )
 
     cv2.destroyAllWindows()

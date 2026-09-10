@@ -567,11 +567,18 @@ class Arx5Env:
             # We don't need to worry new data come in here.
             end_time = float("inf")
             for key, value in self.obs_accumulator.timestamps.items():
-                end_time = min(end_time, value[-1])
-            end_time = min(end_time, self.action_accumulator.timestamps[-1])
+                if len(value) > 0:
+                    end_time = min(end_time, value[-1])
+            action_timestamps = self.action_accumulator.timestamps
+            if len(action_timestamps) == 0:
+                # Episode started but no actions were accepted (e.g. all timestamps
+                # were already stale). Still clear accumulators cleanly.
+                self.obs_accumulator = None
+                self.action_accumulator = None
+                return
+            end_time = min(end_time, action_timestamps[-1])
 
             actions = self.action_accumulator.actions
-            action_timestamps = self.action_accumulator.timestamps
             n_steps = 0
             if np.sum(self.action_accumulator.timestamps <= end_time) > 0:
                 n_steps = (

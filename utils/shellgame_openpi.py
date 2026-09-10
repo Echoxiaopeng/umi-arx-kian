@@ -19,6 +19,12 @@ NUM_SWAPS = 3
 TOTAL_MODEL_FRAMES = 242
 ACTION_HORIZON = 16
 ACTION_DIM = 10
+# M6 / Stage2 deployment keys (serve_shellgame_real_m6_cached.py).
+M6_VIDEO_FRAME_KEY_PREFIX = "left_wrist_0_rgb_0_"
+M6_VIDEO_CURRENT_STEP_KEY = "left_wrist_0_rgb_0"
+# Legacy semantic-action cached keys.
+LEGACY_VIDEO_FRAME_KEY_PREFIX = "left_wrist_0_rgb_"
+LEGACY_VIDEO_CURRENT_STEP_KEY = "left_wrist_0_rgb"
 
 
 def shift_pose_along_tcp_z(pose6: np.ndarray, distance: float) -> np.ndarray:
@@ -125,6 +131,27 @@ def relative_action_to_world(action10: np.ndarray, anchor_pose6: np.ndarray) -> 
     return np.concatenate([world_pose6, [float(action10[9])]], dtype=np.float64)
 
 
+def world_action_to_relative(world7: np.ndarray, anchor_pose6: np.ndarray) -> np.ndarray:
+    """Encode one world xyz+rotvec+gripper waypoint as current-relative EEF10."""
+    world7 = np.asarray(world7, dtype=np.float64).reshape(7)
+    anchor = pose_to_mat(np.asarray(anchor_pose6, dtype=np.float64).reshape(6))
+    world_mat = pose_to_mat(world7[:6])
+    relative = np.linalg.inv(anchor) @ world_mat
+    pose9 = np.asarray(mat_to_pose10d(relative), dtype=np.float32)
+    return np.concatenate([pose9, np.asarray([world7[6]], dtype=np.float32)], axis=-1)
+
+
+def world_chunk_to_relative(world_actions: np.ndarray, anchor_pose6: np.ndarray) -> np.ndarray:
+    """Encode a world xyz+rotvec+gripper chunk as current-relative EEF10."""
+    world = np.asarray(world_actions, dtype=np.float64)
+    if world.ndim != 2 or world.shape[1] != 7:
+        raise ValueError(f"Expected world actions (N, 7), got {world.shape}")
+    out = np.empty((len(world), ACTION_DIM), dtype=np.float32)
+    for index in range(len(world)):
+        out[index] = world_action_to_relative(world[index], anchor_pose6)
+    return out
+
+
 def relative_actions_sequence_to_world(
     actions: np.ndarray,
     anchors: np.ndarray,
@@ -146,8 +173,10 @@ def relative_actions_sequence_to_world(
 def relative_chunk_to_world(action_chunk: np.ndarray, anchor_pose6: np.ndarray) -> np.ndarray:
     """Restore current-relative EEF10 targets to world xyz+rotvec+gripper."""
     actions = np.asarray(action_chunk, dtype=np.float64)
-    if actions.shape != (ACTION_HORIZON, ACTION_DIM):
-        raise ValueError(f"Expected action chunk {(ACTION_HORIZON, ACTION_DIM)}, got {actions.shape}")
+    if actions.ndim != 2 or actions.shape[1] != ACTION_DIM:
+        raise ValueError(f"Expected action chunk (N, {ACTION_DIM}), got {actions.shape}")
+    if actions.shape[0] < 1:
+        raise ValueError(f"Expected a non-empty action chunk, got {actions.shape}")
     if not np.all(np.isfinite(actions)):
         raise ValueError("Policy returned NaN or infinite actions")
 
@@ -256,6 +285,9 @@ class ShellGameHistory:
     episode_start_pose6: np.ndarray | None = None
     swap_segments: list[list[np.ndarray]] = field(default_factory=list)
     active_segment: list[np.ndarray] | None = None
+    # auto: one F saves the initial frame and continuously records all swaps.
+    # manual: F for initial, then each F starts the next swap.
+    auto_capture: bool = False
 
     @property
     def ready(self) -> bool:
@@ -303,8 +335,16 @@ class ShellGameHistory:
         if self.initial_frame is None:
             self.initial_frame = image_to_uint8(frame).copy()
             self.episode_start_pose6 = np.asarray(current_pose6, dtype=np.float64).reshape(6).copy()
+            if self.auto_capture:
+                self.active_segment = []
+                return (
+                    f"已保存初始帧并开始连续采集 "
+                    f"(1+{NUM_SWAPS * SWAP_FRAMES}); 采满后自动开始"
+                )
             return "已保存初始帧; 下一次 F 开始采集第一次交换"
         if self.ready:
+            if self.auto_capture:
+                return "241 帧历史已完成; 即将自动开始, 或按 P 开始下一轮"
             return "241 帧历史已完成; 按 C 开始抓取, 或按 P 开始下一轮"
         self.active_segment = []
         return f"开始采集第 {len(self.swap_segments) + 1} 次交换: 0/{SWAP_FRAMES}"
@@ -317,9 +357,19 @@ class ShellGameHistory:
         if count < SWAP_FRAMES:
             return f"采集第 {len(self.swap_segments) + 1} 次交换: {count}/{SWAP_FRAMES}"
         self.swap_segments.append(self.active_segment)
-        self.active_segment = None
         if self.ready:
+            self.active_segment = None
+            if self.auto_capture:
+                return "三次交换采集完成: 241/241, 即将自动开始"
             return "三次交换采集完成: 241/241, 按 C 开始抓取"
+        if self.auto_capture:
+            finished = len(self.swap_segments)
+            self.active_segment = []
+            return (
+                f"第 {finished} 次交换完成; 继续采集第 {finished + 1} 次: "
+                f"0/{SWAP_FRAMES}"
+            )
+        self.active_segment = None
         return f"第 {len(self.swap_segments)} 次交换完成; 按 F 采集下一次交换"
 
     def frames(self) -> list[np.ndarray]:
@@ -336,9 +386,11 @@ class ShellGameHistory:
         if self.collecting:
             return f"SWAP {len(self.swap_segments) + 1}/{NUM_SWAPS} {len(self.active_segment or [])}/{SWAP_FRAMES}"
         if self.ready:
+            if self.auto_capture:
+                return "READY 241/241 - auto-start policy, P: reset"
             return "READY 241/241 - C: policy, P: reset"
         if self.initial_frame is None:
-            return "F: capture initial frame"
+            return "F: auto-capture all swaps" if self.auto_capture else "F: capture initial frame"
         return f"WAITING F - next swap {len(self.swap_segments) + 1}/{NUM_SWAPS}"
 
     def build_policy_observation(
@@ -366,17 +418,28 @@ class ShellGameHistory:
             observation[f"left_wrist_0_rgb_{index}"] = frame
         return observation
 
-    def build_history_upload_observation(self, *, prompt: str) -> dict[str, np.ndarray | str]:
+    def build_history_upload_observation(
+        self,
+        *,
+        prompt: str,
+        image_key_style: str = "m6",
+    ) -> dict[str, np.ndarray | str]:
         """Build a one-time 241-frame history upload for cached server inference."""
         if not self.ready:
             raise RuntimeError(f"History is incomplete: {self.frame_count}/{HISTORY_FRAMES}")
+        if image_key_style == "m6":
+            prefix = M6_VIDEO_FRAME_KEY_PREFIX
+        elif image_key_style == "legacy":
+            prefix = LEGACY_VIDEO_FRAME_KEY_PREFIX
+        else:
+            raise ValueError(f"Unknown image_key_style={image_key_style!r}")
         observation: dict[str, np.ndarray | str] = {
             "mode": "reset_history",
             "prompt": prompt,
         }
         for index, frame in enumerate(self.frames()):
-            observation[f"left_wrist_0_rgb_{index}"] = frame
-        if len([key for key in observation if key.startswith("left_wrist_0_rgb_")]) != HISTORY_FRAMES:
+            observation[f"{prefix}{index}"] = frame
+        if len([key for key in observation if key.startswith(prefix)]) != HISTORY_FRAMES:
             raise RuntimeError(f"Expected {HISTORY_FRAMES} history frames for upload")
         return observation
 
@@ -387,15 +450,22 @@ class ShellGameHistory:
         current_pose6: np.ndarray,
         gripper_width: float,
         prompt: str,
+        image_key_style: str = "m6",
     ) -> dict[str, np.ndarray | str]:
         """Build a single-frame step observation for cached server inference."""
         if self.episode_start_pose6 is None:
             raise RuntimeError("Episode start pose is missing")
+        if image_key_style == "m6":
+            current_key = M6_VIDEO_CURRENT_STEP_KEY
+        elif image_key_style == "legacy":
+            current_key = LEGACY_VIDEO_CURRENT_STEP_KEY
+        else:
+            raise ValueError(f"Unknown image_key_style={image_key_style!r}")
         state_pose9 = relative_pose10(self.episode_start_pose6, current_pose6)
         return {
             "mode": "infer_step",
             "prompt": prompt,
-            "left_wrist_0_rgb": image_to_uint8(current_frame),
+            current_key: image_to_uint8(current_frame),
             "robot0_eef_pos": state_pose9[:3],
             "robot0_eef_rot_axis_angle": state_pose9[3:9],
             "robot0_gripper_width": np.asarray([gripper_width], dtype=np.float32),
@@ -405,27 +475,48 @@ class ShellGameHistory:
 class ShellGamePolicyClient:
     """WebSocket client wrapper for cached ShellGame history upload + step infer."""
 
-    def __init__(self, client, *, cached_infer: bool = True) -> None:
+    def __init__(
+        self,
+        client,
+        *,
+        cached_infer: bool = True,
+        image_key_style: str = "m6",
+    ) -> None:
         self._client = client
         self._cached_infer = cached_infer
-        self._server_supports_cache = bool(
-            client.get_server_metadata().get("supports_cached_infer", False)
-        )
+        self._image_key_style = image_key_style
+        metadata = client.get_server_metadata()
+        self._server_supports_cache = bool(metadata.get("supports_cached_infer", False))
+        self._server_supports_rtc = bool(metadata.get("supports_rtc", False))
         self._history_uploaded = False
 
     @property
     def cached_infer_enabled(self) -> bool:
         return self._cached_infer and self._server_supports_cache
 
+    @property
+    def rtc_enabled(self) -> bool:
+        return self._server_supports_rtc
+
     def reset_session(self) -> None:
-        if self.cached_infer_enabled:
-            self._client.infer({"mode": "reset"})
-        self._history_uploaded = False
+        try:
+            if self.cached_infer_enabled:
+                self._client.infer({"mode": "reset"})
+        except Exception as exc:
+            # RTC stop can race a background recv; keep local cache state consistent.
+            print(f"[cache] reset_session failed (ignored): {exc}")
+        finally:
+            self._history_uploaded = False
 
     def upload_history(self, history: ShellGameHistory, *, prompt: str) -> dict:
         if not self.cached_infer_enabled:
             raise RuntimeError("Cached infer is disabled or unsupported by the server")
-        result = self._client.infer(history.build_history_upload_observation(prompt=prompt))
+        result = self._client.infer(
+            history.build_history_upload_observation(
+                prompt=prompt,
+                image_key_style=self._image_key_style,
+            )
+        )
         self._history_uploaded = bool(result.get("cache_ready", False))
         if not self._history_uploaded:
             raise RuntimeError(f"Server failed to cache history: {result!r}")
@@ -439,18 +530,29 @@ class ShellGamePolicyClient:
         current_pose6: np.ndarray,
         gripper_width: float,
         prompt: str,
+        rtc_prev_chunk: np.ndarray | None = None,
+        rtc_inference_delay: int = 0,
+        rtc_execution_horizon: int = 0,
+        rtc_prefix_attention_schedule: str = "exp",
+        rtc_max_guidance_weight: float = 5.0,
     ) -> dict:
         if self.cached_infer_enabled:
             if not self._history_uploaded:
                 raise RuntimeError("History cache missing; call upload_history first")
-            return self._client.infer(
-                history.build_step_observation(
-                    current_frame=current_frame,
-                    current_pose6=current_pose6,
-                    gripper_width=gripper_width,
-                    prompt=prompt,
-                )
+            obs = history.build_step_observation(
+                current_frame=current_frame,
+                current_pose6=current_pose6,
+                gripper_width=gripper_width,
+                prompt=prompt,
+                image_key_style=self._image_key_style,
             )
+            if rtc_prev_chunk is not None:
+                obs["rtc_prev_chunk"] = np.asarray(rtc_prev_chunk, dtype=np.float32)
+                obs["rtc_inference_delay"] = int(rtc_inference_delay)
+                obs["rtc_execution_horizon"] = int(rtc_execution_horizon)
+                obs["rtc_prefix_attention_schedule"] = str(rtc_prefix_attention_schedule)
+                obs["rtc_max_guidance_weight"] = float(rtc_max_guidance_weight)
+            return self._client.infer(obs)
         return self.infer_full(
             history,
             current_frame=current_frame,
@@ -489,6 +591,16 @@ def run_contract_self_test() -> None:
             history.capture_tick(image)
     assert history.ready
     assert history.frame_count == HISTORY_FRAMES
+
+    auto_history = ShellGameHistory(auto_capture=True)
+    msg = auto_history.press_f(image, start)
+    assert "连续采集" in msg
+    assert auto_history.collecting
+    for _ in range(NUM_SWAPS * SWAP_FRAMES):
+        auto_history.capture_tick(image)
+    assert auto_history.ready
+    assert auto_history.frame_count == HISTORY_FRAMES
+    assert not auto_history.collecting
 
     current = start.copy()
     current[0] += 0.02
