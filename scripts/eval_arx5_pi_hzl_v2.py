@@ -61,8 +61,9 @@ S: stop policy and return to human control
 P: in human mode, return to init_pose and reset history for the next round
 Q: quit
 --grasp-only --grasp-cup {left,middle,right}: skip F/swap capture; seed dummy 241 frames;
-  server skips MEM and freezes the direction prompt to the chosen cup (restart
-  serve_shellgame_real_m6_cached.py so force_cup support is loaded).
+  F cycles left→middle→right (shown on screen); C starts grasp with the selected cup.
+  Server skips MEM and freezes that cup prompt (restart serve_shellgame_real_m6_cached.py
+  so force_cup support is loaded).
 
 Startup defaults to the Direct-collected init pose and converts it to ZMQ before moving.
 After init move, a throw-away 242-frame request warms the policy server (JAX compile)
@@ -1777,7 +1778,7 @@ def main(
     if grasp_only:
         print(
             f"[grasp-only] skip shell-game capture; dummy 241 history + force_cup={force_cup}. "
-            "Press C to start grasp, P to reset, Q to quit."
+            "F: cycle cup (L/M/R)  C: start grasp  P: reset  Q: quit"
         )
     elif auto_capture:
         print(
@@ -1958,7 +1959,7 @@ def main(
                 history.seed_dummy_history(frame, current_link6_pose)
                 print(
                     f"[grasp-only] seeded dummy {HISTORY_FRAMES}-frame history; "
-                    f"force_cup={force_cup}. Press C to start grasp."
+                    f"cup={force_cup}. F cycles cup, C starts grasp."
                 )
             elif observe_only:
                 print(f"At current pose. {f_hint}")
@@ -1995,10 +1996,14 @@ def main(
                             break
                         if key == KeyCode(char="f"):
                             if grasp_only:
-                                print(
-                                    "[grasp-only] F ignored; history already seeded. "
-                                    "Press C to start, or P to re-seed."
+                                assert force_cup is not None
+                                cup_idx = CUP_NAMES.index(force_cup)
+                                force_cup = CUP_NAMES[(cup_idx + 1) % len(CUP_NAMES)]
+                                message = (
+                                    f"[grasp-only] cup → {CUP_DISPLAY_NAMES[CUP_NAMES.index(force_cup)]} "
+                                    f"({force_cup})"
                                 )
+                                print(message)
                                 continue
                             message = history.press_f(frame, current_link6_pose)
                             print_init_link6_alignment(
@@ -2049,7 +2054,7 @@ def main(
                                 history.seed_dummy_history(seed_frame, seed_link6)
                                 message = (
                                     f"[grasp-only] re-seeded dummy history; "
-                                    f"force_cup={force_cup}. Press C to start."
+                                    f"cup={force_cup}. F cycles cup, C starts grasp."
                                 )
                             else:
                                 message = (
@@ -2086,7 +2091,7 @@ def main(
                         )
 
                     if grasp_only:
-                        help_text = f"C: grasp({force_cup})  P: reset  Q: quit"
+                        help_text = f"F: cycle cup  C: grasp  P: reset  Q: quit"
                     elif auto_capture:
                         help_text = "F: auto-capture→policy  P: reset  Q: quit"
                     else:
@@ -2104,18 +2109,31 @@ def main(
                         else:
                             remaining = f"remaining {swap_left / frequency:.1f}s"
                     status_label = history.status()
-                    if history.ready:
+                    if grasp_only:
+                        assert force_cup is not None
+                        cup_idx = CUP_NAMES.index(force_cup)
+                        status_label = (
+                            f"GRASP-ONLY  cup={CUP_DISPLAY_NAMES[cup_idx]} ({force_cup})"
+                        )
+                    elif history.ready:
                         status_label = "READY 241/241"
                     elif history.collecting:
                         status_label = (
                             f"REC {len(history.swap_segments) + 1}/{NUM_SWAPS} "
                             f"{len(history.active_segment or [])}/{SWAP_FRAMES}"
                         )
+                    detail_lines = [line for line in (remaining, message) if line]
+                    if grasp_only and force_cup is not None:
+                        detail_lines = [
+                            f"selected: {force_cup.upper()}  "
+                            f"[{' | '.join(n.upper() if n == force_cup else n for n in CUP_NAMES)}]",
+                            *detail_lines,
+                        ]
                     view = make_eval_vis(
                         frame,
                         status=status_label,
                         help_text=help_text,
-                        detail_lines=[line for line in (remaining, message) if line],
+                        detail_lines=detail_lines,
                         memory=last_memory,
                         cup_overlay_positions=cup_overlay_positions,
                         vis_scale=vis_scale,
