@@ -180,8 +180,8 @@ class Arx5Env:
             capture_fps.append(fps)
             cap_buffer_size.append(buf)
             video_recorder.append(
-                VideoRecorder.create_hevc_nvenc(
-                    fps=fps, input_pix_fmt="bgr24", bit_rate=bit_rate
+                VideoRecorder.create_h264(
+                    fps=fps, input_pix_fmt="bgr24"
                 )
             )
 

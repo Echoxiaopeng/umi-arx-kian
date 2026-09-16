@@ -60,6 +60,7 @@ C: start policy (manual capture, or --grasp-only after dummy history is seeded)
 S: stop policy and return to human control
 P: in human mode, return to init_pose and reset history for the next round
 Q: quit
+--record-video / --no-record-video: record wrist-camera MP4 from swap capture through grasp (default ON)
 --grasp-only --grasp-cup {left,middle,right}: skip F/swap capture; seed dummy 241 frames;
   F cycles left→middle→right (shown on screen); C starts grasp with the selected cup.
   Server skips MEM and freezes that cup prompt (restart serve_shellgame_real_m6_cached.py
@@ -805,6 +806,8 @@ def run_policy(
     rtc_initial_delay_steps: int = 4,
     rtc_max_guidance_weight: float = 5.0,
     force_cup: str | None = None,
+    record_video: bool = True,
+    recording_started: bool = False,
 ) -> tuple[bool, bool, dict | None]:
     """Run one policy episode. Returns (quit_requested, warmup_done, last_memory)."""
     from peripherals.keystroke_counter import KeyCode
@@ -1029,7 +1032,7 @@ def run_policy(
             f"[RTC] enabled: s_min={rtc_s_min}, delay_buf={rtc_delay_buffer_size}, "
             f"d_init={rtc_initial_delay_steps}, max_gw={rtc_max_guidance_weight}"
         )
-        episode_started = False
+        episode_started = bool(recording_started)
         quit_requested = False
         episode_start_time = time.monotonic()
         worker: RTCInferenceWorker | None = None
@@ -1142,7 +1145,7 @@ def run_policy(
                     continue
 
                 first_timestamp = time.time() + action_lead_time
-                if not episode_started:
+                if record_video and not episode_started:
                     env.start_episode(time.time())
                     episode_started = True
                 env.exec_actions(
@@ -1195,7 +1198,7 @@ def run_policy(
             print("Policy stopped; human control restored. Restore the cups, then press P.")
         return quit_requested, warmup_done, last_memory
 
-    episode_started = False
+    episode_started = bool(recording_started)
     quit_requested = False
     episode_start_time = time.monotonic()
     infer_step = 0
@@ -1334,7 +1337,7 @@ def run_policy(
                 "the next inference starts after the last submitted deadline"
             )
 
-            if not episode_started:
+            if record_video and not episode_started:
                 env.start_episode(time.time())
                 episode_started = True
             env.exec_actions(
@@ -1575,6 +1578,12 @@ def run_policy(
     type=str,
     help="Optional cup marker pixels at 224x224: 'x0,y0;x1,y1;x2,y2'.",
 )
+@click.option(
+    "--record-video/--no-record-video",
+    default=True,
+    show_default=True,
+    help="Record wrist-camera MP4 from swap capture through grasp via Arx5Env (output/videos/).",
+)
 @click.option("--self-test", is_flag=True, help="Validate transforms without opening cameras or robot hardware.")
 def main(
     output: str,
@@ -1624,6 +1633,7 @@ def main(
     vis_scale: float,
     panel_height: int,
     cup_overlay_xy: str | None,
+    record_video: bool,  # noqa: FBT001
     self_test: bool,  # noqa: FBT001
 ) -> None:
     if self_test:
@@ -1811,6 +1821,12 @@ def main(
         f"[vis] scale={vis_scale:.1f}x panel={panel_height}px "
         f"cup_markers={cup_overlay_positions}"
     )
+    if record_video:
+        print(
+            f"[record] wrist video ON (swap+grasp) → {output_path / 'videos'}"
+        )
+    else:
+        print("[record] wrist video OFF (--no-record-video)")
 
     with SharedMemoryManager() as shm_manager:  # noqa: SIM117
         with (
@@ -1938,6 +1954,7 @@ def main(
                     panel_height=panel_height,
                     cup_overlay_positions=cup_overlay_positions,
                     rtc=False,
+                    record_video=record_video,
                 )
                 print("[observe-only] done.")
                 cv2.destroyAllWindows()
@@ -1975,6 +1992,7 @@ def main(
             while not quit_requested:
                 target_pose, target_gripper = current_robot_pose_and_gripper(env)
                 start_policy = False
+                recording_started = False
                 iteration = 0
                 loop_start = time.monotonic()
                 was_ready = history.ready
@@ -2015,6 +2033,11 @@ def main(
                                 direct_origin3=direct_origin3,
                             )
                             print(message)
+                            # Start MP4 at the beginning of swap capture (not only grasp).
+                            if record_video and not recording_started and history.locked:
+                                env.start_episode(time.time())
+                                recording_started = True
+                                print("[record] started at swap capture")
                         elif key == KeyCode(char="c"):
                             if history.ready:
                                 start_policy = True
@@ -2024,6 +2047,10 @@ def main(
                         elif key == KeyCode(char="p"):
                             reset_target = "current pose" if observe_only else "init_pose"
                             print(f"P pressed: clearing history and returning to {reset_target}")
+                            if recording_started:
+                                env.end_episode()
+                                recording_started = False
+                                print("[record] stopped (reset before policy)")
                             policy_client.reset_session()
                             history.reset()
                             last_memory = None
@@ -2145,6 +2172,10 @@ def main(
                     iteration += 1
 
                 if quit_requested:
+                    if recording_started:
+                        env.end_episode()
+                        recording_started = False
+                        print("[record] stopped (quit during capture)")
                     break
                 quit_requested, warmup_done, last_memory = run_policy(
                     env=env,
@@ -2178,6 +2209,8 @@ def main(
                     rtc_initial_delay_steps=rtc_initial_delay_steps,
                     rtc_max_guidance_weight=rtc_max_guidance_weight,
                     force_cup=force_cup,
+                    record_video=record_video,
+                    recording_started=recording_started,
                 )
 
     cv2.destroyAllWindows()
