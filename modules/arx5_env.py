@@ -514,6 +514,15 @@ class Arx5Env:
         for robot in self.robots:
             robot.set_gravity_compensation()
 
+    def set_end_control(self):
+        for robot in self.robots:
+            robot.set_end_control()
+
+    def restore_gains_after_drag(self):
+        for robot in self.robots:
+            if hasattr(robot, "restore_gains_after_drag"):
+                robot.restore_gains_after_drag()
+
     def set_to_damping(self):
         for robot in self.robots:
             robot.set_to_damping()

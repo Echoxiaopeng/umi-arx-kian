@@ -564,16 +564,57 @@ def format_pose_cli(pose6: np.ndarray, grip: float | None = None) -> str:
     return f"--init_pose {pose_s} --init_gripper {float(grip):.6f}"
 
 
-def print_current_pose(env: Arx5EnvWithImages, *, tag: str = "pose") -> None:
-    """打印可复制的 init 位姿（命令坐标系 ActualTCPPose）。"""
-    for robot_idx, (pose, grip) in enumerate(tcp_pose_grip_from_robot_state(env)):
+def print_current_pose(
+    env: Arx5EnvWithImages,
+    *,
+    tag: str = "pose",
+    obs: dict | None = None,
+) -> None:
+    """
+    打印控制器 ActualTCPPose，以及 get_obs 里将写入 zarr 的 eef 位姿，便于对照。
+
+    ctrl = 即时 tcp_pose（复制 --init_pose 用这条）
+    save = obs 的 eef_pos / eef_rot_axis_angle / gripper（与 record_pose_action 同源）
+    """
+    ctrl_list = tcp_pose_grip_from_robot_state(env)
+    if obs is None:
+        try:
+            obs = env.get_obs()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{tag}] get_obs failed, only printing ctrl: {exc}")
+            obs = None
+
+    save_list = (
+        tcp_pose_grip_from_obs(obs, len(ctrl_list)) if obs is not None else None
+    )
+
+    for robot_idx, (pose, grip) in enumerate(ctrl_list):
         print(
-            f"[{tag}] robot{robot_idx} "
+            f"[{tag}] robot{robot_idx} ctrl "
             f"pos=[{pose[0]:.4f},{pose[1]:.4f},{pose[2]:.4f}] "
             f"rotvec=[{pose[3]:.4f},{pose[4]:.4f},{pose[5]:.4f}] "
             f"grip={grip:.4f}"
         )
-        print(f"[{tag}] copy: {format_pose_cli(pose, grip)}")
+        print(f"[{tag}] copy(ctrl): {format_pose_cli(pose, grip)}")
+        if save_list is None:
+            continue
+        save_pose, save_grip = save_list[robot_idx]
+        print(
+            f"[{tag}] robot{robot_idx} save "
+            f"pos=[{save_pose[0]:.4f},{save_pose[1]:.4f},{save_pose[2]:.4f}] "
+            f"rotvec=[{save_pose[3]:.4f},{save_pose[4]:.4f},{save_pose[5]:.4f}] "
+            f"grip={save_grip:.4f}"
+        )
+        dpos = save_pose[:3] - pose[:3]
+        drot = save_pose[3:6] - pose[3:6]
+        print(
+            f"[{tag}] robot{robot_idx} delta(save-ctrl) "
+            f"pos=[{dpos[0]:+.4f},{dpos[1]:+.4f},{dpos[2]:+.4f}] "
+            f"|dpos|={float(np.linalg.norm(dpos)):.4f} "
+            f"rotvec=[{drot[0]:+.4f},{drot[1]:+.4f},{drot[2]:+.4f}] "
+            f"|drot|={float(np.linalg.norm(drot)):.4f} "
+            f"dgrip={save_grip - grip:+.4f}"
+        )
 
 
 def ease_in_out_quad(t: float) -> float:
@@ -1566,7 +1607,7 @@ def main(
                         if pose_print_enabled:
                             now = time.monotonic()
                             if now - last_pose_print_t >= pose_print_interval:
-                                print_current_pose(env, tag="live")
+                                print_current_pose(env, tag="live", obs=obs)
                                 last_pose_print_t = now
                         n_saved = env.replay_buffer.n_episodes
                         delete_prompt = None
@@ -1759,7 +1800,7 @@ def main(
                         obs = env.get_obs()
                         if pose_print_enabled:
                             if now - last_pose_print_t >= pose_print_interval:
-                                print_current_pose(env, tag="rec")
+                                print_current_pose(env, tag="rec", obs=obs)
                                 last_pose_print_t = now
 
                         recording_now = phase.startswith("record_")

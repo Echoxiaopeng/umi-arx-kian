@@ -145,7 +145,7 @@ class ReplayBuffer:
         Open a on-disk zarr directly (for dataset larger than memory).
         Slower.
         """
-        group = zarr.open(os.path.expanduser(zarr_path), mode)
+        group = zarr.open(os.path.expanduser(zarr_path), mode=mode)
         return cls.create_from_group(group, **kwargs)
 
     # ============= copy constructors ===============
@@ -243,7 +243,7 @@ class ReplayBuffer:
         if backend == "numpy":
             print("backend argument is deprecated!")
             store = None
-        group = zarr.open(os.path.expanduser(zarr_path), "r")
+        group = zarr.open(os.path.expanduser(zarr_path), mode="r")
         return cls.copy_from_store(
             src_store=group.store,
             store=store,

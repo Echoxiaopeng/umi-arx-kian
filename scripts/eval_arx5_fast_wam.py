@@ -92,8 +92,12 @@ export XAUTHORITY=/run/user/1000/gdm/Xauthority
 
 python /data1/projects/umi-arx-kian/scripts/eval_arx5_fast_wam.py \
     -o data_local/umi_eval_output \
+    --policy_port 5566 --terminal_keys\
+    -eh 8 \
+    -f 10
+
+
     --policy_host 112.91.138.78 \
-    --policy_port 5566 --terminal_keys
 
 """
 
@@ -1349,7 +1353,7 @@ def _clear_key_events(key_counter, terminal_reader):
               help="ZMQ 物理开口下界（米，≈闭合；也用于 invert 映射）")
 @click.option("--gripper_max_width", type=float, default=DEFAULT_GRIPPER_MAX_WIDTH,
               help="ZMQ 物理开口上界（米，≈全开；也用于 invert 映射）")
-@click.option("--max_delta_pos", type=float, default=0.03,
+@click.option("--max_delta_pos", type=float, default=0.05,
               help="相邻 waypoint 逐步相对位置安全限位（米）")
 @click.option("--max_delta_rot", type=float, default=0.3,
               help="相邻 waypoint 逐步相对旋转安全限位（弧度）")
