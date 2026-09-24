@@ -98,8 +98,13 @@ class ReplayBuffer:
         assert "data" in root
         assert "meta" in root
         assert "episode_ends" in root["meta"]
+        episode_ends = root["meta"]["episode_ends"]
+        # 空 buffer：episode_ends 长度为 0，不能取 [-1]
+        n_steps = int(episode_ends[-1]) if len(episode_ends) > 0 else 0
         for key, value in root["data"].items():
-            assert value.shape[0] == root["meta"]["episode_ends"][-1]
+            assert value.shape[0] == n_steps, (
+                f"data[{key!r}] length {value.shape[0]} != episode_ends n_steps {n_steps}"
+            )
         self.root = root
 
     # ============= create constructors ===============

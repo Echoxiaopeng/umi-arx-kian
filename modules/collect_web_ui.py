@@ -67,6 +67,7 @@ class SharedCollectState:
         self.viewer_only: bool = False
         self._jpeg: bytes = b""
         self._live_series: list[dict] = []
+        self.logs: list[str] = []
         # 由主循环注入，只读访问 replay / videos
         self.env: Any = None
         self.output_dir: Optional[Path] = None
@@ -79,8 +80,24 @@ class SharedCollectState:
                         self._jpeg = bytes(v)
                 elif k == "live_series":
                     self._live_series = list(v)
+                elif k == "logs":
+                    self.logs = list(v)
                 elif hasattr(self, k):
                     setattr(self, k, v)
+
+    def clear_logs(self) -> None:
+        with self._lock:
+            self.logs = []
+
+    def append_log(self, line: str, *, max_lines: int = 200) -> None:
+        """追加一条带时间戳的启动/运行日志（网页 CONNECTING 面板用）。"""
+        ts = time.strftime("%H:%M:%S")
+        entry = f"[{ts}] {line}"
+        with self._lock:
+            self.logs.append(entry)
+            if len(self.logs) > max_lines:
+                self.logs = self.logs[-max_lines:]
+            self.message = str(line)
 
     def clear_live_series(self) -> None:
         with self._lock:
@@ -131,6 +148,7 @@ class SharedCollectState:
                 "frequency": self.frequency,
                 "live_n": len(self._live_series),
                 "viewer_only": bool(getattr(self, "viewer_only", False)),
+                "logs": list(self.logs),
             }
 
     def get_jpeg(self) -> bytes:
@@ -176,48 +194,62 @@ def _downsample_indices(n: int, max_points: int) -> np.ndarray:
     return np.linspace(0, n - 1, num=max_points, dtype=np.int64)
 
 
+def _rb_slice_array(replay_buffer, key: str, sl: slice) -> np.ndarray:
+    """只切片读一个 key，避免 get_episode 把 camera rgb 整段解压进内存。"""
+    if key not in replay_buffer.data:
+        return np.zeros((0,), dtype=np.float64)
+    return np.asarray(replay_buffer.data[key][sl])
+
+
 def episode_series_from_buffer(
     replay_buffer, episode_id: int, *, max_points: int = 2000
 ) -> dict:
     n_ep = int(replay_buffer.n_episodes)
     if episode_id < 0 or episode_id >= n_ep:
         raise IndexError(f"episode {episode_id} out of range 0..{n_ep - 1}")
-    ep = replay_buffer.get_episode(episode_id, copy=False)
+    sl = replay_buffer.get_episode_slice(episode_id)
 
-    pos = np.asarray(ep.get("robot0_eef_pos", np.zeros((0, 3))), dtype=np.float64)
+    pos = _rb_slice_array(replay_buffer, "robot0_eef_pos", sl)
     if pos.ndim == 1:
-        pos = pos.reshape(-1, 3)
+        pos = pos.reshape(-1, 3) if pos.size else np.zeros((0, 3))
+    elif pos.ndim >= 2:
+        pos = pos.reshape(-1, pos.shape[-1])[:, :3]
     n = int(pos.shape[0])
-    rot = np.asarray(
-        ep.get("robot0_eef_rot_axis_angle", np.zeros((n, 3))), dtype=np.float64
-    )
-    if rot.ndim == 1:
-        rot = rot.reshape(-1, 3)
-    grip = np.asarray(
-        ep.get("robot0_gripper_width", np.zeros((n,))), dtype=np.float64
-    ).reshape(-1)
-    action = np.asarray(ep.get("action", np.zeros((n, 7))), dtype=np.float64)
-    if action.ndim == 1:
-        action = action.reshape(-1, 7)
-    ts = ep.get("timestamp", None)
-    if ts is not None:
+
+    rot = _rb_slice_array(replay_buffer, "robot0_eef_rot_axis_angle", sl)
+    if rot.size == 0:
+        rot = np.zeros((n, 3), dtype=np.float64)
+    else:
+        rot = np.asarray(rot, dtype=np.float64).reshape(-1, 3)
+
+    grip = _rb_slice_array(replay_buffer, "robot0_gripper_width", sl)
+    if grip.size == 0:
+        grip = np.zeros((n,), dtype=np.float64)
+    else:
+        grip = np.asarray(grip, dtype=np.float64).reshape(-1)
+
+    action = _rb_slice_array(replay_buffer, "action", sl)
+    if action.size == 0:
+        action = np.zeros((n, 7), dtype=np.float64)
+    else:
+        action = np.asarray(action, dtype=np.float64)
+        if action.ndim == 1:
+            action = action.reshape(-1, 7)
+        elif action.shape[-1] < 7:
+            pad = np.zeros((action.shape[0], 7), dtype=np.float64)
+            pad[:, : action.shape[-1]] = action
+            action = pad
+
+    ts = _rb_slice_array(replay_buffer, "timestamp", sl)
+    if ts.size == n and n > 0:
         t = np.asarray(ts, dtype=np.float64).reshape(-1)
-        if t.size == n and n > 0:
-            t = t - t[0]
-        else:
-            t = np.arange(n, dtype=np.float64)
+        t = t - t[0]
     else:
         t = np.arange(n, dtype=np.float64)
 
     idx = _downsample_indices(n, max_points)
     pos_d = pos[idx] if n else pos
-    rot_d = rot[idx] if rot.shape[0] == n and n else (
-        rot[:0].reshape(0, 3) if rot.size else np.zeros((0, 3))
-    )
-    if rot_d.shape[0] != idx.shape[0] and n:
-        rot_d = np.asarray(
-            ep.get("robot0_eef_rot_axis_angle", np.zeros((n, 3))), dtype=np.float64
-        ).reshape(-1, 3)[idx]
+    rot_d = rot[idx] if rot.shape[0] == n and n else np.zeros((idx.shape[0], 3))
     grip_d = grip[idx] if grip.shape[0] == n and n else np.zeros((idx.shape[0],))
     act_d = (
         action[idx]
@@ -250,10 +282,10 @@ def list_episodes(env) -> list[dict]:
         has_video = vdir.is_dir() and any(vdir.glob("*.mp4"))
         duration = None
         try:
-            ep = rb.get_episode(eid, copy=False)
-            ts = ep.get("timestamp", None)
-            if ts is not None and len(ts) >= 2:
-                duration = float(ts[-1] - ts[0])
+            if n_steps >= 2 and "timestamp" in rb.data:
+                ts = np.asarray(rb.data["timestamp"][sl], dtype=np.float64).reshape(-1)
+                if ts.size >= 2:
+                    duration = float(ts[-1] - ts[0])
         except Exception:
             pass
         out.append(
@@ -288,27 +320,35 @@ def episode_frame_jpeg(env, episode_id: int, index: int, quality: int = 80) -> b
     if episode_id < 0 or episode_id >= n_ep:
         raise IndexError(f"episode {episode_id} out of range")
 
+    rb = env.replay_buffer
+    sl = rb.get_episode_slice(episode_id)
+    n_steps = int(sl.stop - sl.start)
+    idx = int(np.clip(index, 0, max(n_steps - 1, 0)))
+
+    # 优先 zarr 单帧（随机访问快）；避免每次打开整段 mp4 seek
+    cam_keys = sorted(
+        k for k in rb.data.keys() if "camera" in k and "rgb" in k
+    )
+    if cam_keys and n_steps > 0:
+        try:
+            frame = np.asarray(rb.data[cam_keys[0]][sl.start + idx])
+            return rgb_to_jpeg(frame, quality=quality)
+        except Exception:
+            pass
+
     cap = _open_episode_video(env, episode_id)
     if cap is not None:
         try:
             n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            idx = int(np.clip(index, 0, max(n_frames - 1, 0)))
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            vidx = int(np.clip(index, 0, max(n_frames - 1, 0)))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, vidx)
             ok, bgr = cap.read()
             if ok and bgr is not None:
                 return _encode_jpeg_bgr(bgr, quality=quality)
         finally:
             cap.release()
 
-    # Fallback: zarr camera rgb
-    ep = env.replay_buffer.get_episode(episode_id, copy=False)
-    cam_keys = sorted(k for k in ep.keys() if "camera" in k and "rgb" in k)
-    if not cam_keys:
-        raise FileNotFoundError(f"no video/images for episode {episode_id}")
-    imgs = np.asarray(ep[cam_keys[0]])
-    n = int(imgs.shape[0])
-    idx = int(np.clip(index, 0, max(n - 1, 0)))
-    return rgb_to_jpeg(imgs[idx], quality=quality)
+    raise FileNotFoundError(f"no video/images for episode {episode_id}")
 
 
 class CollectWebServer:
@@ -397,12 +437,15 @@ class CollectWebServer:
 
                     if path == "/api/status":
                         snap = state.snapshot()
+                        want_eps = qs.get("episodes", ["0"])
+                        include_eps = str(want_eps[0]).lower() in ("1", "true", "yes")
                         if state.env is not None:
                             try:
-                                snap["episodes"] = list_episodes(state.env)
                                 snap["n_episodes"] = int(
                                     state.env.replay_buffer.n_episodes
                                 )
+                                if include_eps:
+                                    snap["episodes"] = list_episodes(state.env)
                             except Exception as exc:  # noqa: BLE001
                                 snap["episodes_error"] = str(exc)
                         self._send_json(200, snap)
@@ -562,7 +605,17 @@ class CollectWebServer:
                 self._httpd.shutdown()
             except Exception:
                 pass
+            try:
+                self._httpd.server_close()
+            except Exception:
+                pass
             self._httpd = None
+        if self._thread is not None:
+            try:
+                self._thread.join(timeout=2.0)
+            except Exception:
+                pass
+            self._thread = None
 
 
 def start_collect_web_ui(

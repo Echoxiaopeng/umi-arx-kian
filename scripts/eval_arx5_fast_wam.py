@@ -93,7 +93,7 @@ export XAUTHORITY=/run/user/1000/gdm/Xauthority
 python /data1/projects/umi-arx-kian/scripts/eval_arx5_fast_wam.py \
     -o data_local/umi_eval_output \
     --policy_port 5566 --terminal_keys\
-    -eh 16 \
+    -eh 32 \
     -f 10
 
 
@@ -1349,7 +1349,7 @@ def _clear_key_events(key_counter, terminal_reader):
               help="位姿微调: dx,dy,dz,drx,dry,drz（米/弧度）")
 @click.option("--init_gripper_delta", type=float, default=0.11,
               help="夹爪开度微调（米，ZMQ 物理开口；越大越张开）")
-@click.option("--gripper_min_width", type=float, default=0.011,
+@click.option("--gripper_min_width", type=float, default=0.005,
               help="ZMQ 物理开口下界（米，≈闭合；也用于 invert 映射）")
 @click.option("--gripper_max_width", type=float, default=DEFAULT_GRIPPER_MAX_WIDTH,
               help="ZMQ 物理开口上界（米，≈全开；也用于 invert 映射）")

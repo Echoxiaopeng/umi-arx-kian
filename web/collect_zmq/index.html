@@ -17,24 +17,32 @@
       --warn: #f0b429;
       --danger: #f07178;
       --rec: #ff5c5c;
-      --ui-font: 16px;
+      --ui-font: 20px;
     }
     * { box-sizing: border-box; }
-    html { font-size: var(--ui-font); }
+    html {
+      font-size: var(--ui-font);
+      height: 100%;
+    }
     body {
       margin: 0;
       font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
       background: var(--bg);
       color: var(--text);
-      min-height: 100vh;
       font-size: 1rem;
+      height: 100vh;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
     }
     header {
+      flex: 0 0 auto;
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      padding: 12px 20px;
+      padding: 10px 20px;
       border-bottom: 1px solid var(--border);
       background: var(--panel);
     }
@@ -42,11 +50,11 @@
     header .right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     header h1 {
       margin: 0;
-      font-size: 1.15rem;
+      font-size: 1.25rem;
       font-weight: 600;
       letter-spacing: 0.02em;
     }
-    header .hint { color: var(--muted); font-size: 0.85rem; }
+    header .hint { color: var(--muted); font-size: 0.9rem; }
     .font-btns {
       display: inline-flex;
       align-items: center;
@@ -72,31 +80,84 @@
       min-width: 2.8rem;
       text-align: center;
     }
-    .wrap { padding: 16px; display: flex; flex-direction: column; gap: 16px; }
-    .row { display: grid; gap: 16px; }
-    .row.top { grid-template-columns: 1.4fr 1fr; }
+    .wrap {
+      flex: 1 1 auto;
+      min-height: 0;
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      overflow: hidden;
+    }
+    .row { display: grid; gap: 12px; min-height: 0; }
+    .row.top {
+      flex: 0 1 auto;
+      grid-template-columns: 1.5fr 1fr;
+      min-height: 180px;
+      max-height: min(42vh, 480px);
+      align-items: stretch;
+    }
     @media (max-width: 960px) {
-      .row.top { grid-template-columns: 1fr; }
+      .row.top {
+        flex: 0 0 auto;
+        max-height: 50vh;
+        grid-template-columns: 1fr;
+        overflow: auto;
+      }
     }
     .panel {
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 10px;
-      padding: 14px;
+      padding: 12px 14px;
+      min-height: 0;
+    }
+    .panel.grow {
+      flex: 1 1 auto;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .row.top > .panel {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      min-height: 0;
+    }
+    .row.top > .panel-control {
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+    .panel-control .control-body {
+      flex: 1 1 auto;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
     }
     .panel h2 {
-      margin: 0 0 10px;
+      margin: 0 0 8px;
       font-size: 0.85rem;
       color: var(--muted);
       text-transform: uppercase;
       letter-spacing: 0.06em;
+      flex: 0 0 auto;
     }
     .live-img {
+      flex: 1 1 auto;
       width: 100%;
-      max-height: 360px;
+      min-height: 0;
+      max-height: none;
+      height: auto;
       object-fit: contain;
       background: #000;
       border-radius: 6px;
+    }
+    .viewer-toolbar {
+      flex: 0 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
     }
     .badge {
       display: inline-block;
@@ -125,52 +186,71 @@
     .stats {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 8px;
-      margin: 12px 0;
-      font-size: 0.9rem;
+      gap: 6px;
+      margin: 8px 0;
+      font-size: 0.95rem;
+      flex: 0 0 auto;
     }
     .stats dt { color: var(--muted); font-size: 0.75rem; }
     .stats dd { margin: 0; font-variant-numeric: tabular-nums; }
     .pose {
       font-family: "IBM Plex Mono", ui-monospace, monospace;
-      font-size: 0.78rem;
-      line-height: 1.5;
+      font-size: 0.82rem;
+      line-height: 1.45;
       color: #c5d0e0;
       background: #121820;
       padding: 8px 10px;
       border-radius: 6px;
-      margin-bottom: 12px;
+      margin-bottom: 8px;
+      flex: 0 0 auto;
+      overflow-wrap: anywhere;
     }
-    .btns { display: flex; flex-wrap: wrap; gap: 8px; }
+    .btns { display: flex; flex-wrap: wrap; gap: 8px; flex: 0 0 auto; }
+    #collectBtns {
+      position: sticky;
+      bottom: 0;
+      padding-top: 6px;
+      background: linear-gradient(to bottom, transparent, var(--panel) 8px);
+    }
     button {
       border: 1px solid var(--border);
       background: #243044;
       color: var(--text);
-      padding: 8px 14px;
+      padding: 10px 16px;
       border-radius: 6px;
       cursor: pointer;
-      font-size: 0.85rem;
+      font-size: 0.95rem;
     }
     button:hover:not(:disabled) { border-color: var(--accent); }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
     button.primary { background: #1e4d7a; border-color: var(--accent); }
     button.danger { background: #4a2228; border-color: var(--danger); }
     button.ok { background: #1a3d30; border-color: var(--ok); }
-    .msg { margin-top: 10px; color: var(--muted); font-size: 0.8rem; min-height: 1.2em; }
+    .msg { margin-top: 8px; color: var(--muted); font-size: 0.9rem; min-height: 1.2em; }
 
     .viewer {
+      flex: 1 1 auto;
+      min-height: 0;
       display: grid;
       grid-template-columns: 200px 1fr;
-      gap: 16px;
+      gap: 12px;
     }
     @media (max-width: 960px) {
-      .viewer { grid-template-columns: 1fr; }
+      .viewer { grid-template-columns: 1fr; overflow: auto; }
+    }
+    .ep-side {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
     }
     .ep-list {
       list-style: none;
       margin: 0;
       padding: 0;
-      max-height: 420px;
+      flex: 1 1 auto;
+      min-height: 0;
+      max-height: none;
       overflow: auto;
     }
     .ep-list li {
@@ -178,7 +258,7 @@
       border-radius: 6px;
       cursor: pointer;
       border: 1px solid transparent;
-      font-size: 0.85rem;
+      font-size: 0.95rem;
     }
     .ep-list li:hover { background: #243044; }
     .ep-list li.active {
@@ -186,22 +266,12 @@
       background: #1e2a3c;
     }
     .ep-list .meta { color: var(--muted); font-size: 0.75rem; }
-    .viewer-main { display: flex; flex-direction: column; gap: 10px; }
-    .frame-row {
-      display: grid;
-      grid-template-columns: 320px 1fr;
-      gap: 12px;
-      align-items: start;
-    }
-    @media (max-width: 960px) {
-      .frame-row { grid-template-columns: 1fr; }
-    }
-    #epFrame {
-      width: 100%;
-      max-height: 240px;
-      object-fit: contain;
-      background: #000;
-      border-radius: 6px;
+    .viewer-main {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-height: 0;
+      overflow: hidden;
     }
     .scrub {
       display: flex;
@@ -210,7 +280,15 @@
       flex-wrap: wrap;
     }
     .scrub input[type=range] { flex: 1; min-width: 160px; }
-    #chart { width: 100%; height: 360px; background: #121820; border-radius: 6px; }
+    #chart {
+      flex: 1 1 auto;
+      width: 100%;
+      min-height: 160px;
+      height: auto;
+      background: #121820;
+      border-radius: 6px;
+    }
+    #cursorReadout { flex: 0 0 auto; margin-top: 0; }
     .modal-bg {
       display: none;
       position: fixed;
@@ -231,12 +309,108 @@
     }
     .modal h3 { margin: 0 0 10px; }
     .modal p { color: var(--muted); font-size: 0.9rem; }
+    .hub-page {
+      display: none;
+      flex: 1 1 auto;
+      min-height: 0;
+      align-items: center;
+      justify-content: center;
+      padding: 32px 20px;
+    }
+    .hub-page.show { display: flex; }
+    .hub-card {
+      width: min(640px, 100%);
+      text-align: center;
+    }
+    .hub-card h2 {
+      margin: 0 0 8px;
+      font-size: 1.6rem;
+      font-weight: 600;
+      text-transform: none;
+      letter-spacing: 0;
+      color: var(--text);
+    }
+    .hub-card .hub-sub {
+      color: var(--muted);
+      font-size: 0.95rem;
+      margin: 0 0 28px;
+      line-height: 1.5;
+    }
+    .hub-btns {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .hub-btns button {
+      width: 100%;
+      padding: 18px 20px;
+      font-size: 1.15rem;
+      font-weight: 600;
+      border-radius: 10px;
+    }
+    .hub-btns .hub-collect {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #041018;
+    }
+    .hub-btns .hub-manage {
+      background: #243044;
+    }
+    .hub-note {
+      margin-top: 20px;
+      color: var(--muted);
+      font-size: 0.85rem;
+      line-height: 1.45;
+    }
+    .hub-msg {
+      margin-top: 14px;
+      min-height: 1.4em;
+      color: var(--warn);
+      font-size: 0.9rem;
+    }
+    .hub-log-wrap {
+      display: none;
+      margin-top: 18px;
+      text-align: left;
+    }
+    .hub-log-wrap.show { display: block; }
+    .hub-log-wrap h3 {
+      margin: 0 0 8px;
+      font-size: 0.8rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-weight: 600;
+    }
+    .hub-log {
+      margin: 0;
+      max-height: min(42vh, 320px);
+      overflow: auto;
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: #0a0e14;
+      border: 1px solid var(--border);
+      color: #b8c4d6;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: 0.78rem;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .hub-log .hub-log-empty { color: var(--muted); }
+    .hub-connecting .hub-btns button:not(#btnHubQuit) {
+      opacity: 0.45;
+      pointer-events: none;
+    }
+    .badge.HUB { background: #3d9cf033; color: var(--accent); }
+    .badge.CONNECTING { background: #f0b42933; color: var(--warn); }
+    #viewerOnlyBar { flex: 0 0 auto; }
   </style>
 </head>
 <body>
   <header>
     <div class="left">
-      <h1>ARX5 ZMQ Collect</h1>
+      <h1 id="pageTitle">ARX5 ZMQ Collect</h1>
       <div class="hint" id="headerHint">网页快捷键: P/C/S/D/Q · 仅可信局域网</div>
     </div>
     <div class="right">
@@ -248,65 +422,84 @@
     </div>
   </header>
 
-  <div class="wrap">
+  <div class="hub-page" id="hubPage">
+    <div class="hub-card panel" id="hubCard">
+      <h2 id="hubTitle">选择模式</h2>
+      <p class="hub-sub" id="hubSub">一个网页入口：先选数据采集或数据管理。机械臂仅在进入数采后连接。</p>
+      <div class="hub-btns">
+        <button type="button" id="btnEnterCollect" class="hub-collect">数据采集</button>
+        <button type="button" id="btnEnterManage" class="hub-manage">数据管理</button>
+        <button type="button" id="btnHubQuit" class="danger">退出</button>
+      </div>
+      <p class="hub-note" id="hubNote">数采需要本机已启动 ZMQ robot server。管理页不连臂，可回看 / 删除已有 episode。</p>
+      <div class="hub-msg" id="hubMsg"></div>
+      <div class="hub-log-wrap" id="hubLogWrap">
+        <h3>连接日志</h3>
+        <pre class="hub-log" id="hubLog"><span class="hub-log-empty">等待日志…</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="wrap" id="mainWrap">
     <div class="row top" id="collectRow">
-      <div class="panel">
-        <h2>Live preview</h2>
+      <div class="panel" id="livePanel">
+        <h2 id="videoHeading">Live preview</h2>
         <img id="liveCam" class="live-img" alt="live" src="/api/video" />
       </div>
-      <div class="panel">
+      <div class="panel panel-control" id="controlPanel">
         <h2>Control</h2>
-        <div>
-          <span id="modeBadge" class="badge">IDLE</span>
-          <span style="margin-left:8px;color:var(--muted);font-size:0.85rem">
-            saved: <strong id="nEpisodes">0</strong>
-          </span>
+        <div class="control-body">
+          <div>
+            <span id="modeBadge" class="badge">IDLE</span>
+            <span style="margin-left:8px;color:var(--muted);font-size:0.85rem">
+              saved: <strong id="nEpisodes">0</strong>
+            </span>
+          </div>
+          <dl class="stats">
+            <div><dt>Steps</dt><dd id="nSteps">0</dd></div>
+            <div><dt>Elapsed</dt><dd id="tElapsed">0.0s</dd></div>
+            <div><dt>Episode</dt><dd id="curEp">—</dd></div>
+            <div><dt>Live pts</dt><dd id="liveN">0</dd></div>
+          </dl>
+          <div class="pose" id="poseBox">pos — · rot — · grip —</div>
+          <div class="btns" id="collectBtns">
+            <button id="btnDrag" class="primary">P · Drag</button>
+            <button id="btnStart" class="ok">C · Start</button>
+            <button id="btnSave">S · Save</button>
+            <button id="btnDrop">D · Drop</button>
+            <button id="btnQuit" class="danger">Q · Home+Quit</button>
+          </div>
+          <div class="msg" id="msg"></div>
         </div>
-        <dl class="stats">
-          <div><dt>Steps</dt><dd id="nSteps">0</dd></div>
-          <div><dt>Elapsed</dt><dd id="tElapsed">0.0s</dd></div>
-          <div><dt>Episode</dt><dd id="curEp">—</dd></div>
-          <div><dt>Live pts</dt><dd id="liveN">0</dd></div>
-        </dl>
-        <div class="pose" id="poseBox">pos — · rot — · grip —</div>
-        <div class="btns" id="collectBtns">
-          <button id="btnDrag" class="primary">P · Drag</button>
-          <button id="btnStart" class="ok">C · Start</button>
-          <button id="btnSave">S · Save</button>
-          <button id="btnDrop">D · Drop</button>
-          <button id="btnQuit" class="danger">Q · Home+Quit</button>
-        </div>
-        <div class="msg" id="msg"></div>
       </div>
     </div>
 
     <div class="panel" id="viewerOnlyBar" style="display:none">
-      <h2>Viewer only</h2>
+      <h2>数据管理</h2>
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
         <span id="modeBadgeView" class="badge READY">VIEW</span>
         <span style="color:var(--muted);font-size:0.85rem">
           saved: <strong id="nEpisodesView">0</strong> · no robot / camera
         </span>
+        <button id="btnBackHub" type="button">返回入口</button>
         <button id="btnQuitView" class="danger">Q · Quit</button>
         <div class="msg" id="msgView"></div>
       </div>
     </div>
 
-    <div class="panel">
-      <h2>Episode viewer (LeRobot-style)</h2>
+    <div class="panel grow" id="episodePanel">
+      <h2>Episode viewer</h2>
       <div class="viewer">
-        <div>
+        <div class="ep-side">
           <ul class="ep-list" id="epList"></ul>
-          <div class="btns" style="margin-top:8px">
+          <div class="btns" style="margin-top:8px;flex:0 0 auto">
             <button id="btnRefresh">Refresh</button>
             <button id="btnDelete" class="danger" disabled>Delete</button>
             <button id="btnLiveView">Follow LIVE</button>
           </div>
         </div>
         <div class="viewer-main">
-          <div class="frame-row">
-            <img id="epFrame" alt="episode frame" />
-            <div>
+          <div class="viewer-toolbar">
               <div class="scrub">
                 <button id="btnPlay">Play</button>
                 <input id="scrub" type="range" min="0" max="0" value="0" />
@@ -324,10 +517,9 @@
                 rot = TCP 姿态的 axis-angle（旋转向量，单位 rad；方向=转轴，模长=转角）·
                 左键拖动移动黄线 · 滚轮缩放曲线 · 双击复位
               </div>
-            </div>
           </div>
           <div id="chart"></div>
-          <div id="cursorReadout" class="pose" style="margin-top:8px;min-height:2.6em">
+          <div id="cursorReadout" class="pose" style="min-height:2.6em">
             黄线当前位置：拖动曲线或 scrub 后显示数值
           </div>
         </div>
@@ -355,18 +547,21 @@
     let playTimer = null;
     let lastLiveFetch = 0;
     let viewerOnly = false;
+    let hubMode = false;
+    let lastRecording = false;
+    let lastUiMode = "";
     let chartChannel = "all"; // all | pos | gripper | rot | action
     let chartTitle = "";
     let chartFrameIdx = 0;
-    const FONT_MIN = 14;
-    const FONT_MAX = 24;
+    const FONT_MIN = 16;
+    const FONT_MAX = 32;
     const FONT_STEP = 2;
-    let uiFontPx = 16;
+    let uiFontPx = 20;
 
     function applyFontSize(px, { replot = true } = {}) {
       uiFontPx = Math.max(FONT_MIN, Math.min(FONT_MAX, px));
       document.documentElement.style.setProperty("--ui-font", uiFontPx + "px");
-      $("fontLabel").textContent = Math.round((uiFontPx / 16) * 100) + "%";
+      $("fontLabel").textContent = Math.round((uiFontPx / 20) * 100) + "%";
       $("fontDown").disabled = uiFontPx <= FONT_MIN;
       $("fontUp").disabled = uiFontPx >= FONT_MAX;
       try { localStorage.setItem("collect_ui_font_px", String(uiFontPx)); } catch (_) {}
@@ -375,7 +570,36 @@
 
     function chartFontSize() {
       // Plotly 用 px；随 UI 字体略放大
-      return Math.round(11 * (uiFontPx / 16));
+      return Math.round(13 * (uiFontPx / 20));
+    }
+
+    function chartPixelHeight() {
+      const el = $("chart");
+      if (!el) return 280;
+      // 若尚未被 flex 撑开，用视口估算，避免 Plotly 画出 0 高
+      const h = el.clientHeight;
+      if (h >= 120) return Math.floor(h);
+      const vh = window.innerHeight || 800;
+      return Math.max(180, Math.floor(vh * (viewerOnly ? 0.48 : 0.36)));
+    }
+
+    function resizeChart() {
+      const gd = $("chart");
+      if (!gd) return;
+      const h = chartPixelHeight();
+      gd.style.height = h + "px";
+      if (gd.data && window.Plotly) {
+        try {
+          Plotly.relayout(gd, { height: h, autosize: true });
+          Plotly.Plots.resize(gd);
+        } catch (_) {}
+      }
+    }
+
+    let _resizeTimer = null;
+    function onViewportResize() {
+      if (_resizeTimer) clearTimeout(_resizeTimer);
+      _resizeTimer = setTimeout(() => resizeChart(), 80);
     }
 
     async function postCmd(action, extra = {}) {
@@ -392,25 +616,103 @@
     function setMsg(t) {
       $("msg").textContent = t || "";
       if ($("msgView")) $("msgView").textContent = t || "";
+      if ($("hubMsg")) $("hubMsg").textContent = t || "";
     }
 
-    function applyViewerOnly(flag) {
-      viewerOnly = !!flag;
-      $("collectRow").style.display = viewerOnly ? "none" : "";
+    function renderHubLogs(logs) {
+      const pre = $("hubLog");
+      if (!pre) return;
+      const lines = Array.isArray(logs) ? logs : [];
+      if (!lines.length) {
+        pre.innerHTML = '<span class="hub-log-empty">等待日志…</span>';
+        return;
+      }
+      pre.textContent = lines.join("\n");
+      pre.scrollTop = pre.scrollHeight;
+    }
+
+    function applyUiMode(mode, s) {
+      const connecting = mode === "CONNECTING";
+      hubMode = mode === "HUB" || connecting;
+      viewerOnly = !!(s && s.viewer_only) || mode === "VIEW";
+
+      $("hubPage").classList.toggle("show", hubMode);
+      $("mainWrap").style.display = hubMode ? "none" : "flex";
+
+      if ($("hubCard")) {
+        $("hubCard").classList.toggle("hub-connecting", connecting);
+      }
+      if ($("hubLogWrap")) {
+        $("hubLogWrap").classList.toggle("show", connecting || (hubMode && (s.logs || []).length > 0));
+      }
+      renderHubLogs(s && s.logs);
+
+      if (hubMode) {
+        if (connecting) {
+          $("headerHint").textContent = "正在连接 · 请看下方日志 · 仅可信局域网";
+          $("pageTitle").textContent = "ARX5 Connecting…";
+          document.title = "ARX5 Connecting…";
+          if ($("hubTitle")) $("hubTitle").textContent = "正在启动数据采集";
+          if ($("hubSub")) {
+            $("hubSub").textContent =
+              "正在连接 ZMQ 机械臂与相机，请稍候。日志会实时刷新；失败会返回本页并保留错误信息。";
+          }
+        } else {
+          $("headerHint").textContent = "选择模式 · Q 退出 · 仅可信局域网";
+          $("pageTitle").textContent = "ARX5 Web Hub";
+          document.title = "ARX5 Web Hub";
+          if ($("hubTitle")) $("hubTitle").textContent = "选择模式";
+          if ($("hubSub")) {
+            $("hubSub").textContent =
+              "一个网页入口：先选数据采集或数据管理。机械臂仅在进入数采后连接。";
+          }
+        }
+        return;
+      }
+
+      // 顶部始终保留唯一视频区；管理页隐藏 Control
+      $("collectRow").style.display = "grid";
+      if ($("controlPanel")) $("controlPanel").style.display = viewerOnly ? "none" : "";
+      if ($("livePanel")) {
+        // 管理页单列铺满视频
+        $("collectRow").style.gridTemplateColumns = viewerOnly ? "1fr" : "";
+      }
       $("viewerOnlyBar").style.display = viewerOnly ? "" : "none";
       $("btnLiveView").style.display = viewerOnly ? "none" : "";
+      if ($("btnBackHub")) {
+        $("btnBackHub").style.display = "";
+      }
       $("headerHint").textContent = viewerOnly
-        ? "Viewer only · Q quit · 仅可信局域网"
+        ? "数据管理 · 返回入口 / Q 退出 · 仅可信局域网"
         : "网页快捷键: P/C/S/D/Q · 仅可信局域网";
-      document.title = viewerOnly ? "ARX5 Dataset Viewer" : "ARX5 ZMQ Collect";
+      $("pageTitle").textContent = viewerOnly ? "ARX5 Dataset Viewer" : "ARX5 ZMQ Collect";
+      document.title = $("pageTitle").textContent;
+      if ($("videoHeading")) {
+        $("videoHeading").textContent = viewerOnly ? "Episode frame" : "Live preview";
+      }
+      // 数采默认实时流（只在尚未选 episode 时挂一次）
+      if (!viewerOnly && selectedEp == null) {
+        followLive();
+      }
+      // 刚进入管理/数采页面时拉一次 episode 列表
+      if (mode !== lastUiMode && (mode === "VIEW" || mode === "IDLE" || mode === "READY" || mode === "DRAG" || mode === "REC")) {
+        pollStatus(true);
+      }
+      lastUiMode = mode;
+      requestAnimationFrame(() => resizeChart());
     }
 
     function updateControls(s) {
-      if (s.viewer_only) applyViewerOnly(true);
       const mode = s.mode || "IDLE";
+      applyUiMode(mode, s);
+
       const badge = $("modeBadge");
       badge.textContent = mode;
       badge.className = "badge " + mode;
+      if ($("modeBadgeView")) {
+        $("modeBadgeView").textContent = mode;
+        $("modeBadgeView").className = "badge " + mode;
+      }
       $("nEpisodes").textContent = s.n_episodes ?? 0;
       if ($("nEpisodesView")) $("nEpisodesView").textContent = s.n_episodes ?? 0;
       $("nSteps").textContent = s.n_steps ?? 0;
@@ -425,6 +727,8 @@
         `grip ${(s.grip ?? 0).toFixed(4)}`;
       if (s.message) setMsg(s.message);
 
+      if (hubMode) return;
+
       if (viewerOnly) {
         $("btnDelete").disabled = selectedEp === null || selectedEp === "live";
         return;
@@ -437,6 +741,25 @@
       $("btnSave").disabled = !rec;
       $("btnDrop").disabled = !rec;
       $("btnDelete").disabled = selectedEp === null || selectedEp === "live";
+
+      // 按下 C 进入录制：强制切回实时相机画面
+      if (rec && !lastRecording) {
+        selectedEp = "live";
+        document.querySelectorAll(".ep-list li").forEach((li) => li.classList.remove("active"));
+        $("btnDelete").disabled = true;
+        showLiveStream({ force: true });
+        $("viewerMsg").textContent = "Recording — live camera";
+      } else if (rec) {
+        const cam = $("liveCam");
+        if (cam && String(cam.src || "").indexOf("/api/video") < 0) {
+          showLiveStream({ force: true });
+        } else if ($("videoHeading")) {
+          $("videoHeading").textContent = "Live preview · REC";
+        }
+      } else if (!rec && lastRecording && $("videoHeading")) {
+        $("videoHeading").textContent = "Live preview";
+      }
+      lastRecording = rec;
     }
 
     function renderEpList(episodes) {
@@ -509,7 +832,8 @@
           plot_bgcolor: "#121820",
           font: { color: "#c5d0e0", size: chartFontSize() },
           margin: { t: 48, r: 24, b: 36, l: 64 },
-          height: 380,
+          height: chartPixelHeight(),
+          autosize: true,
           showlegend: true,
           legend: { orientation: "h", y: 1.15 },
           shapes,
@@ -588,7 +912,8 @@
           plot_bgcolor: "#121820",
           font: { color: "#c5d0e0", size: chartFontSize() },
           margin: { t: 48, r: 24, b: 40, l: chan === "gripper" ? 92 : 68 },
-          height: 320,
+          height: chartPixelHeight(),
+          autosize: true,
           showlegend: true,
           legend: { orientation: "h", y: 1.12 },
           shapes,
@@ -609,7 +934,7 @@
         displayModeBar: false,
         scrollZoom: true,
         doubleClick: "reset",
-      });
+      }).then(() => resizeChart()).catch(() => {});
       bindChartScrub();
 
       const maxIdx = Math.max((data.n_steps || n) - 1, 0);
@@ -841,15 +1166,44 @@
     }
 
     async function loadFrame(index) {
+      const cam = $("liveCam");
+      if (!cam) return;
+      // 数采录制中：顶部始终跟实时相机，不被 scrub / episode 静帧抢走
+      if (!viewerOnly && (selectedEp === "live" || !!status.recording)) {
+        showLiveStream();
+        return;
+      }
       if (selectedEp === "live") {
-        $("epFrame").src = "/api/live/frame?t=" + Date.now();
+        if (!viewerOnly) showLiveStream();
         return;
       }
       if (selectedEp == null) return;
-      $("epFrame").src = `/api/episodes/${selectedEp}/frame?index=${index}&t=${Date.now()}`;
+      cam.dataset.stream = "0";
+      cam.src = `/api/episodes/${selectedEp}/frame?index=${index}&t=${Date.now()}`;
+    }
+
+    function showLiveStream({ force = false } = {}) {
+      const el = $("liveCam");
+      if (!el) return;
+      const already =
+        el.dataset.stream === "1" && String(el.src || "").indexOf("/api/video") >= 0;
+      if (!force && already) return;
+      el.dataset.stream = "1";
+      el.src = "/api/video?t=" + Date.now();
+      if ($("videoHeading") && !viewerOnly) {
+        $("videoHeading").textContent = status.recording
+          ? "Live preview · REC"
+          : "Live preview";
+      }
     }
 
     async function selectEpisode(id) {
+      // 录制中不允许切走实时相机
+      if (!viewerOnly && status.recording) {
+        setMsg("recording — stay on live camera");
+        followLive();
+        return;
+      }
       stopPlay();
       selectedEp = id;
       document.querySelectorAll(".ep-list li").forEach((li) => {
@@ -857,6 +1211,7 @@
       });
       $("btnDelete").disabled = false;
       $("viewerMsg").textContent = `Loading episode ${id}…`;
+      if ($("videoHeading")) $("videoHeading").textContent = `Episode ${id}`;
       try {
         const r = await fetch(`/api/episodes/${id}/series?max_points=2000`);
         const data = await r.json();
@@ -874,7 +1229,12 @@
       selectedEp = "live";
       document.querySelectorAll(".ep-list li").forEach((li) => li.classList.remove("active"));
       $("btnDelete").disabled = true;
-      $("viewerMsg").textContent = "Following LIVE recording…";
+      $("viewerMsg").textContent = viewerOnly
+        ? "Select an episode to scrub"
+        : (status.recording
+          ? "Recording — live camera"
+          : "Following LIVE · chart updates while recording");
+      if (!viewerOnly) showLiveStream({ force: true });
       await refreshLiveSeries();
     }
 
@@ -923,12 +1283,45 @@
     }
 
     $("btnDrag").onclick = () => postCmd("drag_toggle").then(() => setMsg("drag toggled")).catch(e => setMsg(e.message));
-    $("btnStart").onclick = () => postCmd("start").then(() => { setMsg("start"); followLive(); }).catch(e => setMsg(e.message));
+    $("btnStart").onclick = () =>
+      postCmd("start")
+        .then(() => {
+          setMsg("start");
+          followLive();
+          showLiveStream({ force: true });
+        })
+        .catch(e => setMsg(e.message));
     $("btnSave").onclick = () => postCmd("save").then(() => setMsg("save")).catch(e => setMsg(e.message));
     $("btnDrop").onclick = () => postCmd("drop").then(() => setMsg("drop")).catch(e => setMsg(e.message));
     $("btnQuit").onclick = () => postCmd("quit").then(() => setMsg("quit…")).catch(e => setMsg(e.message));
     if ($("btnQuitView")) {
       $("btnQuitView").onclick = () => postCmd("quit").then(() => setMsg("quit…")).catch(e => setMsg(e.message));
+    }
+    if ($("btnBackHub")) {
+      $("btnBackHub").onclick = () =>
+        postCmd("back_hub").then(() => setMsg("返回入口…")).catch(e => setMsg(e.message));
+    }
+    if ($("btnEnterCollect")) {
+      $("btnEnterCollect").onclick = () => {
+        renderHubLogs(["正在发送 enter_collect…"]);
+        if ($("hubLogWrap")) $("hubLogWrap").classList.add("show");
+        if ($("hubCard")) $("hubCard").classList.add("hub-connecting");
+        if ($("hubTitle")) $("hubTitle").textContent = "正在启动数据采集";
+        setMsg("正在进入数采（连接机械臂）…");
+        postCmd("enter_collect")
+          .then(() => setMsg("正在连接…（见下方日志）"))
+          .catch(e => setMsg(e.message));
+      };
+    }
+    if ($("btnEnterManage")) {
+      $("btnEnterManage").onclick = () =>
+        postCmd("enter_manage")
+          .then(() => setMsg("进入数据管理…"))
+          .catch(e => setMsg(e.message));
+    }
+    if ($("btnHubQuit")) {
+      $("btnHubQuit").onclick = () =>
+        postCmd("quit").then(() => setMsg("quit…")).catch(e => setMsg(e.message));
     }
     $("btnRefresh").onclick = () => pollStatus(true);
     $("btnLiveView").onclick = () => followLive();
@@ -943,6 +1336,8 @@
     });
 
     // 网页内快捷键（焦点在浏览器时生效；与终端 P/C/S/D/Q 一致）
+    // --web 时后端不启 pynput，避免本机按 P 双触发（进拖拽又立刻退出）
+    let _keyBusyUntil = 0;
     window.addEventListener("keydown", (ev) => {
       const tag = (ev.target && ev.target.tagName) || "";
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
@@ -962,9 +1357,16 @@
 
       if (k === "q") {
         ev.preventDefault();
-        (viewerOnly ? $("btnQuitView") : $("btnQuit")).click();
+        if (hubMode) {
+          $("btnHubQuit").click();
+        } else if (viewerOnly) {
+          $("btnQuitView").click();
+        } else {
+          $("btnQuit").click();
+        }
         return;
       }
+      if (hubMode) return;
       if (k === " " || k === "spacebar") {
         if (selectedEp != null) {
           ev.preventDefault();
@@ -972,10 +1374,18 @@
         }
         return;
       }
-      if (viewerOnly) return;
+      if (viewerOnly) {
+        if (k === "b" || k === "escape") {
+          ev.preventDefault();
+          if ($("btnBackHub")) $("btnBackHub").click();
+        }
+        return;
+      }
 
+      if (Date.now() < _keyBusyUntil) return;
       if (k === "p") {
         ev.preventDefault();
+        _keyBusyUntil = Date.now() + 350;
         $("btnDrag").click();
       } else if (k === "c") {
         ev.preventDefault();
@@ -1014,10 +1424,12 @@
 
     async function pollStatus(forceList) {
       try {
-        const r = await fetch("/api/status");
+        const url = forceList ? "/api/status?episodes=1" : "/api/status";
+        const r = await fetch(url);
         status = await r.json();
         updateControls(status);
-        if (forceList || status.episodes) renderEpList(status.episodes || []);
+        if (forceList && status.episodes) renderEpList(status.episodes || []);
+        else if (status.episodes) renderEpList(status.episodes || []);
         if (status.delete_pending != null && !$("delModal").classList.contains("show")) {
           // keyboard-side pending; show modal
         }
@@ -1033,16 +1445,31 @@
       }
     }
 
+    // 进入管理 / 数采后周期性轻量刷新列表（不再每次 status 都扫 zarr 全图）
+    setInterval(() => {
+      if (!hubMode) pollStatus(true);
+    }, 5000);
     setInterval(() => pollStatus(false), 200);
     pollStatus(true);
+
+    window.addEventListener("resize", onViewportResize);
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(() => onViewportResize());
+      if ($("chart")) ro.observe($("chart"));
+      if ($("mainWrap")) ro.observe($("mainWrap"));
+    }
+    requestAnimationFrame(() => resizeChart());
 
     $("fontDown").onclick = () => applyFontSize(uiFontPx - FONT_STEP);
     $("fontUp").onclick = () => applyFontSize(uiFontPx + FONT_STEP);
     try {
-      const saved = parseInt(localStorage.getItem("collect_ui_font_px") || "16", 10);
-      applyFontSize(Number.isFinite(saved) ? saved : 16, { replot: false });
+      const raw = localStorage.getItem("collect_ui_font_px");
+      const saved = parseInt(raw || "20", 10);
+      // 旧默认 16 偏小：自动抬到 20
+      const px = Number.isFinite(saved) ? (saved < 18 ? 20 : saved) : 20;
+      applyFontSize(px, { replot: false });
     } catch (_) {
-      applyFontSize(16, { replot: false });
+      applyFontSize(20, { replot: false });
     }
   </script>
 </body>
