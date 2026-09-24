@@ -93,7 +93,7 @@ export XAUTHORITY=/run/user/1000/gdm/Xauthority
 python /data1/projects/umi-arx-kian/scripts/eval_arx5_fast_wam.py \
     -o data_local/umi_eval_output \
     --policy_port 5566 --terminal_keys\
-    -eh 8 \
+    -eh 16 \
     -f 10
 
 

@@ -32,6 +32,12 @@ ARX5 拖拽采数脚本 — ZMQ 版本（重力补偿 / 零力拖拽）。
     # 先起 ZMQ server，再:
     python scripts/collect_drag_umi_zmq.py -o data/collect_demo_zmq --terminal_keys
 
+    # 网页面板（LeRobot 风格回看；默认 --no_cv，浏览器打开提示的 URL）:
+    python scripts/collect_drag_umi_zmq.py -o data/collect_demo_zmq --terminal_keys --web
+
+    # 只管理已有数据（不启机械臂 / 相机）:
+    python scripts/collect_drag_umi_zmq.py -o data/collect_demo_zmq --web --viewer_only
+
     # 与 fast_wam 相同的启动微调（默认已是这组 delta）:
     python scripts/collect_drag_umi_zmq.py -o data/collect_demo_zmq --terminal_keys \\
         --init_delta 0,0,0,0.1,-0.1,-1.0 --init_gripper_delta 0.11
@@ -83,8 +89,30 @@ if str(ROOT_DIR) not in sys.path:
 os.chdir(ROOT_DIR)
 
 from modules.arx5_env_with_images_zmq import Arx5EnvWithImages  # noqa: E402
-from peripherals.keystroke_counter import Key, KeyCode  # noqa: E402
+from modules.replay_buffer import ReplayBuffer  # noqa: E402
 from utils.other_util import precise_wait  # noqa: E402
+
+# pynput 在无 DISPLAY 时会炸；viewer_only 不需要键盘钩子
+try:
+    from peripherals.keystroke_counter import Key, KeyCode  # noqa: E402
+except Exception:  # noqa: BLE001
+
+    class Key:  # type: ignore[no-redef]
+        backspace = object()
+        enter = object()
+        esc = object()
+
+    class KeyCode:  # type: ignore[no-redef]
+        def __init__(self, char=None):
+            self.char = char
+
+        def __eq__(self, other):
+            return isinstance(other, KeyCode) and self.char == getattr(
+                other, "char", None
+            )
+
+        def __hash__(self):
+            return hash(self.char)
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +537,7 @@ def abort_episode(env: Arx5EnvWithImages) -> None:
     print(f"Episode {episode_id} aborted (not saved).")
 
 
-def check_episode_alignment(env: Arx5EnvWithImages) -> None:
+def check_episode_alignment(env) -> None:
     """启动采集前校验编号，并清理异常退出遗留的孤立视频目录。"""
     n_episodes = env.replay_buffer.n_episodes
     expected_ids = set(range(n_episodes))
@@ -536,7 +564,7 @@ def check_episode_alignment(env: Arx5EnvWithImages) -> None:
         )
 
 
-def delete_saved_episode(env: Arx5EnvWithImages, episode_id: int) -> bool:
+def delete_saved_episode(env, episode_id: int) -> bool:
     """删除已写入 zarr 的指定 episode，并重编号后续 videos/{id} 以保持连续。"""
     n_episodes = env.replay_buffer.n_episodes
     if n_episodes <= 0:
@@ -735,19 +763,7 @@ def make_vis_image(
     delete_prompt: str | None = None,
     n_robots: int = 1,
 ) -> np.ndarray:
-    cam_keys = sorted(k for k in obs if k.startswith("camera") and k.endswith("_rgb"))
-    if not cam_keys:
-        raise RuntimeError("obs 中没有 camera*_rgb")
-    frames = []
-    for key in cam_keys:
-        img = np.asarray(obs[key][-1])
-        if img.dtype != np.uint8:
-            if float(np.nanmax(img)) <= 1.5:
-                img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
-            else:
-                img = np.clip(img, 0, 255).astype(np.uint8)
-        frames.append(img)
-    vis = np.concatenate(frames, axis=1) if len(frames) > 1 else frames[0]
+    vis = camera_strip_from_obs(obs).copy()
     if recording:
         status = "REC"
         help_text = "S save | D drop | I pose | Q quit"
@@ -806,6 +822,23 @@ def make_vis_image(
     return vis
 
 
+def camera_strip_from_obs(obs: dict) -> np.ndarray:
+    """纯相机拼接图（无文字叠加），供网页预览。"""
+    cam_keys = sorted(k for k in obs if k.startswith("camera") and k.endswith("_rgb"))
+    if not cam_keys:
+        raise RuntimeError("obs 中没有 camera*_rgb")
+    frames = []
+    for key in cam_keys:
+        img = np.asarray(obs[key][-1])
+        if img.dtype != np.uint8:
+            if float(np.nanmax(img)) <= 1.5:
+                img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+            else:
+                img = np.clip(img, 0, 255).astype(np.uint8)
+        frames.append(img)
+    return np.concatenate(frames, axis=1) if len(frames) > 1 else frames[0]
+
+
 def drain_keys(key_source) -> list:
     if key_source is None:
         return []
@@ -828,6 +861,208 @@ def parse_episode_id(text: str) -> int | None:
     if not stripped.isdigit():
         return None
     return int(stripped)
+
+
+def _compute_mode(
+    *,
+    recording: bool,
+    zero_force_active: bool,
+    no_zero_force: bool,
+    delete_mode,
+) -> str:
+    if delete_mode is not None:
+        return "DEL"
+    if recording:
+        return "REC"
+    if zero_force_active:
+        return "DRAG"
+    if no_zero_force:
+        return "READY"
+    return "IDLE"
+
+
+def publish_web_frame(
+    web_state,
+    *,
+    env,
+    vis_rgb: np.ndarray | None,
+    recording: bool,
+    zero_force_active: bool,
+    no_zero_force: bool,
+    delete_mode,
+    delete_target,
+    n_steps: int,
+    t_elapsed: float,
+    episode_id: int | None,
+    frequency: float,
+    message: str = "",
+    clean_rgb: np.ndarray | None = None,
+) -> None:
+    if web_state is None:
+        return
+    from modules.collect_web_ui import publish_pose_from_env, vis_rgb_to_jpeg
+
+    mode = _compute_mode(
+        recording=recording,
+        zero_force_active=zero_force_active,
+        no_zero_force=no_zero_force,
+        delete_mode=delete_mode,
+    )
+    publish_pose_from_env(web_state, env)
+    jpeg = b""
+    # 网页预览用无叠加文字的干净画面；OpenCV 窗仍可用 vis_rgb
+    src = clean_rgb if clean_rgb is not None else vis_rgb
+    if src is not None:
+        try:
+            jpeg = vis_rgb_to_jpeg(src, quality=75)
+        except Exception:
+            jpeg = b""
+    web_state.update(
+        mode=mode,
+        zero_force_active=zero_force_active,
+        recording=recording,
+        no_zero_force=no_zero_force,
+        n_steps=int(n_steps),
+        t_elapsed=float(t_elapsed),
+        episode_id=episode_id,
+        delete_pending=delete_target if delete_mode == "confirm" else None,
+        frequency=float(frequency),
+        message=message,
+        jpeg=jpeg,
+        n_episodes=int(env.replay_buffer.n_episodes),
+    )
+
+
+def append_live_from_obs(web_state, obs: dict, *, step: int, t_elapsed: float) -> None:
+    if web_state is None:
+        return
+    # 降采样：约每 3 步采一点
+    if step > 0 and step % 3 != 0:
+        return
+    try:
+        xyz = np.asarray(obs["robot0_eef_pos"][-1], dtype=np.float64).reshape(3)
+        rot = np.asarray(
+            obs["robot0_eef_rot_axis_angle"][-1], dtype=np.float64
+        ).reshape(3)
+        grip = float(np.asarray(obs["robot0_gripper_width"][-1]).squeeze())
+        action = action_from_obs(obs, 1)
+        web_state.append_live_sample(
+            step=step, t=t_elapsed, xyz=xyz, rot=rot, grip=grip, action=action
+        )
+    except Exception:
+        pass
+
+
+class OfflineDatasetEnv:
+    """仅打开已有 replay_buffer.zarr + videos，不启臂 / 相机。"""
+
+    def __init__(self, output_dir: str | Path):
+        self.output_dir = Path(output_dir)
+        self.video_dir = self.output_dir / "videos"
+        self.video_dir.mkdir(parents=True, exist_ok=True)
+        zarr_path = self.output_dir / "replay_buffer.zarr"
+        if not zarr_path.exists():
+            raise FileNotFoundError(
+                f"未找到 {zarr_path}。请先采数，或检查 -o 输出目录。"
+            )
+        # r+：允许网页删除 episode
+        self.replay_buffer = ReplayBuffer.create_from_path(str(zarr_path), mode="r+")
+
+
+def run_viewer_only(
+    *,
+    output: str,
+    web_host: str,
+    web_port: int,
+) -> None:
+    """离线数据管理：网页回看 / 删除，不连接机械臂。"""
+    from modules.collect_web_ui import (
+        CommandQueue,
+        SharedCollectState,
+        start_collect_web_ui,
+    )
+
+    env = OfflineDatasetEnv(output)
+    try:
+        check_episode_alignment(env)
+    except RuntimeError as exc:
+        print(f"[viewer_only] alignment warning: {exc}")
+
+    web_state = SharedCollectState()
+    web_cmds = CommandQueue()
+    web_state.env = env
+    web_state.output_dir = Path(output)
+    web_state.viewer_only = True
+    web_state.update(
+        mode="VIEW",
+        viewer_only=True,
+        recording=False,
+        zero_force_active=False,
+        n_episodes=int(env.replay_buffer.n_episodes),
+        message="viewer_only: no robot",
+    )
+
+    print("=" * 60)
+    print("ARX5 Dataset Viewer (no robot)")
+    print(f"  output     : {output}")
+    print(f"  episodes   : {env.replay_buffer.n_episodes}")
+    print(f"  web        : http://{web_host}:{web_port}/")
+    print("  controls   : browse / scrub / delete only")
+    print("  quit       : Ctrl+C in this terminal, or Q on the page")
+    print("=" * 60)
+
+    server = start_collect_web_ui(web_state, web_cmds, host=web_host, port=int(web_port))
+    print(f"Open viewer: http://127.0.0.1:{web_port}/")
+
+    try:
+        while True:
+            for cmd in web_cmds.drain():
+                action = cmd.get("action")
+                if action == "quit":
+                    print("Quit viewer.")
+                    return
+                if action == "delete_cancel":
+                    web_state.update(delete_pending=None, message="delete cancelled")
+                    continue
+                if action == "delete_request":
+                    eid = cmd.get("episode_id")
+                    n = int(env.replay_buffer.n_episodes)
+                    if eid is None or int(eid) < 0 or int(eid) >= n:
+                        web_state.update(message=f"invalid episode_id {eid}")
+                    else:
+                        web_state.update(
+                            delete_pending=int(eid),
+                            message=f"confirm delete ep {eid}",
+                        )
+                    continue
+                if action == "delete_confirm":
+                    eid = cmd.get("episode_id", web_state.delete_pending)
+                    if eid is not None:
+                        ok = delete_saved_episode(env, int(eid))
+                        web_state.update(
+                            delete_pending=None,
+                            n_episodes=int(env.replay_buffer.n_episodes),
+                            message=(
+                                f"deleted ep {eid}"
+                                if ok
+                                else f"delete ep {eid} failed"
+                            ),
+                        )
+                    continue
+                if action in ("drag_toggle", "start", "save", "drop"):
+                    web_state.update(
+                        message="viewer_only: collect controls disabled"
+                    )
+            web_state.update(
+                mode="VIEW",
+                viewer_only=True,
+                n_episodes=int(env.replay_buffer.n_episodes),
+            )
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\nInterrupted — closing viewer.")
+    finally:
+        server.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +1194,37 @@ def parse_episode_id(text: str) -> int | None:
     show_default=True,
     help="按 Q 退出时缓动回 home 的时长（秒）",
 )
+@click.option(
+    "--web",
+    is_flag=True,
+    default=False,
+    help="启动网页采数面板（实时预览 + LeRobot 风格 episode 回看）",
+)
+@click.option(
+    "--web_host",
+    default="0.0.0.0",
+    show_default=True,
+    help="网页绑定地址",
+)
+@click.option(
+    "--web_port",
+    default=8080,
+    type=int,
+    show_default=True,
+    help="网页端口",
+)
+@click.option(
+    "--no_cv",
+    is_flag=True,
+    default=False,
+    help="不弹 OpenCV 窗口（--web 时默认开启）",
+)
+@click.option(
+    "--viewer_only",
+    is_flag=True,
+    default=False,
+    help="只管理已有数据（网页回看/删除），不启机械臂与相机；隐含 --web",
+)
 def main(
     output,
     robot_ip,
@@ -986,8 +1252,26 @@ def main(
     init_duration,
     no_zero_force,
     quit_home_duration,
+    web,
+    web_host,
+    web_port,
+    no_cv,
+    viewer_only,
 ):
+    if viewer_only:
+        run_viewer_only(
+            output=output,
+            web_host=web_host,
+            web_port=int(web_port),
+        )
+        return
+
     from peripherals.keystroke_counter import KeystrokeCounter
+
+    # --web 时默认不弹 OpenCV（无显示器 / SSH 更稳）；显式不加 --no_cv 且未 --web 则仍 imshow
+    if web and not no_cv:
+        # click 无法区分“用户显式传了 --no_cv=False”；约定：开 web 默认关 cv
+        no_cv = True
 
     os.makedirs(output, exist_ok=True)
     dt = 1.0 / frequency
@@ -1038,7 +1322,23 @@ def main(
         "  P=toggle zero-force (again -> init)  "
         "C=start  S=save  D=drop  E=del  I=pose  Q=home+quit"
     )
+    if web:
+        print(f"  web        : http://{web_host}:{web_port}/  (no_cv={no_cv})")
     print("=" * 60)
+
+    web_state = None
+    web_cmds = None
+    web_server = None
+    if web:
+        from modules.collect_web_ui import (
+            CommandQueue,
+            SharedCollectState,
+            start_collect_web_ui,
+        )
+
+        web_state = SharedCollectState()
+        web_cmds = CommandQueue()
+        web_state.update(frequency=float(frequency), no_zero_force=bool(no_zero_force))
 
     key_ctx = (
         contextlib.nullcontext(None) if terminal_keys else KeystrokeCounter()
@@ -1073,6 +1373,17 @@ def main(
                 time.sleep(0.1)
             check_episode_alignment(env)
             print("Env ready.")
+
+            if web and web_state is not None and web_cmds is not None:
+                web_state.env = env
+                web_state.output_dir = Path(output)
+                web_server = start_collect_web_ui(
+                    web_state, web_cmds, host=web_host, port=int(web_port)
+                )
+                print(
+                    f"Open collect UI: http://127.0.0.1:{web_port}/ "
+                    f"(or host IP if remote)"
+                )
 
             # 与 fast_wam 对齐的启动微调；结果记为 init_pose6 / home（Q 退出回此处）
             init_pose6: np.ndarray | None = None
@@ -1127,10 +1438,101 @@ def main(
             if no_zero_force:
                 print("Direct record mode: press C to start (P optional for drag).")
 
+            def handle_idle_web_cmds() -> tuple[bool, bool]:
+                """Returns (start_episode, should_quit)."""
+                nonlocal zero_force_active, delete_mode, delete_buf, delete_target
+                nonlocal pose_print_enabled, last_pose_print_t
+                if web_cmds is None:
+                    return False, False
+                start = False
+                for cmd in web_cmds.drain():
+                    action = cmd.get("action")
+                    if action == "quit":
+                        return False, True
+                    if action == "delete_cancel":
+                        print("Delete cancelled.")
+                        delete_mode = None
+                        delete_buf = ""
+                        delete_target = None
+                        continue
+                    if action == "delete_confirm":
+                        tid = cmd.get("episode_id", delete_target)
+                        if tid is not None:
+                            delete_saved_episode(env, int(tid))
+                        delete_mode = None
+                        delete_buf = ""
+                        delete_target = None
+                        continue
+                    if action == "delete_request":
+                        n_saved = env.replay_buffer.n_episodes
+                        eid = cmd.get("episode_id")
+                        if eid is None:
+                            print("delete_request missing episode_id")
+                        else:
+                            eid = int(eid)
+                            if 0 <= eid < n_saved:
+                                delete_target = eid
+                                delete_mode = "confirm"
+                                print(
+                                    f"Confirm delete saved episode {eid}? "
+                                    "(web Yes / keyboard Y)"
+                                )
+                            else:
+                                print(f"Episode {eid} does not exist.")
+                        continue
+                    if delete_mode == "confirm" and action not in (
+                        "delete_confirm",
+                        "delete_cancel",
+                    ):
+                        continue
+                    if action == "drag_toggle":
+                        if not zero_force_active:
+                            env.set_gravity_compensation()
+                            zero_force_active = True
+                            print(
+                                "Drag mode ON (gravity if supported, else damping). "
+                                "Drag freely."
+                            )
+                        else:
+                            leave_zero_force_to_init(
+                                env,
+                                init_pose6,
+                                frequency=frequency,
+                                duration=init_duration,
+                                init_gripper=gripper_target,
+                            )
+                            zero_force_active = False
+                    elif action == "start":
+                        if zero_force_active or no_zero_force:
+                            start = True
+                        else:
+                            print("Press P / Drag first to enter zero-force mode.")
+                    elif action == "save":
+                        print("Not recording — nothing to save.")
+                    elif action == "drop":
+                        print("No active episode to drop.")
+                return start, False
+
             while True:
                 # ---------- idle: optional P -> zero-force, then C -> start ----------
                 start_episode = False
                 while True:
+                    web_start, web_quit = handle_idle_web_cmds()
+                    if web_quit:
+                        print("Quit.")
+                        go_home_before_quit(
+                            env,
+                            home_targets,
+                            frequency=frequency,
+                            duration=quit_home_duration,
+                            zero_force_active=zero_force_active,
+                        )
+                        if web_server is not None:
+                            web_server.stop()
+                        return
+                    if web_start:
+                        start_episode = True
+
                     for key_stroke in drain_keys(key_source):
                         if key_stroke == KeyCode(char="q"):
                             print("Quit.")
@@ -1141,6 +1543,8 @@ def main(
                                 duration=quit_home_duration,
                                 zero_force_active=zero_force_active,
                             )
+                            if web_server is not None:
+                                web_server.stop()
                             return
 
                         if delete_mode == "confirm":
@@ -1268,8 +1672,24 @@ def main(
                             delete_prompt=delete_prompt,
                             n_robots=n_robots,
                         )
-                        cv2.imshow("drag_collect_zmq", vis[..., ::-1])
-                        cv2.pollKey()
+                        if not no_cv:
+                            cv2.imshow("drag_collect_zmq", vis[..., ::-1])
+                            cv2.pollKey()
+                        publish_web_frame(
+                            web_state,
+                            env=env,
+                            vis_rgb=vis,
+                            clean_rgb=camera_strip_from_obs(obs),
+                            recording=False,
+                            zero_force_active=zero_force_active,
+                            no_zero_force=no_zero_force,
+                            delete_mode=delete_mode,
+                            delete_target=delete_target,
+                            n_steps=0,
+                            t_elapsed=0.0,
+                            episode_id=None,
+                            frequency=frequency,
+                        )
                     except Exception:
                         pass
                     time.sleep(0.05)
@@ -1279,6 +1699,8 @@ def main(
                 start_delay = 0.5
                 eval_t_start = time.time() + start_delay
                 print(f"\n>>> Episode {episode_id} START")
+                if web_state is not None:
+                    web_state.clear_live_series()
                 env.start_episode(eval_t_start)
                 if not save_images:
                     env.image_accumulator = None
@@ -1296,6 +1718,36 @@ def main(
                         now = time.monotonic()
                         t_elapsed = now - loop_t0
                         t_cycle_end = last_tick + dt
+
+                        if web_cmds is not None:
+                            for cmd in web_cmds.drain():
+                                action = cmd.get("action")
+                                if action == "save":
+                                    stop_save = True
+                                elif action == "drop":
+                                    stop_drop = True
+                                elif action == "quit":
+                                    print(
+                                        "Quit requested — abort current episode, "
+                                        "then go home."
+                                    )
+                                    abort_episode(env)
+                                    go_home_before_quit(
+                                        env,
+                                        home_targets,
+                                        frequency=frequency,
+                                        duration=quit_home_duration,
+                                        zero_force_active=zero_force_active,
+                                    )
+                                    if web_server is not None:
+                                        web_server.stop()
+                                    return
+                                elif action in ("start", "drag_toggle"):
+                                    print("Still recording — save/drop first.")
+                                elif action and action.startswith("delete"):
+                                    print(
+                                        "Still recording — save/drop first, then delete."
+                                    )
 
                         for key_stroke in drain_keys(key_source):
                             if key_stroke == KeyCode(char="s"):
@@ -1322,6 +1774,8 @@ def main(
                                     duration=quit_home_duration,
                                     zero_force_active=zero_force_active,
                                 )
+                                if web_server is not None:
+                                    web_server.stop()
                                 return
 
                         obs = env.get_obs()
@@ -1331,6 +1785,9 @@ def main(
                                 last_pose_print_t = now
                         record_pose_action(env, obs)
                         n_steps += 1
+                        append_live_from_obs(
+                            web_state, obs, step=n_steps, t_elapsed=t_elapsed
+                        )
 
                         vis = make_vis_image(
                             obs,
@@ -1342,8 +1799,24 @@ def main(
                             recording=True,
                             n_robots=n_robots,
                         )
-                        cv2.imshow("drag_collect_zmq", vis[..., ::-1])
-                        cv2.pollKey()
+                        if not no_cv:
+                            cv2.imshow("drag_collect_zmq", vis[..., ::-1])
+                            cv2.pollKey()
+                        publish_web_frame(
+                            web_state,
+                            env=env,
+                            vis_rgb=vis,
+                            clean_rgb=camera_strip_from_obs(obs),
+                            recording=True,
+                            zero_force_active=zero_force_active,
+                            no_zero_force=no_zero_force,
+                            delete_mode=None,
+                            delete_target=None,
+                            n_steps=n_steps,
+                            t_elapsed=t_elapsed,
+                            episode_id=episode_id,
+                            frequency=frequency,
+                        )
 
                         if t_elapsed > max_duration:
                             print(f"Max duration {max_duration}s reached — auto save.")
@@ -1351,6 +1824,8 @@ def main(
 
                         if stop_drop:
                             abort_episode(env)
+                            if web_state is not None:
+                                web_state.clear_live_series()
                             # 丢弃后仍保持零力，可直接再按 C 录下一条
                             break
 

@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ARX5 ZMQ Collect</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --border: #2d3a4d;
+      --text: #e7ecf3;
+      --muted: #8b9bb4;
+      --accent: #3d9cf0;
+      --ok: #3ecf8e;
+      --warn: #f0b429;
+      --danger: #f07178;
+      --rec: #ff5c5c;
+      --ui-font: 16px;
+    }
+    * { box-sizing: border-box; }
+    html { font-size: var(--ui-font); }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      font-size: 1rem;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    header .left { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+    header .right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    header h1 {
+      margin: 0;
+      font-size: 1.15rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    header .hint { color: var(--muted); font-size: 0.85rem; }
+    .font-btns {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 2px;
+      background: #121820;
+    }
+    .font-btns button {
+      padding: 4px 10px;
+      font-size: 0.85rem;
+      min-width: 2rem;
+      border: none;
+      background: transparent;
+    }
+    .font-btns button:hover:not(:disabled) { background: #243044; }
+    .font-btns #fontLabel {
+      color: var(--muted);
+      font-size: 0.8rem;
+      font-variant-numeric: tabular-nums;
+      padding: 0 6px;
+      min-width: 2.8rem;
+      text-align: center;
+    }
+    .wrap { padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+    .row { display: grid; gap: 16px; }
+    .row.top { grid-template-columns: 1.4fr 1fr; }
+    @media (max-width: 960px) {
+      .row.top { grid-template-columns: 1fr; }
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+    }
+    .panel h2 {
+      margin: 0 0 10px;
+      font-size: 0.85rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .live-img {
+      width: 100%;
+      max-height: 360px;
+      object-fit: contain;
+      background: #000;
+      border-radius: 6px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: #243044;
+      color: var(--accent);
+    }
+    .badge.DRAG { color: var(--warn); }
+    .badge.REC { color: var(--rec); background: #3a1f24; }
+    .badge.READY { color: var(--ok); }
+    .chan-btns { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 4px; }
+    .chan-btns button {
+      padding: 5px 12px;
+      font-size: 0.8rem;
+      border-radius: 999px;
+      background: #1a2332;
+    }
+    .chan-btns button.active {
+      background: #1e4d7a;
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin: 12px 0;
+      font-size: 0.9rem;
+    }
+    .stats dt { color: var(--muted); font-size: 0.75rem; }
+    .stats dd { margin: 0; font-variant-numeric: tabular-nums; }
+    .pose {
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: 0.78rem;
+      line-height: 1.5;
+      color: #c5d0e0;
+      background: #121820;
+      padding: 8px 10px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+    }
+    .btns { display: flex; flex-wrap: wrap; gap: 8px; }
+    button {
+      border: 1px solid var(--border);
+      background: #243044;
+      color: var(--text);
+      padding: 8px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.85rem;
+    }
+    button:hover:not(:disabled) { border-color: var(--accent); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.primary { background: #1e4d7a; border-color: var(--accent); }
+    button.danger { background: #4a2228; border-color: var(--danger); }
+    button.ok { background: #1a3d30; border-color: var(--ok); }
+    .msg { margin-top: 10px; color: var(--muted); font-size: 0.8rem; min-height: 1.2em; }
+
+    .viewer {
+      display: grid;
+      grid-template-columns: 200px 1fr;
+      gap: 16px;
+    }
+    @media (max-width: 960px) {
+      .viewer { grid-template-columns: 1fr; }
+    }
+    .ep-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      max-height: 420px;
+      overflow: auto;
+    }
+    .ep-list li {
+      padding: 8px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      border: 1px solid transparent;
+      font-size: 0.85rem;
+    }
+    .ep-list li:hover { background: #243044; }
+    .ep-list li.active {
+      border-color: var(--accent);
+      background: #1e2a3c;
+    }
+    .ep-list .meta { color: var(--muted); font-size: 0.75rem; }
+    .viewer-main { display: flex; flex-direction: column; gap: 10px; }
+    .frame-row {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+    @media (max-width: 960px) {
+      .frame-row { grid-template-columns: 1fr; }
+    }
+    #epFrame {
+      width: 100%;
+      max-height: 240px;
+      object-fit: contain;
+      background: #000;
+      border-radius: 6px;
+    }
+    .scrub {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .scrub input[type=range] { flex: 1; min-width: 160px; }
+    #chart { width: 100%; height: 360px; background: #121820; border-radius: 6px; }
+    .modal-bg {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.55);
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+    }
+    .modal-bg.show { display: flex; }
+    .modal {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+      max-width: 360px;
+      width: 90%;
+    }
+    .modal h3 { margin: 0 0 10px; }
+    .modal p { color: var(--muted); font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="left">
+      <h1>ARX5 ZMQ Collect</h1>
+      <div class="hint" id="headerHint">网页快捷键: P/C/S/D/Q · 仅可信局域网</div>
+    </div>
+    <div class="right">
+      <div class="font-btns" title="调节界面字体">
+        <button type="button" id="fontDown" aria-label="减小字体">A−</button>
+        <span id="fontLabel">100%</span>
+        <button type="button" id="fontUp" aria-label="增大字体">A+</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <div class="row top" id="collectRow">
+      <div class="panel">
+        <h2>Live preview</h2>
+        <img id="liveCam" class="live-img" alt="live" src="/api/video" />
+      </div>
+      <div class="panel">
+        <h2>Control</h2>
+        <div>
+          <span id="modeBadge" class="badge">IDLE</span>
+          <span style="margin-left:8px;color:var(--muted);font-size:0.85rem">
+            saved: <strong id="nEpisodes">0</strong>
+          </span>
+        </div>
+        <dl class="stats">
+          <div><dt>Steps</dt><dd id="nSteps">0</dd></div>
+          <div><dt>Elapsed</dt><dd id="tElapsed">0.0s</dd></div>
+          <div><dt>Episode</dt><dd id="curEp">—</dd></div>
+          <div><dt>Live pts</dt><dd id="liveN">0</dd></div>
+        </dl>
+        <div class="pose" id="poseBox">pos — · rot — · grip —</div>
+        <div class="btns" id="collectBtns">
+          <button id="btnDrag" class="primary">P · Drag</button>
+          <button id="btnStart" class="ok">C · Start</button>
+          <button id="btnSave">S · Save</button>
+          <button id="btnDrop">D · Drop</button>
+          <button id="btnQuit" class="danger">Q · Home+Quit</button>
+        </div>
+        <div class="msg" id="msg"></div>
+      </div>
+    </div>
+
+    <div class="panel" id="viewerOnlyBar" style="display:none">
+      <h2>Viewer only</h2>
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <span id="modeBadgeView" class="badge READY">VIEW</span>
+        <span style="color:var(--muted);font-size:0.85rem">
+          saved: <strong id="nEpisodesView">0</strong> · no robot / camera
+        </span>
+        <button id="btnQuitView" class="danger">Q · Quit</button>
+        <div class="msg" id="msgView"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Episode viewer (LeRobot-style)</h2>
+      <div class="viewer">
+        <div>
+          <ul class="ep-list" id="epList"></ul>
+          <div class="btns" style="margin-top:8px">
+            <button id="btnRefresh">Refresh</button>
+            <button id="btnDelete" class="danger" disabled>Delete</button>
+            <button id="btnLiveView">Follow LIVE</button>
+          </div>
+        </div>
+        <div class="viewer-main">
+          <div class="frame-row">
+            <img id="epFrame" alt="episode frame" />
+            <div>
+              <div class="scrub">
+                <button id="btnPlay">Play</button>
+                <input id="scrub" type="range" min="0" max="0" value="0" />
+                <span id="scrubLabel" style="font-variant-numeric:tabular-nums;font-size:0.85rem;color:var(--muted)">0 / 0</span>
+              </div>
+              <div class="msg" id="viewerMsg">Select an episode or Follow LIVE while recording.</div>
+              <div class="chan-btns" id="chanBtns">
+                <button type="button" data-chan="all" class="active">All</button>
+                <button type="button" data-chan="pos" title="TCP position xyz (m)">pos</button>
+                <button type="button" data-chan="gripper" title="Gripper opening width (m)">gripper</button>
+                <button type="button" data-chan="rot" title="TCP orientation as axis-angle / rotvec (rad)">rot (axis-angle)</button>
+                <button type="button" data-chan="action" title="Action: xyz + rotvec + gripper">action</button>
+              </div>
+              <div class="msg" id="chanHint" style="margin-top:2px">
+                rot = TCP 姿态的 axis-angle（旋转向量，单位 rad；方向=转轴，模长=转角）·
+                左键拖动移动黄线 · 滚轮缩放曲线 · 双击复位
+              </div>
+            </div>
+          </div>
+          <div id="chart"></div>
+          <div id="cursorReadout" class="pose" style="margin-top:8px;min-height:2.6em">
+            黄线当前位置：拖动曲线或 scrub 后显示数值
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-bg" id="delModal">
+    <div class="modal">
+      <h3>Delete episode?</h3>
+      <p id="delText">Delete episode N? This cannot be undone.</p>
+      <div class="btns">
+        <button id="delYes" class="danger">Yes, delete</button>
+        <button id="delNo">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let status = {};
+    let selectedEp = null; // number | 'live' | null
+    let series = null;
+    let playing = false;
+    let playTimer = null;
+    let lastLiveFetch = 0;
+    let viewerOnly = false;
+    let chartChannel = "all"; // all | pos | gripper | rot | action
+    let chartTitle = "";
+    let chartFrameIdx = 0;
+    const FONT_MIN = 14;
+    const FONT_MAX = 24;
+    const FONT_STEP = 2;
+    let uiFontPx = 16;
+
+    function applyFontSize(px, { replot = true } = {}) {
+      uiFontPx = Math.max(FONT_MIN, Math.min(FONT_MAX, px));
+      document.documentElement.style.setProperty("--ui-font", uiFontPx + "px");
+      $("fontLabel").textContent = Math.round((uiFontPx / 16) * 100) + "%";
+      $("fontDown").disabled = uiFontPx <= FONT_MIN;
+      $("fontUp").disabled = uiFontPx >= FONT_MAX;
+      try { localStorage.setItem("collect_ui_font_px", String(uiFontPx)); } catch (_) {}
+      if (replot && series) plotSeries(series, chartTitle, chartFrameIdx);
+    }
+
+    function chartFontSize() {
+      // Plotly 用 px；随 UI 字体略放大
+      return Math.round(11 * (uiFontPx / 16));
+    }
+
+    async function postCmd(action, extra = {}) {
+      const r = await fetch("/api/cmd", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, ...extra }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || r.statusText);
+      return j;
+    }
+
+    function setMsg(t) {
+      $("msg").textContent = t || "";
+      if ($("msgView")) $("msgView").textContent = t || "";
+    }
+
+    function applyViewerOnly(flag) {
+      viewerOnly = !!flag;
+      $("collectRow").style.display = viewerOnly ? "none" : "";
+      $("viewerOnlyBar").style.display = viewerOnly ? "" : "none";
+      $("btnLiveView").style.display = viewerOnly ? "none" : "";
+      $("headerHint").textContent = viewerOnly
+        ? "Viewer only · Q quit · 仅可信局域网"
+        : "网页快捷键: P/C/S/D/Q · 仅可信局域网";
+      document.title = viewerOnly ? "ARX5 Dataset Viewer" : "ARX5 ZMQ Collect";
+    }
+
+    function updateControls(s) {
+      if (s.viewer_only) applyViewerOnly(true);
+      const mode = s.mode || "IDLE";
+      const badge = $("modeBadge");
+      badge.textContent = mode;
+      badge.className = "badge " + mode;
+      $("nEpisodes").textContent = s.n_episodes ?? 0;
+      if ($("nEpisodesView")) $("nEpisodesView").textContent = s.n_episodes ?? 0;
+      $("nSteps").textContent = s.n_steps ?? 0;
+      $("tElapsed").textContent = (s.t_elapsed ?? 0).toFixed(1) + "s";
+      $("curEp").textContent = s.recording ? (s.episode_id ?? "—") : "—";
+      $("liveN").textContent = s.live_n ?? 0;
+      const pos = s.pos || [0,0,0];
+      const rot = s.rotvec || [0,0,0];
+      $("poseBox").textContent =
+        `pos [${pos.map(v => v.toFixed(3)).join(", ")}]  ` +
+        `rot [${rot.map(v => v.toFixed(3)).join(", ")}]  ` +
+        `grip ${(s.grip ?? 0).toFixed(4)}`;
+      if (s.message) setMsg(s.message);
+
+      if (viewerOnly) {
+        $("btnDelete").disabled = selectedEp === null || selectedEp === "live";
+        return;
+      }
+
+      const rec = !!s.recording;
+      const drag = !!s.zero_force_active;
+      $("btnDrag").textContent = drag ? "P · Exit drag" : "P · Drag";
+      $("btnStart").disabled = rec || !(drag || s.no_zero_force);
+      $("btnSave").disabled = !rec;
+      $("btnDrop").disabled = !rec;
+      $("btnDelete").disabled = selectedEp === null || selectedEp === "live";
+    }
+
+    function renderEpList(episodes) {
+      const ul = $("epList");
+      const keep = selectedEp;
+      ul.innerHTML = "";
+      (episodes || []).slice().reverse().forEach((ep) => {
+        const li = document.createElement("li");
+        li.dataset.id = String(ep.id);
+        if (keep === ep.id) li.classList.add("active");
+        const dur = ep.duration != null ? `${ep.duration.toFixed(1)}s` : "?s";
+        li.innerHTML = `<strong>Ep ${ep.id}</strong><div class="meta">${ep.n_steps} steps · ${dur}${ep.has_video ? " · video" : ""}</div>`;
+        li.onclick = () => selectEpisode(ep.id);
+        ul.appendChild(li);
+      });
+    }
+
+    function plotSeries(data, title, frameIdx) {
+      series = data;
+      if (title != null) chartTitle = title;
+      if (frameIdx != null) chartFrameIdx = frameIdx;
+      title = chartTitle;
+      frameIdx = chartFrameIdx;
+
+      const n = (data.steps && data.steps.length) || (data.t && data.t.length) || 0;
+      const x = data.steps && data.steps.length ? data.steps : Array.from({length: n}, (_, i) => i);
+      const xyz = data.xyz || [];
+      const rot = data.rot || [];
+      const grip = data.grip || [];
+      const action = data.action || [];
+      const chan = chartChannel;
+
+      const axisCommon = { gridcolor: "#2d3a4d", zeroline: false, color: "#8b9bb4" };
+      let traces = [];
+      let layout;
+
+      if (chan === "all") {
+        traces = [
+          { x, y: xyz.map(p => p[0]), name: "pos_x", xaxis: "x", yaxis: "y", line: { width: 1.5 } },
+          { x, y: xyz.map(p => p[1]), name: "pos_y", xaxis: "x", yaxis: "y", line: { width: 1.5 } },
+          { x, y: xyz.map(p => p[2]), name: "pos_z", xaxis: "x", yaxis: "y", line: { width: 1.5 } },
+          { x, y: grip, name: "grip", xaxis: "x2", yaxis: "y2", line: { width: 1.5 } },
+          { x, y: rot.map(p => p[0]), name: "rotvec_x", xaxis: "x3", yaxis: "y3", line: { width: 1.5 } },
+          { x, y: rot.map(p => p[1]), name: "rotvec_y", xaxis: "x3", yaxis: "y3", line: { width: 1.5 } },
+          { x, y: rot.map(p => p[2]), name: "rotvec_z", xaxis: "x3", yaxis: "y3", line: { width: 1.5 } },
+        ];
+        if (action.length && action[0] != null) {
+          traces.push(
+            { x, y: action.map(a => (a && a[0]) || 0), name: "act_x", xaxis: "x4", yaxis: "y4", line: { width: 1.5 } },
+            { x, y: action.map(a => (a && a[1]) || 0), name: "act_y", xaxis: "x4", yaxis: "y4", line: { width: 1.5 } },
+            { x, y: action.map(a => (a && a[2]) || 0), name: "act_z", xaxis: "x4", yaxis: "y4", line: { width: 1.5 } },
+          );
+        }
+        const shapes = [];
+        const annotations = [];
+        if (frameIdx != null && n > 0) {
+          const xi = frameIdx;
+          for (const xref of ["x", "x2", "x3", "x4"]) {
+            shapes.push({
+              type: "line", xref, yref: "paper",
+              x0: xi, x1: xi, y0: 0, y1: 1,
+              line: { color: "#f0b429", width: 1, dash: "dot" },
+            });
+          }
+          annotations.push(...cursorAnnotations(xi));
+        }
+        layout = {
+          title: { text: title, font: { size: chartFontSize() + 2, color: "#8b9bb4" } },
+          paper_bgcolor: "#121820",
+          plot_bgcolor: "#121820",
+          font: { color: "#c5d0e0", size: chartFontSize() },
+          margin: { t: 48, r: 24, b: 36, l: 64 },
+          height: 380,
+          showlegend: true,
+          legend: { orientation: "h", y: 1.15 },
+          shapes,
+          annotations,
+          xaxis:  { ...axisCommon, domain: [0, 1], anchor: "y" },
+          xaxis2: { ...axisCommon, domain: [0, 1], anchor: "y2", matches: "x" },
+          xaxis3: { ...axisCommon, domain: [0, 1], anchor: "y3", matches: "x" },
+          xaxis4: { ...axisCommon, domain: [0, 1], anchor: "y4", matches: "x", title: "step" },
+          yaxis:  { ...axisCommon, domain: [0.78, 1.00], title: { text: "pos", standoff: 8 }, automargin: true },
+          yaxis2: { ...axisCommon, domain: [0.54, 0.74], title: { text: "grip", standoff: 8 }, automargin: true, tickformat: ".3f" },
+          yaxis3: { ...axisCommon, domain: [0.30, 0.50], title: { text: "rot", standoff: 8 }, automargin: true },
+          yaxis4: { ...axisCommon, domain: [0.00, 0.26], title: { text: "act", standoff: 8 }, automargin: true },
+          dragmode: false,
+        };
+      } else {
+        // 单独通道：一张大图
+        if (chan === "pos") {
+          traces = [
+            { x, y: xyz.map(p => p[0]), name: "pos_x", mode: "lines", line: { width: 2 } },
+            { x, y: xyz.map(p => p[1]), name: "pos_y", mode: "lines", line: { width: 2 } },
+            { x, y: xyz.map(p => p[2]), name: "pos_z", mode: "lines", line: { width: 2 } },
+          ];
+        } else if (chan === "gripper") {
+          traces = [
+            { x, y: grip, name: "gripper_width", mode: "lines", line: { width: 2, color: "#3ecf8e" } },
+          ];
+        } else if (chan === "rot") {
+          traces = [
+            { x, y: rot.map(p => p[0]), name: "rotvec_x", mode: "lines", line: { width: 2 } },
+            { x, y: rot.map(p => p[1]), name: "rotvec_y", mode: "lines", line: { width: 2 } },
+            { x, y: rot.map(p => p[2]), name: "rotvec_z", mode: "lines", line: { width: 2 } },
+          ];
+        } else if (chan === "action") {
+          const hasAct = action.length && action[0] != null;
+          const dim = hasAct ? Math.min(7, action[0].length || 7) : 0;
+          const names = ["act_x","act_y","act_z","act_rx","act_ry","act_rz","act_grip"];
+          for (let d = 0; d < dim; d++) {
+            traces.push({
+              x,
+              y: action.map(a => (a && a[d]) || 0),
+              name: names[d] || `act_${d}`,
+              mode: "lines",
+              line: { width: 2 },
+            });
+          }
+          if (!traces.length) {
+            traces = [{ x: [0], y: [0], name: "no action", mode: "lines" }];
+          }
+        }
+        const shapes = [];
+        const annotations = [];
+        if (frameIdx != null && n > 0) {
+          shapes.push({
+            type: "line", xref: "x", yref: "paper",
+            x0: frameIdx, x1: frameIdx, y0: 0, y1: 1,
+            line: { color: "#f0b429", width: 1.5, dash: "dot" },
+          });
+          annotations.push(...cursorAnnotations(frameIdx));
+        }
+        const yTitle = {
+          pos: "pos (m)",
+          gripper: "m",
+          rot: "rad",
+          action: "action",
+        }[chan] || chan;
+        const titleExtra = {
+          pos: "TCP xyz",
+          gripper: "gripper width (m)",
+          rot: "axis-angle rotvec",
+          action: "xyz+rotvec+grip",
+        }[chan] || chan;
+        const yTickFormat = chan === "gripper" ? ".4f" : undefined;
+        layout = {
+          title: { text: `${title} · ${titleExtra}`, font: { size: chartFontSize() + 2, color: "#8b9bb4" } },
+          paper_bgcolor: "#121820",
+          plot_bgcolor: "#121820",
+          font: { color: "#c5d0e0", size: chartFontSize() },
+          margin: { t: 48, r: 24, b: 40, l: chan === "gripper" ? 92 : 68 },
+          height: 320,
+          showlegend: true,
+          legend: { orientation: "h", y: 1.12 },
+          shapes,
+          annotations,
+          xaxis: { ...axisCommon, title: "step", automargin: true },
+          yaxis: {
+            ...axisCommon,
+            title: { text: yTitle, standoff: 16 },
+            automargin: true,
+            tickformat: yTickFormat,
+          },
+          dragmode: false,
+        };
+      }
+
+      Plotly.react("chart", traces, layout, {
+        responsive: true,
+        displayModeBar: false,
+        scrollZoom: true,
+        doubleClick: "reset",
+      });
+      bindChartScrub();
+
+      const maxIdx = Math.max((data.n_steps || n) - 1, 0);
+      $("scrub").max = String(Math.max((data.n_steps || n) - 1, 0));
+      if (Number($("scrub").value) > Number($("scrub").max)) $("scrub").value = "0";
+      updateScrubLabel();
+      updateCursorReadout(chartFrameIdx);
+    }
+
+    function setChartChannel(chan) {
+      chartChannel = chan;
+      document.querySelectorAll("#chanBtns button").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.chan === chan);
+      });
+      if (series) plotSeries(series, chartTitle, chartFrameIdx);
+    }
+
+    function updateScrubLabel() {
+      const v = Number($("scrub").value);
+      const max = Number($("scrub").max);
+      $("scrubLabel").textContent = `${v} / ${max}`;
+    }
+
+    let chartDragging = false;
+    let lastDragStep = -1;
+    let frameLoadTimer = null;
+
+    function stepFromClientX(clientX) {
+      const gd = $("chart");
+      if (!gd || !gd._fullLayout || !gd._fullLayout._size) return null;
+      const layout = gd._fullLayout;
+      const size = layout._size;
+      const rect = gd.getBoundingClientRect();
+      const left = rect.left + size.l;
+      const width = size.w || 1;
+      let frac = (clientX - left) / width;
+      frac = Math.max(0, Math.min(1, frac));
+      const xa = layout.xaxis;
+      const x0 = xa.range[0];
+      const x1 = xa.range[1];
+      const x = x0 + frac * (x1 - x0);
+      const max = Number($("scrub").max) || 0;
+      return Math.max(0, Math.min(max, Math.round(x)));
+    }
+
+    function cursorShapes(step) {
+      const line = { color: "#f0b429", width: chartDragging ? 2.5 : 1.5, dash: "dot" };
+      if (chartChannel === "all") {
+        return ["x", "x2", "x3", "x4"].map((xref) => ({
+          type: "line",
+          xref,
+          yref: "paper",
+          x0: step,
+          x1: step,
+          y0: 0,
+          y1: 1,
+          line,
+        }));
+      }
+      return [
+        {
+          type: "line",
+          xref: "x",
+          yref: "paper",
+          x0: step,
+          x1: step,
+          y0: 0,
+          y1: 1,
+          line,
+        },
+      ];
+    }
+
+    function sampleAtStep(step) {
+      if (!series) return null;
+      const n =
+        (series.steps && series.steps.length) ||
+        (series.t && series.t.length) ||
+        (series.xyz && series.xyz.length) ||
+        0;
+      if (n <= 0) return null;
+      const xs =
+        series.steps && series.steps.length
+          ? series.steps
+          : Array.from({ length: n }, (_, i) => i);
+      let best = 0;
+      let bestD = Infinity;
+      for (let i = 0; i < xs.length; i++) {
+        const d = Math.abs(xs[i] - step);
+        if (d < bestD) {
+          bestD = d;
+          best = i;
+        }
+      }
+      const xyz = (series.xyz && series.xyz[best]) || [0, 0, 0];
+      const rot = (series.rot && series.rot[best]) || [0, 0, 0];
+      const grip = series.grip ? series.grip[best] : 0;
+      const act = series.action ? series.action[best] : null;
+      return { i: best, step: xs[best], xyz, rot, grip, action: act };
+    }
+
+    function fmt3(v) {
+      return Number(v).toFixed(3);
+    }
+
+    function cursorValueLines(step) {
+      const s = sampleAtStep(step);
+      if (!s) return [`step ${step}`];
+      const lines = [`step ${s.step}`];
+      const chan = chartChannel;
+      if (chan === "all" || chan === "pos") {
+        lines.push(`pos [${s.xyz.map(fmt3).join(", ")}] m`);
+      }
+      if (chan === "all" || chan === "gripper") {
+        lines.push(`grip ${Number(s.grip).toFixed(4)} m`);
+      }
+      if (chan === "all" || chan === "rot") {
+        lines.push(`rotvec [${s.rot.map(fmt3).join(", ")}] rad`);
+      }
+      if ((chan === "all" || chan === "action") && s.action) {
+        const a = s.action;
+        lines.push(
+          `action xyz [${fmt3(a[0])}, ${fmt3(a[1])}, ${fmt3(a[2])}]` +
+            (a.length > 6 ? ` grip ${Number(a[6]).toFixed(4)}` : "")
+        );
+      }
+      return lines;
+    }
+
+    function cursorAnnotations(step) {
+      const lines = cursorValueLines(step);
+      // 图上黄线旁短标注（step + 主数值），完整值在下方 readout
+      const short =
+        chartChannel === "gripper"
+          ? lines.slice(0, 2).join("<br>")
+          : lines.slice(0, Math.min(3, lines.length)).join("<br>");
+      return [
+        {
+          x: step,
+          y: 1.0,
+          xref: chartChannel === "all" ? "x" : "x",
+          yref: "paper",
+          text: short,
+          showarrow: false,
+          xanchor: "left",
+          yanchor: "bottom",
+          xshift: 6,
+          yshift: 2,
+          align: "left",
+          bgcolor: "rgba(18,24,32,0.88)",
+          bordercolor: "#f0b429",
+          borderwidth: 1,
+          borderpad: 4,
+          font: {
+            color: "#f0b429",
+            size: Math.max(chartFontSize(), 11),
+            family: "IBM Plex Mono, ui-monospace, monospace",
+          },
+        },
+      ];
+    }
+
+    function updateCursorReadout(step) {
+      const el = $("cursorReadout");
+      if (!el) return;
+      const lines = cursorValueLines(step);
+      el.textContent = "黄线 · " + lines.join("  ·  ");
+    }
+
+    function updateCursorLine(step) {
+      const gd = $("chart");
+      updateCursorReadout(step);
+      if (!gd || !gd.data) {
+        if (series) plotSeries(series, chartTitle, step);
+        return;
+      }
+      Plotly.relayout(gd, {
+        shapes: cursorShapes(step),
+        annotations: cursorAnnotations(step),
+      });
+    }
+
+    function setScrubStep(step, { fromDrag = false } = {}) {
+      const max = Number($("scrub").max) || 0;
+      step = Math.max(0, Math.min(max, Math.round(step)));
+      if (fromDrag && step === lastDragStep) return;
+      lastDragStep = step;
+      $("scrub").value = String(step);
+      updateScrubLabel();
+      chartFrameIdx = step;
+      updateCursorLine(step);
+      clearTimeout(frameLoadTimer);
+      frameLoadTimer = setTimeout(() => {
+        loadFrame(step);
+      }, fromDrag ? 50 : 0);
+    }
+
+    function bindChartScrub() {
+      const gd = $("chart");
+      if (!gd || gd._scrubBound) return;
+      gd._scrubBound = true;
+      gd.style.cursor = "ew-resize";
+      gd.title = "在图上拖动可移动黄线 scrub";
+
+      const onMove = (ev) => {
+        if (!chartDragging) return;
+        const step = stepFromClientX(ev.clientX);
+        if (step != null) setScrubStep(step, { fromDrag: true });
+      };
+      const onUp = () => {
+        if (!chartDragging) return;
+        chartDragging = false;
+        updateCursorLine(Number($("scrub").value));
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+      };
+      gd.addEventListener("mousedown", (ev) => {
+        if (ev.button !== 0 || !series) return;
+        if (ev.target && ev.target.closest && ev.target.closest(".legend")) return;
+        stopPlay();
+        chartDragging = true;
+        lastDragStep = -1;
+        const step = stepFromClientX(ev.clientX);
+        if (step != null) setScrubStep(step, { fromDrag: true });
+        window.addEventListener("mousemove", onMove);
+        window.addEventListener("mouseup", onUp);
+        ev.preventDefault();
+      });
+    }
+
+    async function loadFrame(index) {
+      if (selectedEp === "live") {
+        $("epFrame").src = "/api/live/frame?t=" + Date.now();
+        return;
+      }
+      if (selectedEp == null) return;
+      $("epFrame").src = `/api/episodes/${selectedEp}/frame?index=${index}&t=${Date.now()}`;
+    }
+
+    async function selectEpisode(id) {
+      stopPlay();
+      selectedEp = id;
+      document.querySelectorAll(".ep-list li").forEach((li) => {
+        li.classList.toggle("active", Number(li.dataset.id) === id);
+      });
+      $("btnDelete").disabled = false;
+      $("viewerMsg").textContent = `Loading episode ${id}…`;
+      try {
+        const r = await fetch(`/api/episodes/${id}/series?max_points=2000`);
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || r.statusText);
+        plotSeries(data, `Episode ${id}`, 0);
+        $("scrub").value = "0";
+        await loadFrame(0);
+        $("viewerMsg").textContent = `Episode ${id} · ${data.n_steps} steps`;
+      } catch (e) {
+        $("viewerMsg").textContent = "Failed: " + e.message;
+      }
+    }
+
+    async function followLive() {
+      selectedEp = "live";
+      document.querySelectorAll(".ep-list li").forEach((li) => li.classList.remove("active"));
+      $("btnDelete").disabled = true;
+      $("viewerMsg").textContent = "Following LIVE recording…";
+      await refreshLiveSeries();
+    }
+
+    async function refreshLiveSeries() {
+      if (selectedEp !== "live") return;
+      try {
+        const r = await fetch("/api/live/series");
+        const data = await r.json();
+        const n = (data.t && data.t.length) || 0;
+        plotSeries(data, "LIVE", n > 0 ? n - 1 : 0);
+        if (n > 0) {
+          $("scrub").value = String(n - 1);
+          updateScrubLabel();
+        }
+        await loadFrame(n - 1);
+      } catch (e) {
+        $("viewerMsg").textContent = "Live: " + e.message;
+      }
+    }
+
+    function stopPlay() {
+      playing = false;
+      $("btnPlay").textContent = "Play";
+      if (playTimer) { clearInterval(playTimer); playTimer = null; }
+    }
+
+    function togglePlay() {
+      if (playing) { stopPlay(); return; }
+      if (selectedEp == null) return;
+      playing = true;
+      $("btnPlay").textContent = "Pause";
+      const fps = status.frequency || 30;
+      const dt = Math.max(1000 / fps, 30);
+      playTimer = setInterval(async () => {
+        let v = Number($("scrub").value);
+        const max = Number($("scrub").max);
+        if (v >= max) { stopPlay(); return; }
+        v += 1;
+        setScrubStep(v, { fromDrag: false });
+      }, dt);
+    }
+
+    async function onScrub() {
+      const v = Number($("scrub").value);
+      setScrubStep(v, { fromDrag: false });
+    }
+
+    $("btnDrag").onclick = () => postCmd("drag_toggle").then(() => setMsg("drag toggled")).catch(e => setMsg(e.message));
+    $("btnStart").onclick = () => postCmd("start").then(() => { setMsg("start"); followLive(); }).catch(e => setMsg(e.message));
+    $("btnSave").onclick = () => postCmd("save").then(() => setMsg("save")).catch(e => setMsg(e.message));
+    $("btnDrop").onclick = () => postCmd("drop").then(() => setMsg("drop")).catch(e => setMsg(e.message));
+    $("btnQuit").onclick = () => postCmd("quit").then(() => setMsg("quit…")).catch(e => setMsg(e.message));
+    if ($("btnQuitView")) {
+      $("btnQuitView").onclick = () => postCmd("quit").then(() => setMsg("quit…")).catch(e => setMsg(e.message));
+    }
+    $("btnRefresh").onclick = () => pollStatus(true);
+    $("btnLiveView").onclick = () => followLive();
+    $("btnPlay").onclick = () => togglePlay();
+    $("scrub").oninput = () => {
+      stopPlay();
+      onScrub();
+    };
+
+    document.querySelectorAll("#chanBtns button").forEach((btn) => {
+      btn.onclick = () => setChartChannel(btn.dataset.chan);
+    });
+
+    // 网页内快捷键（焦点在浏览器时生效；与终端 P/C/S/D/Q 一致）
+    window.addEventListener("keydown", (ev) => {
+      const tag = (ev.target && ev.target.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      const k = (ev.key || "").toLowerCase();
+      const modalOpen = $("delModal").classList.contains("show");
+
+      if (modalOpen) {
+        if (k === "y" || k === "enter") {
+          ev.preventDefault();
+          $("delYes").click();
+        } else if (k === "n" || k === "escape") {
+          ev.preventDefault();
+          $("delNo").click();
+        }
+        return;
+      }
+
+      if (k === "q") {
+        ev.preventDefault();
+        (viewerOnly ? $("btnQuitView") : $("btnQuit")).click();
+        return;
+      }
+      if (k === " " || k === "spacebar") {
+        if (selectedEp != null) {
+          ev.preventDefault();
+          togglePlay();
+        }
+        return;
+      }
+      if (viewerOnly) return;
+
+      if (k === "p") {
+        ev.preventDefault();
+        $("btnDrag").click();
+      } else if (k === "c") {
+        ev.preventDefault();
+        $("btnStart").click();
+      } else if (k === "s") {
+        ev.preventDefault();
+        $("btnSave").click();
+      } else if (k === "d" || k === "backspace") {
+        ev.preventDefault();
+        $("btnDrop").click();
+      }
+    });
+
+    $("btnDelete").onclick = () => {
+      if (selectedEp == null || selectedEp === "live") return;
+      $("delText").textContent = `Delete saved episode ${selectedEp}? Videos and zarr slice will be removed.`;
+      $("delModal").classList.add("show");
+    };
+    $("delNo").onclick = () => {
+      $("delModal").classList.remove("show");
+      postCmd("delete_cancel").catch(() => {});
+    };
+    $("delYes").onclick = async () => {
+      const id = selectedEp;
+      $("delModal").classList.remove("show");
+      try {
+        await postCmd("delete_request", { episode_id: id });
+        await postCmd("delete_confirm", { episode_id: id });
+        setMsg(`Deleted episode ${id}`);
+        selectedEp = null;
+        pollStatus(true);
+      } catch (e) {
+        setMsg(e.message);
+      }
+    };
+
+    async function pollStatus(forceList) {
+      try {
+        const r = await fetch("/api/status");
+        status = await r.json();
+        updateControls(status);
+        if (forceList || status.episodes) renderEpList(status.episodes || []);
+        if (status.delete_pending != null && !$("delModal").classList.contains("show")) {
+          // keyboard-side pending; show modal
+        }
+        if (selectedEp === "live" && status.recording) {
+          const now = Date.now();
+          if (now - lastLiveFetch > 500) {
+            lastLiveFetch = now;
+            refreshLiveSeries();
+          }
+        }
+      } catch (e) {
+        setMsg("status: " + e.message);
+      }
+    }
+
+    setInterval(() => pollStatus(false), 200);
+    pollStatus(true);
+
+    $("fontDown").onclick = () => applyFontSize(uiFontPx - FONT_STEP);
+    $("fontUp").onclick = () => applyFontSize(uiFontPx + FONT_STEP);
+    try {
+      const saved = parseInt(localStorage.getItem("collect_ui_font_px") || "16", 10);
+      applyFontSize(Number.isFinite(saved) ? saved : 16, { replot: false });
+    } catch (_) {
+      applyFontSize(16, { replot: false });
+    }
+  </script>
+</body>
+</html>
