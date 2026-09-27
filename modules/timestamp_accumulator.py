@@ -187,7 +187,12 @@ class TimestampActionAccumulator:
     def put(self, actions: np.ndarray, timestamps: np.ndarray):
         """
         Note: timestamps is the time when the action will be issued,
-        not when the action will be completed (target_timestamp)
+        not when the action will be completed (target_timestamp).
+
+        Still allows overwriting earlier slots (next_global_idx=None).
+        If camera/control loop skips dt bins, forward-fill those holes with
+        the last known action (or the first new sample for a leading gap)
+        so pose-as-action demos do not keep zero spikes.
         """
 
         local_idxs, global_idxs, _ = get_accumulate_timestamp_idxs(
@@ -212,6 +217,24 @@ class TimestampActionAccumulator:
                 new_shape = (new_size,) + self.action_buffer.shape[1:]
                 self.action_buffer = np.resize(self.action_buffer, new_shape)
                 self.timestamp_buffer = np.resize(self.timestamp_buffer, (new_size,))
+
+            first_idx = int(global_idxs[0])
+            first_action = np.asarray(actions[local_idxs[0]], dtype=self.action_buffer.dtype)
+
+            # Leading gap on first write, or hole after already-recorded steps.
+            gap_start = 0 if self.size == 0 else self.size
+            if first_idx > gap_start:
+                fill_action = (
+                    first_action
+                    if self.size == 0
+                    else np.asarray(
+                        self.action_buffer[self.size - 1], dtype=self.action_buffer.dtype
+                    )
+                )
+                for g in range(gap_start, first_idx):
+                    self.action_buffer[g] = fill_action
+                    # Keep regular grid timestamps (matches .timestamps property).
+                    self.timestamp_buffer[g] = self.start_time + g * self.dt
 
             # potentially rewrite old data (as expected)
             self.action_buffer[global_idxs] = actions[local_idxs]

@@ -160,17 +160,96 @@
       gap: 6px;
     }
     .badge {
-      display: inline-block;
-      padding: 4px 10px;
-      border-radius: 999px;
-      font-size: 0.75rem;
-      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-size: 1.05rem;
+      font-weight: 800;
+      letter-spacing: 0.04em;
       background: #243044;
       color: var(--accent);
+      border: 2px solid transparent;
+      text-transform: uppercase;
+      line-height: 1.2;
     }
-    .badge.DRAG { color: var(--warn); }
-    .badge.REC { color: var(--rec); background: #3a1f24; }
-    .badge.READY { color: var(--ok); }
+    .badge .badge-sub {
+      font-size: 0.85rem;
+      font-weight: 600;
+      letter-spacing: 0;
+      text-transform: none;
+      opacity: 0.95;
+    }
+    .mode-status {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 4px;
+      flex: 0 0 auto;
+    }
+    .mode-status .saved-meta {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    .badge.IDLE {
+      background: #2a3140;
+      color: #c5d0e0;
+      border-color: #4a5568;
+    }
+    .badge.READY {
+      background: #123528;
+      color: #5dffb0;
+      border-color: var(--ok);
+      box-shadow: 0 0 0 1px #3ecf8e55;
+    }
+    .badge.DRAG {
+      background: #3a2e10;
+      color: #ffd666;
+      border-color: var(--warn);
+      box-shadow: 0 0 0 1px #f0b42966;
+      animation: modePulse 1.4s ease-in-out infinite;
+    }
+    .badge.REC {
+      background: #4a1518;
+      color: #ff8a90;
+      border-color: var(--rec);
+      box-shadow: 0 0 0 1px #ff5c5c66;
+      animation: modePulse 0.9s ease-in-out infinite;
+    }
+    .badge.SAVING {
+      background: #1a3a4a;
+      color: #7ed7ff;
+      border-color: #3d9cf0;
+      box-shadow: 0 0 0 1px #3d9cf066;
+      animation: modePulse 0.7s ease-in-out infinite;
+    }
+    .badge.DEL {
+      background: #3a1f24;
+      color: #ffb3b8;
+      border-color: var(--danger);
+    }
+    .msg.busy {
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .badge.VIEW {
+      background: #1e2a3c;
+      color: #7ec8ff;
+      border-color: var(--accent);
+    }
+    .badge.HUB { background: #3d9cf033; color: var(--accent); border-color: var(--accent); }
+    .badge.CONNECTING {
+      background: #f0b42933;
+      color: var(--warn);
+      border-color: var(--warn);
+      animation: modePulse 1.2s ease-in-out infinite;
+    }
+    @keyframes modePulse {
+      0%, 100% { filter: brightness(1); transform: scale(1); }
+      50% { filter: brightness(1.15); transform: scale(1.02); }
+    }
     .chan-btns { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 4px; }
     .chan-btns button {
       padding: 5px 12px;
@@ -402,8 +481,6 @@
       opacity: 0.45;
       pointer-events: none;
     }
-    .badge.HUB { background: #3d9cf033; color: var(--accent); }
-    .badge.CONNECTING { background: #f0b42933; color: var(--warn); }
     #viewerOnlyBar { flex: 0 0 auto; }
   </style>
 </head>
@@ -449,11 +526,9 @@
       <div class="panel panel-control" id="controlPanel">
         <h2>Control</h2>
         <div class="control-body">
-          <div>
-            <span id="modeBadge" class="badge">IDLE</span>
-            <span style="margin-left:8px;color:var(--muted);font-size:0.85rem">
-              saved: <strong id="nEpisodes">0</strong>
-            </span>
+          <div class="mode-status">
+            <span id="modeBadge" class="badge IDLE">IDLE<span class="badge-sub">空闲</span></span>
+            <span class="saved-meta">saved: <strong id="nEpisodes">0</strong></span>
           </div>
           <dl class="stats">
             <div><dt>Steps</dt><dd id="nSteps">0</dd></div>
@@ -467,7 +542,7 @@
             <button id="btnStart" class="ok">C · Start</button>
             <button id="btnSave">S · Save</button>
             <button id="btnDrop">D · Drop</button>
-            <button id="btnQuit" class="danger">Q · Home+Quit</button>
+            <button id="btnQuit" class="danger">Q · Quit</button>
           </div>
           <div class="msg" id="msg"></div>
         </div>
@@ -477,12 +552,11 @@
     <div class="panel" id="viewerOnlyBar" style="display:none">
       <h2>数据管理</h2>
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-        <span id="modeBadgeView" class="badge READY">VIEW</span>
+        <span id="modeBadgeView" class="badge VIEW">VIEW<span class="badge-sub">数据管理</span></span>
         <span style="color:var(--muted);font-size:0.85rem">
           saved: <strong id="nEpisodesView">0</strong> · no robot / camera
         </span>
         <button id="btnBackHub" type="button">返回入口</button>
-        <button id="btnQuitView" class="danger">Q · Quit</button>
         <div class="msg" id="msgView"></div>
       </div>
     </div>
@@ -614,9 +688,45 @@
     }
 
     function setMsg(t) {
-      $("msg").textContent = t || "";
-      if ($("msgView")) $("msgView").textContent = t || "";
+      const el = $("msg");
+      el.textContent = t || "";
+      const busy = /保存|丢弃|稍候|写盘/.test(t || "");
+      el.classList.toggle("busy", busy);
+      if ($("msgView")) {
+        $("msgView").textContent = t || "";
+        $("msgView").classList.toggle("busy", busy);
+      }
       if ($("hubMsg")) $("hubMsg").textContent = t || "";
+    }
+
+    const MODE_LABELS = {
+      IDLE: "空闲",
+      READY: "可采集",
+      DRAG: "拖拽中",
+      REC: "录制中",
+      SAVING: "保存中",
+      DEL: "删除确认",
+      VIEW: "数据管理",
+      HUB: "入口",
+      CONNECTING: "连接中",
+    };
+    function setModeBadge(el, mode) {
+      if (!el) return;
+      const m = mode || "IDLE";
+      const sub = MODE_LABELS[m] || "";
+      el.className = "badge " + m;
+      el.innerHTML = sub
+        ? `${m}<span class="badge-sub">${sub}</span>`
+        : m;
+    }
+
+    function beginSavingUi(kind) {
+      setModeBadge($("modeBadge"), "SAVING");
+      if (kind === "drop") setMsg("正在丢弃当前 episode…");
+      else setMsg("正在保存…请稍候（写盘可能需要几秒）");
+      ["btnSave", "btnDrop", "btnDrag", "btnStart"].forEach((id) => {
+        if ($(id)) $(id).disabled = true;
+      });
     }
 
     function renderHubLogs(logs) {
@@ -683,7 +793,7 @@
         $("btnBackHub").style.display = "";
       }
       $("headerHint").textContent = viewerOnly
-        ? "数据管理 · 返回入口 / Q 退出 · 仅可信局域网"
+        ? "数据管理 · 返回入口 · 仅可信局域网"
         : "网页快捷键: P/C/S/D/Q · 仅可信局域网";
       $("pageTitle").textContent = viewerOnly ? "ARX5 Dataset Viewer" : "ARX5 ZMQ Collect";
       document.title = $("pageTitle").textContent;
@@ -706,13 +816,8 @@
       const mode = s.mode || "IDLE";
       applyUiMode(mode, s);
 
-      const badge = $("modeBadge");
-      badge.textContent = mode;
-      badge.className = "badge " + mode;
-      if ($("modeBadgeView")) {
-        $("modeBadgeView").textContent = mode;
-        $("modeBadgeView").className = "badge " + mode;
-      }
+      setModeBadge($("modeBadge"), mode);
+      setModeBadge($("modeBadgeView"), mode);
       $("nEpisodes").textContent = s.n_episodes ?? 0;
       if ($("nEpisodesView")) $("nEpisodesView").textContent = s.n_episodes ?? 0;
       $("nSteps").textContent = s.n_steps ?? 0;
@@ -735,15 +840,17 @@
       }
 
       const rec = !!s.recording;
+      const saving = mode === "SAVING";
       const drag = !!s.zero_force_active;
       $("btnDrag").textContent = drag ? "P · Exit drag" : "P · Drag";
-      $("btnStart").disabled = rec || !(drag || s.no_zero_force);
-      $("btnSave").disabled = !rec;
-      $("btnDrop").disabled = !rec;
-      $("btnDelete").disabled = selectedEp === null || selectedEp === "live";
+      $("btnStart").disabled = rec || saving || !(drag || s.no_zero_force);
+      $("btnSave").disabled = !rec || saving;
+      $("btnDrop").disabled = !rec || saving;
+      $("btnDrag").disabled = saving;
+      $("btnDelete").disabled = selectedEp === null || selectedEp === "live" || saving;
 
       // 按下 C 进入录制：强制切回实时相机画面
-      if (rec && !lastRecording) {
+      if (rec && !saving && !lastRecording) {
         selectedEp = "live";
         document.querySelectorAll(".ep-list li").forEach((li) => li.classList.remove("active"));
         $("btnDelete").disabled = true;
@@ -1291,12 +1398,15 @@
           showLiveStream({ force: true });
         })
         .catch(e => setMsg(e.message));
-    $("btnSave").onclick = () => postCmd("save").then(() => setMsg("save")).catch(e => setMsg(e.message));
-    $("btnDrop").onclick = () => postCmd("drop").then(() => setMsg("drop")).catch(e => setMsg(e.message));
+    $("btnSave").onclick = () => {
+      beginSavingUi("save");
+      postCmd("save").then(() => setMsg("正在保存…请稍候")).catch(e => setMsg(e.message));
+    };
+    $("btnDrop").onclick = () => {
+      beginSavingUi("drop");
+      postCmd("drop").then(() => setMsg("正在丢弃…")).catch(e => setMsg(e.message));
+    };
     $("btnQuit").onclick = () => postCmd("quit").then(() => setMsg("quit…")).catch(e => setMsg(e.message));
-    if ($("btnQuitView")) {
-      $("btnQuitView").onclick = () => postCmd("quit").then(() => setMsg("quit…")).catch(e => setMsg(e.message));
-    }
     if ($("btnBackHub")) {
       $("btnBackHub").onclick = () =>
         postCmd("back_hub").then(() => setMsg("返回入口…")).catch(e => setMsg(e.message));
@@ -1360,7 +1470,8 @@
         if (hubMode) {
           $("btnHubQuit").click();
         } else if (viewerOnly) {
-          $("btnQuitView").click();
+          // 管理页不退出进程，与「返回入口」一致（--viewer_only 时 back_hub 即结束）
+          if ($("btnBackHub")) $("btnBackHub").click();
         } else {
           $("btnQuit").click();
         }

@@ -60,7 +60,7 @@ ARX5 拖拽采数脚本 — ZMQ 版本（重力补偿 / 零力拖拽）。
   D = 丢弃当前正在录的 episode（未保存）
   E = 删除已保存的指定 episode（空闲时；输入编号后 Y 确认）
   I = 开关位姿打印：开后约每 0.5s 输出一次；再按关闭
-  Q = 回 home 后退出
+  Q = 退出（停留当前位置，不回 init/home）
 
 启动流程: reset_to_home → 按 --init_delta / --init_gripper_delta 微调（与 fast_wam 相同；
 --no_init_pose 跳过）→ 等 P 进零力（或 --no_zero_force 直接 C）。
@@ -708,51 +708,26 @@ def leave_zero_force_to_init(
             print(f"restore_gains_after_drag warning: {exc}")
 
 
-def go_home_before_quit(
+def leave_drag_before_quit(
     env: Arx5EnvWithImages,
-    home_targets: list[tuple[np.ndarray, float]],
     *,
-    frequency: float,
-    duration: float = 3.0,
     zero_force_active: bool = False,
 ) -> None:
-    """
-    退出前离开拖拽模式，再缓动回 quit-home。
-
-    关键：不要在拖拽点拉满 kp 硬锁，否则会抖（日志 gain_alpha_0.15 已证实）。
-    set_end_control 必须等控制器完成后再读 from 位姿开回程。
-    """
-    print("Returning to home before quit...")
-    if zero_force_active and hasattr(env, "set_end_control"):
+    """按 Q 退出：若在拖拽中则软退出控制，停留在当前位置，不回 init/home。"""
+    if not zero_force_active:
+        print("Quit — stay at current pose (no home move).")
+        return
+    print("Quit — leave drag, stay at current pose (no home move).")
+    if hasattr(env, "set_end_control"):
         try:
             env.set_end_control()
         except Exception as exc:  # noqa: BLE001
             print(f"set_end_control warning: {exc}")
-
-    if home_targets:
-        move_to_tcp_pose(
-            env,
-            [(pose, grip) for pose, grip in home_targets],
-            frequency=frequency,
-            duration=max(duration, 4.0) if zero_force_active else duration,
-            label="home",
-            ensure_end_control=False,
-        )
-    else:
-        print("No home pose cached; falling back to reset_to_home().")
-        for robot_idx, robot in enumerate(env.robots):
-            try:
-                print(f"  reset_to_home robot{robot_idx}...")
-                robot.reset_to_home()
-            except Exception as exc:  # noqa: BLE001
-                print(f"  reset_to_home robot{robot_idx} failed: {exc}")
-
-    if zero_force_active and hasattr(env, "restore_gains_after_drag"):
+    if hasattr(env, "restore_gains_after_drag"):
         try:
             env.restore_gains_after_drag()
         except Exception as exc:  # noqa: BLE001
             print(f"restore_gains_after_drag warning: {exc}")
-    print("Home done. Exiting.")
 
 
 def make_vis_image(
@@ -1420,7 +1395,7 @@ def run_collect_session(
         print("  startup: reset_to_home → optional init → P then C")
     print(
         "  P=toggle zero-force (again -> init)  "
-        "C=start  S=save  D=drop  E=del  I=pose  Q=home+quit"
+        "C=start  S=save  D=drop  E=del  I=pose  Q=quit(no home)"
     )
     if web:
         print(f"  web        : http://{web_host}:{web_port}/  (no_cv={no_cv})")
@@ -1685,11 +1660,8 @@ def run_collect_session(
                         web_start, web_quit = handle_idle_web_cmds()
                         if web_quit:
                             print("Quit.")
-                            go_home_before_quit(
+                            leave_drag_before_quit(
                                 env,
-                                home_targets,
-                                frequency=frequency,
-                                duration=quit_home_duration,
                                 zero_force_active=zero_force_active,
                             )
                             _stop_web_if_owned()
@@ -1700,11 +1672,8 @@ def run_collect_session(
                         for key_stroke in drain_keys(key_source):
                             if key_stroke == KeyCode(char="q"):
                                 print("Quit.")
-                                go_home_before_quit(
+                                leave_drag_before_quit(
                                     env,
-                                    home_targets,
-                                    frequency=frequency,
-                                    duration=quit_home_duration,
                                     zero_force_active=zero_force_active,
                                 )
                                 _stop_web_if_owned()
@@ -1887,19 +1856,27 @@ def run_collect_session(
                                     action = cmd.get("action")
                                     if action == "save":
                                         stop_save = True
+                                        if web_state is not None:
+                                            web_state.update(
+                                                mode="SAVING",
+                                                recording=True,
+                                                message=f"正在保存 episode {episode_id}…请稍候",
+                                            )
                                     elif action == "drop":
                                         stop_drop = True
+                                        if web_state is not None:
+                                            web_state.update(
+                                                mode="SAVING",
+                                                message="正在丢弃当前 episode…",
+                                            )
                                     elif action == "quit":
                                         print(
                                             "Quit requested — abort current episode, "
-                                            "then go home."
+                                            "stay at pose."
                                         )
                                         abort_episode(env)
-                                        go_home_before_quit(
+                                        leave_drag_before_quit(
                                             env,
-                                            home_targets,
-                                            frequency=frequency,
-                                            duration=quit_home_duration,
                                             zero_force_active=zero_force_active,
                                         )
                                         _stop_web_if_owned()
@@ -1914,8 +1891,19 @@ def run_collect_session(
                             for key_stroke in drain_keys(key_source):
                                 if key_stroke == KeyCode(char="s"):
                                     stop_save = True
+                                    if web_state is not None:
+                                        web_state.update(
+                                            mode="SAVING",
+                                            recording=True,
+                                            message=f"正在保存 episode {episode_id}…请稍候",
+                                        )
                                 elif is_drop_key(key_stroke):
                                     stop_drop = True
+                                    if web_state is not None:
+                                        web_state.update(
+                                            mode="SAVING",
+                                            message="正在丢弃当前 episode…",
+                                        )
                                 elif key_stroke == KeyCode(char="e"):
                                     print("Still recording — save/drop first, then press E.")
                                 elif key_stroke == KeyCode(char="i"):
@@ -1927,13 +1915,10 @@ def run_collect_session(
                                     else:
                                         print("Pose print OFF.")
                                 elif key_stroke == KeyCode(char="q"):
-                                    print("Quit requested — abort current episode, then go home.")
+                                    print("Quit requested — abort current episode, stay at pose.")
                                     abort_episode(env)
-                                    go_home_before_quit(
+                                    leave_drag_before_quit(
                                         env,
-                                        home_targets,
-                                        frequency=frequency,
-                                        duration=quit_home_duration,
                                         zero_force_active=zero_force_active,
                                     )
                                     _stop_web_if_owned()
@@ -1982,20 +1967,61 @@ def run_collect_session(
                             if t_elapsed > max_duration:
                                 print(f"Max duration {max_duration}s reached — auto save.")
                                 stop_save = True
+                                if web_state is not None:
+                                    web_state.update(
+                                        mode="SAVING",
+                                        recording=True,
+                                        message=f"超时自动保存 episode {episode_id}…",
+                                    )
 
                             if stop_drop:
+                                if web_state is not None:
+                                    web_state.update(
+                                        mode="SAVING",
+                                        message="正在丢弃当前 episode…",
+                                    )
                                 abort_episode(env)
                                 if web_state is not None:
                                     web_state.clear_live_series()
+                                    web_state.update(
+                                        mode="READY" if no_zero_force else (
+                                            "DRAG" if zero_force_active else "IDLE"
+                                        ),
+                                        recording=False,
+                                        message="已丢弃，可继续采集",
+                                    )
                                 # 丢弃后仍保持零力，可直接再按 C 录下一条
                                 break
 
                             if stop_save:
-                                if save_episode(env, episode_id):
+                                if web_state is not None:
+                                    web_state.update(
+                                        mode="SAVING",
+                                        recording=True,
+                                        message=f"正在保存 episode {episode_id}…写盘中，请稍候",
+                                    )
+                                ok = save_episode(env, episode_id)
+                                if ok:
                                     print(
                                         f"Episode {episode_id} saved "
                                         f"({n_steps} loop steps @ {frequency} Hz). "
                                         "Press E to delete a saved episode."
+                                    )
+                                if web_state is not None:
+                                    web_state.clear_live_series()
+                                    web_state.update(
+                                        mode="READY" if no_zero_force else (
+                                            "DRAG" if zero_force_active else "IDLE"
+                                        ),
+                                        recording=False,
+                                        n_episodes=int(env.replay_buffer.n_episodes),
+                                        n_steps=0,
+                                        t_elapsed=0.0,
+                                        message=(
+                                            f"已保存 episode {episode_id}"
+                                            if ok
+                                            else f"保存 episode {episode_id} 失败（无有效帧）"
+                                        ),
                                     )
                                 # 保存后仍保持零力，可直接再按 C 录下一条
                                 break
@@ -2152,7 +2178,7 @@ def run_collect_session(
     default=3.0,
     type=float,
     show_default=True,
-    help="按 Q 退出时缓动回 home 的时长（秒）",
+    help="（已弃用）按 Q 不再回 home；保留参数仅兼容旧命令行",
 )
 @click.option(
     "--web",
