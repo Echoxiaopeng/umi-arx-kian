@@ -23,6 +23,75 @@ import numpy as np
 
 # 仓库根下的静态页
 _DEFAULT_STATIC = Path(__file__).resolve().parent.parent / "web" / "collect_zmq"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def list_fs_dir(path: str | Path | None = None) -> dict:
+    """
+    列目录（仅子文件夹），供网页文件夹浏览器使用。
+    返回 path / parent / entries[{name,path,is_dataset,n_children}]。
+    """
+    if path is None or str(path).strip() == "":
+        target = _REPO_ROOT
+    else:
+        p = Path(str(path).strip()).expanduser()
+        if not p.is_absolute():
+            p = (_REPO_ROOT / p).resolve()
+        else:
+            p = p.resolve()
+        target = p
+
+    if not target.exists():
+        raise FileNotFoundError(f"路径不存在: {target}")
+    if not target.is_dir():
+        raise NotADirectoryError(f"不是目录: {target}")
+
+    parent = target.parent if target.parent != target else None
+    entries: list[dict] = []
+    try:
+        children = sorted(target.iterdir(), key=lambda x: x.name.lower())
+    except PermissionError as exc:
+        raise PermissionError(f"无权限读取: {target}") from exc
+
+    for child in children:
+        name = child.name
+        if name.startswith("."):
+            continue
+        if not child.is_dir():
+            continue
+        # zarr 组目录无需再点进去浏览
+        if name.endswith(".zarr"):
+            continue
+        # 跳过明显的大数据/缓存目录名里的 zarr 本体：仍可进入，但标成数据集
+        is_dataset = (child / "replay_buffer.zarr").exists()
+        n_children = None
+        try:
+            n_children = sum(
+                1
+                for c in child.iterdir()
+                if c.is_dir()
+                and not c.name.startswith(".")
+                and not c.name.endswith(".zarr")
+            )
+        except (PermissionError, OSError):
+            n_children = None
+        entries.append(
+            {
+                "name": name,
+                "path": str(child),
+                "is_dataset": bool(is_dataset),
+                "n_children": n_children,
+            }
+        )
+
+    is_dataset = (target / "replay_buffer.zarr").exists()
+    return {
+        "path": str(target),
+        "parent": str(parent) if parent is not None else None,
+        "is_dataset": bool(is_dataset),
+        "repo_root": str(_REPO_ROOT),
+        "entries": entries,
+    }
 
 
 class CommandQueue:
@@ -150,6 +219,7 @@ class SharedCollectState:
                 "live_n": len(self._live_series),
                 "viewer_only": bool(getattr(self, "viewer_only", False)),
                 "output_dir": str(out_dir) if out_dir is not None else "",
+                "repo_root": str(_REPO_ROOT),
                 "logs": list(self.logs),
             }
 
@@ -458,6 +528,20 @@ class CollectWebServer:
                             self._send_json(503, {"error": "env not ready"})
                             return
                         self._send_json(200, {"episodes": list_episodes(state.env)})
+                        return
+
+                    if path == "/api/fs/list":
+                        raw_path = qs.get("path", [""])[0]
+                        try:
+                            self._send_json(200, list_fs_dir(raw_path or None))
+                        except FileNotFoundError as exc:
+                            self._send_json(404, {"error": str(exc)})
+                        except NotADirectoryError as exc:
+                            self._send_json(400, {"error": str(exc)})
+                        except PermissionError as exc:
+                            self._send_json(403, {"error": str(exc)})
+                        except OSError as exc:
+                            self._send_json(500, {"error": str(exc)})
                         return
 
                     if path == "/api/video":

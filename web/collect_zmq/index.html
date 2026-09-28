@@ -482,6 +482,158 @@
       pointer-events: none;
     }
     #viewerOnlyBar { flex: 0 0 auto; }
+    .path-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+      width: 100%;
+    }
+    .path-row label {
+      color: var(--muted);
+      font-size: 0.85rem;
+      flex: 0 0 auto;
+    }
+    .path-current {
+      flex: 1 1 240px;
+      min-width: 160px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: #121820;
+      color: #c5d0e0;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: 0.82rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .path-row button { flex: 0 0 auto; padding: 8px 14px; }
+
+    .fs-modal {
+      max-width: 640px;
+      width: 94%;
+      max-height: min(80vh, 720px);
+      display: flex;
+      flex-direction: column;
+      padding: 16px 18px;
+    }
+    .fs-modal h3 { margin: 0 0 6px; flex: 0 0 auto; }
+    .fs-modal .fs-hint {
+      color: var(--muted);
+      font-size: 0.82rem;
+      margin: 0 0 10px;
+      flex: 0 0 auto;
+    }
+    .fs-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+      flex: 0 0 auto;
+    }
+    .fs-toolbar button { padding: 6px 12px; font-size: 0.85rem; }
+    .fs-crumb {
+      flex: 1 1 200px;
+      min-width: 0;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: 0.78rem;
+      color: #c5d0e0;
+      background: #121820;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+    .fs-crumb button {
+      display: inline;
+      padding: 0 2px;
+      border: none;
+      background: transparent;
+      color: var(--accent);
+      font-family: inherit;
+      font-size: inherit;
+      cursor: pointer;
+    }
+    .fs-crumb button:hover { text-decoration: underline; }
+    .fs-crumb .sep { color: var(--muted); margin: 0 2px; }
+    .fs-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      flex: 1 1 auto;
+      min-height: 220px;
+      max-height: min(48vh, 420px);
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #0a0e14;
+    }
+    .fs-list li {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      cursor: pointer;
+      border-bottom: 1px solid #1a2332;
+      font-size: 0.95rem;
+      user-select: none;
+    }
+    .fs-list li:last-child { border-bottom: none; }
+    .fs-list li:hover { background: #1e2a3c; }
+    .fs-list li:active { background: #243044; }
+    .fs-list .fs-icon {
+      flex: 0 0 auto;
+      width: 1.4em;
+      text-align: center;
+      opacity: 0.9;
+    }
+    .fs-list .fs-name {
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .fs-list .fs-meta {
+      flex: 0 0 auto;
+      color: var(--muted);
+      font-size: 0.75rem;
+    }
+    .fs-list .fs-tag {
+      flex: 0 0 auto;
+      font-size: 0.72rem;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: #123528;
+      color: var(--ok);
+      border: 1px solid #3ecf8e55;
+    }
+    .fs-list .fs-empty {
+      padding: 28px 16px;
+      text-align: center;
+      color: var(--muted);
+      cursor: default;
+    }
+    .fs-list .fs-empty:hover { background: transparent; }
+    .fs-footer {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+      flex: 0 0 auto;
+    }
+    .fs-footer .fs-status {
+      flex: 1 1 160px;
+      color: var(--muted);
+      font-size: 0.82rem;
+      min-height: 1.2em;
+    }
+    .fs-footer button { padding: 8px 14px; }
   </style>
 </head>
 <body>
@@ -508,7 +660,7 @@
         <button type="button" id="btnEnterManage" class="hub-manage">数据管理</button>
         <button type="button" id="btnHubQuit" class="danger">退出</button>
       </div>
-      <p class="hub-note" id="hubNote">数采需要本机已启动 ZMQ robot server。管理页不连臂，可回看 / 删除已有 episode。</p>
+      <p class="hub-note" id="hubNote">数采需要本机已启动 ZMQ robot server。管理页不连臂，可回看 / 删除已有 episode，也可切换到其它数据目录。</p>
       <div class="hub-msg" id="hubMsg"></div>
       <div class="hub-log-wrap" id="hubLogWrap">
         <h3>连接日志</h3>
@@ -558,6 +710,12 @@
         </span>
         <button id="btnBackHub" type="button">返回入口</button>
         <div class="msg" id="msgView"></div>
+      </div>
+      <div class="path-row" title="当前已加载的数据目录">
+        <label>当前目录</label>
+        <div class="path-current" id="datasetPathLabel" title="">（未加载）</div>
+        <button id="btnBrowseDataset" type="button" class="primary">浏览文件夹…</button>
+        <button id="btnResetDataset" type="button" title="回到启动时的 -o 目录">默认目录</button>
       </div>
     </div>
 
@@ -612,6 +770,25 @@
     </div>
   </div>
 
+  <div class="modal-bg" id="fsModal">
+    <div class="modal fs-modal">
+      <h3>选择数据文件夹</h3>
+      <p class="fs-hint">单击进入子文件夹（像资源管理器）。含 replay_buffer.zarr 的目录会标「数据集」，点「打开此数据集」加载。</p>
+      <div class="fs-toolbar">
+        <button type="button" id="fsUp" title="上级目录">↑ 上级</button>
+        <button type="button" id="fsHome" title="仓库根目录">仓库根</button>
+        <button type="button" id="fsData" title="data/">data/</button>
+        <div class="fs-crumb" id="fsCrumb"></div>
+      </div>
+      <ul class="fs-list" id="fsList"></ul>
+      <div class="fs-footer">
+        <div class="fs-status" id="fsStatus"></div>
+        <button type="button" id="fsOpen" class="ok" disabled>打开此数据集</button>
+        <button type="button" id="fsCancel">取消</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     const $ = (id) => document.getElementById(id);
     let status = {};
@@ -624,6 +801,15 @@
     let hubMode = false;
     let lastRecording = false;
     let lastUiMode = "";
+    let lastOutputDir = "";
+    let defaultOutputDir = "";
+    let repoRoot = "";
+    let fsBrowse = {
+      path: "",
+      parent: null,
+      is_dataset: false,
+      entries: [],
+    };
     let chartChannel = "all"; // all | pos | gripper | rot | action
     let chartTitle = "";
     let chartFrameIdx = 0;
@@ -806,10 +992,194 @@
       }
       // 刚进入管理/数采页面时拉一次 episode 列表
       if (mode !== lastUiMode && (mode === "VIEW" || mode === "IDLE" || mode === "READY" || mode === "DRAG" || mode === "REC")) {
+        if (mode === "VIEW") {
+          // 切到管理页：清空当前选中，避免跨目录残留
+          selectedEp = null;
+          series = null;
+          stopPlay();
+        }
         pollStatus(true);
       }
       lastUiMode = mode;
       requestAnimationFrame(() => resizeChart());
+    }
+
+    function syncDatasetPathLabel(s) {
+      const label = $("datasetPathLabel");
+      const dir = (s && s.output_dir) || "";
+      if (s && s.repo_root) repoRoot = s.repo_root;
+      if (dir && !defaultOutputDir) defaultOutputDir = dir;
+      const dirChanged = !!(dir && lastOutputDir && dir !== lastOutputDir);
+      if (dirChanged) {
+        selectedEp = null;
+        series = null;
+        stopPlay();
+        $("btnDelete").disabled = true;
+        if ($("viewerMsg")) {
+          $("viewerMsg").textContent = "Select an episode to scrub";
+        }
+      }
+      if (label) {
+        label.textContent = dir || "（未加载）";
+        label.title = dir || "";
+      }
+      if (dir) lastOutputDir = dir;
+    }
+
+    async function loadDatasetPath(path) {
+      const p = (path || "").trim();
+      setMsg(p ? `正在加载 ${p}…` : "正在加载默认目录…");
+      stopPlay();
+      selectedEp = null;
+      series = null;
+      try {
+        await postCmd("load_dataset", { path: p });
+        await new Promise((r) => setTimeout(r, 150));
+        await pollStatus(true);
+        if ($("viewerMsg")) {
+          $("viewerMsg").textContent = p
+            ? `已加载：${p}`
+            : "已加载默认目录";
+        }
+      } catch (e) {
+        setMsg("加载失败: " + e.message);
+      }
+    }
+
+    function closeFsModal() {
+      if ($("fsModal")) $("fsModal").classList.remove("show");
+    }
+
+    function openFsModal() {
+      if (!$("fsModal")) return;
+      $("fsModal").classList.add("show");
+      // 从当前数据目录的上级开始，便于点进兄弟文件夹；否则仓库 data/
+      let start = "";
+      if (lastOutputDir) {
+        const parts = lastOutputDir.replace(/\/+$/, "").split("/");
+        parts.pop();
+        start = parts.join("/") || "/";
+      } else if (repoRoot) {
+        start = repoRoot + "/data";
+      }
+      browseFs(start || "");
+    }
+
+    function renderFsCrumb(pathStr) {
+      const el = $("fsCrumb");
+      if (!el) return;
+      el.innerHTML = "";
+      if (!pathStr) return;
+      const parts = pathStr.split("/").filter(Boolean);
+      // Unix root
+      const rootBtn = document.createElement("button");
+      rootBtn.type = "button";
+      rootBtn.textContent = "/";
+      rootBtn.onclick = () => browseFs("/");
+      el.appendChild(rootBtn);
+
+      let acc = "";
+      parts.forEach((part, i) => {
+        acc += "/" + part;
+        const sep = document.createElement("span");
+        sep.className = "sep";
+        sep.textContent = "/";
+        el.appendChild(sep);
+        const btn = document.createElement("button");
+        btn.type = "button";
+        const target = acc;
+        btn.textContent = part;
+        btn.onclick = () => browseFs(target);
+        if (i === parts.length - 1) {
+          btn.style.color = "var(--text)";
+          btn.style.fontWeight = "600";
+        }
+        el.appendChild(btn);
+      });
+      el.scrollLeft = el.scrollWidth;
+    }
+
+    function renderFsList(data) {
+      const ul = $("fsList");
+      if (!ul) return;
+      ul.innerHTML = "";
+      const entries = data.entries || [];
+      if (!entries.length) {
+        const li = document.createElement("li");
+        li.className = "fs-empty";
+        li.textContent = "（此目录下没有子文件夹）";
+        ul.appendChild(li);
+        return;
+      }
+      entries.forEach((ent) => {
+        const li = document.createElement("li");
+        li.title = ent.is_dataset
+          ? "单击进入 · 这是数据集目录"
+          : "单击进入";
+        const icon = document.createElement("span");
+        icon.className = "fs-icon";
+        icon.textContent = "📁";
+        const name = document.createElement("span");
+        name.className = "fs-name";
+        name.textContent = ent.name;
+        li.appendChild(icon);
+        li.appendChild(name);
+        if (ent.is_dataset) {
+          const tag = document.createElement("span");
+          tag.className = "fs-tag";
+          tag.textContent = "数据集";
+          li.appendChild(tag);
+        } else if (ent.n_children != null) {
+          const meta = document.createElement("span");
+          meta.className = "fs-meta";
+          meta.textContent = ent.n_children + " 项";
+          li.appendChild(meta);
+        }
+        li.onclick = () => browseFs(ent.path);
+        // 双击数据集：直接打开
+        if (ent.is_dataset) {
+          li.ondblclick = (ev) => {
+            ev.preventDefault();
+            openDatasetFromBrowser(ent.path);
+          };
+        }
+        ul.appendChild(li);
+      });
+    }
+
+    async function browseFs(path) {
+      const statusEl = $("fsStatus");
+      if (statusEl) statusEl.textContent = "读取中…";
+      try {
+        const q = path ? ("?path=" + encodeURIComponent(path)) : "";
+        const r = await fetch("/api/fs/list" + q);
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || r.statusText);
+        fsBrowse = data;
+        if (data.repo_root) repoRoot = data.repo_root;
+        renderFsCrumb(data.path);
+        renderFsList(data);
+        if ($("fsUp")) $("fsUp").disabled = !data.parent;
+        if ($("fsOpen")) {
+          $("fsOpen").disabled = !data.is_dataset;
+          $("fsOpen").textContent = data.is_dataset
+            ? "打开此数据集"
+            : "打开此数据集（当前不是）";
+        }
+        if (statusEl) {
+          statusEl.textContent = data.is_dataset
+            ? "当前目录含 replay_buffer.zarr，可打开"
+            : `子文件夹 ${ (data.entries || []).length } 个 · 单击进入`;
+        }
+      } catch (e) {
+        if (statusEl) statusEl.textContent = "读取失败: " + e.message;
+        setMsg("浏览失败: " + e.message);
+      }
+    }
+
+    async function openDatasetFromBrowser(path) {
+      closeFsModal();
+      await loadDatasetPath(path);
     }
 
     function updateControls(s) {
@@ -831,6 +1201,7 @@
         `rot [${rot.map(v => v.toFixed(3)).join(", ")}]  ` +
         `grip ${(s.grip ?? 0).toFixed(4)}`;
       if (s.message) setMsg(s.message);
+      syncDatasetPathLabel(s);
 
       if (hubMode) return;
 
@@ -1411,6 +1782,40 @@
       $("btnBackHub").onclick = () =>
         postCmd("back_hub").then(() => setMsg("返回入口…")).catch(e => setMsg(e.message));
     }
+    if ($("btnBrowseDataset")) {
+      $("btnBrowseDataset").onclick = () => openFsModal();
+    }
+    if ($("btnResetDataset")) {
+      $("btnResetDataset").onclick = () => {
+        const fallback = defaultOutputDir || "";
+        loadDatasetPath(fallback);
+      };
+    }
+    if ($("fsCancel")) $("fsCancel").onclick = () => closeFsModal();
+    if ($("fsUp")) {
+      $("fsUp").onclick = () => {
+        if (fsBrowse.parent) browseFs(fsBrowse.parent);
+      };
+    }
+    if ($("fsHome")) {
+      $("fsHome").onclick = () => browseFs(repoRoot || "");
+    }
+    if ($("fsData")) {
+      $("fsData").onclick = () =>
+        browseFs(repoRoot ? repoRoot + "/data" : "data");
+    }
+    if ($("fsOpen")) {
+      $("fsOpen").onclick = () => {
+        if (!fsBrowse.is_dataset || !fsBrowse.path) return;
+        openDatasetFromBrowser(fsBrowse.path);
+      };
+    }
+    // 点遮罩空白关闭浏览器
+    if ($("fsModal")) {
+      $("fsModal").addEventListener("click", (ev) => {
+        if (ev.target === $("fsModal")) closeFsModal();
+      });
+    }
     if ($("btnEnterCollect")) {
       $("btnEnterCollect").onclick = () => {
         renderHubLogs(["正在发送 enter_collect…"]);
@@ -1453,6 +1858,25 @@
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
       const k = (ev.key || "").toLowerCase();
       const modalOpen = $("delModal").classList.contains("show");
+      const fsOpen = $("fsModal") && $("fsModal").classList.contains("show");
+
+      if (fsOpen) {
+        if (k === "escape") {
+          ev.preventDefault();
+          closeFsModal();
+        } else if (k === "backspace") {
+          if (tag !== "INPUT" && tag !== "TEXTAREA") {
+            ev.preventDefault();
+            if (fsBrowse.parent) browseFs(fsBrowse.parent);
+          }
+        } else if (k === "enter") {
+          if (fsBrowse.is_dataset && fsBrowse.path) {
+            ev.preventDefault();
+            openDatasetFromBrowser(fsBrowse.path);
+          }
+        }
+        return;
+      }
 
       if (modalOpen) {
         if (k === "y" || k === "enter") {
@@ -1490,6 +1914,7 @@
           ev.preventDefault();
           if ($("btnBackHub")) $("btnBackHub").click();
         }
+        // 焦点在路径框时由输入框自己处理 Enter
         return;
       }
 
