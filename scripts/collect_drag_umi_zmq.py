@@ -948,6 +948,69 @@ class OfflineDatasetEnv:
         self.replay_buffer = ReplayBuffer.create_from_path(str(zarr_path), mode="r+")
 
 
+def resolve_dataset_dir(path: str | Path) -> Path:
+    """解析数据目录：绝对路径原样；相对路径相对仓库根（cwd）。"""
+    p = Path(str(path).strip()).expanduser()
+    if not p.is_absolute():
+        p = (ROOT_DIR / p).resolve()
+    else:
+        p = p.resolve()
+    return p
+
+
+def open_offline_dataset(path: str | Path) -> OfflineDatasetEnv:
+    """打开含 replay_buffer.zarr 的数据目录；失败抛 FileNotFoundError / OSError。"""
+    out = resolve_dataset_dir(path)
+    if not out.is_dir():
+        raise FileNotFoundError(f"目录不存在: {out}")
+    env = OfflineDatasetEnv(out)
+    try:
+        check_episode_alignment(env)
+    except RuntimeError as exc:
+        print(f"[dataset] alignment warning ({out}): {exc}")
+    return env
+
+
+def apply_manage_dataset(web_state, env: OfflineDatasetEnv, *, message: str = "") -> None:
+    """把数据管理页切到给定 OfflineDatasetEnv。"""
+    web_state.env = env
+    web_state.output_dir = Path(env.output_dir)
+    web_state.viewer_only = True
+    if hasattr(web_state, "clear_live_series"):
+        web_state.clear_live_series()
+    n_ep = int(env.replay_buffer.n_episodes)
+    web_state.update(
+        mode="VIEW",
+        viewer_only=True,
+        recording=False,
+        zero_force_active=False,
+        delete_pending=None,
+        n_episodes=n_ep,
+        n_steps=0,
+        t_elapsed=0.0,
+        message=message or f"已加载 {env.output_dir} · {n_ep} episodes",
+    )
+
+
+def handle_load_dataset_cmd(web_state, cmd: dict, *, default_output: str) -> bool:
+    """
+    处理 load_dataset 命令。成功返回 True。
+    path 为空时回退到启动时的 -o 目录。
+    """
+    raw = cmd.get("path", "")
+    if raw is None or str(raw).strip() == "":
+        raw = default_output
+    try:
+        env = open_offline_dataset(raw)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        web_state.update(message=f"加载失败: {exc}")
+        print(f"[dataset] load failed: {exc}")
+        return False
+    apply_manage_dataset(web_state, env)
+    print(f"[dataset] loaded {env.output_dir} ({env.replay_buffer.n_episodes} eps)")
+    return True
+
+
 def run_viewer_only(
     *,
     output: str,
@@ -961,32 +1024,38 @@ def run_viewer_only(
         start_collect_web_ui,
     )
 
-    env = OfflineDatasetEnv(output)
-    try:
-        check_episode_alignment(env)
-    except RuntimeError as exc:
-        print(f"[viewer_only] alignment warning: {exc}")
-
     web_state = SharedCollectState()
     web_cmds = CommandQueue()
-    web_state.env = env
-    web_state.output_dir = Path(output)
     web_state.viewer_only = True
-    web_state.update(
-        mode="VIEW",
-        viewer_only=True,
-        recording=False,
-        zero_force_active=False,
-        n_episodes=int(env.replay_buffer.n_episodes),
-        message="viewer_only: no robot",
-    )
+    web_state.output_dir = resolve_dataset_dir(output)
+
+    env = None
+    try:
+        env = open_offline_dataset(output)
+        apply_manage_dataset(
+            web_state, env, message="viewer_only: no robot · 可切换数据目录"
+        )
+    except (FileNotFoundError, OSError) as exc:
+        print(f"[viewer_only] 默认目录未就绪: {exc}")
+        web_state.env = None
+        web_state.update(
+            mode="VIEW",
+            viewer_only=True,
+            recording=False,
+            zero_force_active=False,
+            n_episodes=0,
+            message=f"请在上方填写含 replay_buffer.zarr 的目录后点「加载」· {exc}",
+        )
 
     print("=" * 60)
     print("ARX5 Dataset Viewer (no robot)")
-    print(f"  output     : {output}")
-    print(f"  episodes   : {env.replay_buffer.n_episodes}")
+    print(f"  output     : {web_state.output_dir}")
+    print(
+        f"  episodes   : "
+        f"{env.replay_buffer.n_episodes if env is not None else 0}"
+    )
     print(f"  web        : http://{web_host}:{web_port}/")
-    print("  controls   : browse / scrub / delete only")
+    print("  controls   : browse / scrub / delete / load other folder")
     print("  quit       : Ctrl+C in this terminal, or Q on the page")
     print("=" * 60)
 
@@ -1004,10 +1073,19 @@ def run_viewer_only(
                     # --viewer_only 无 hub；返回视为退出
                     print("Quit viewer (back).")
                     return
+                if action == "load_dataset":
+                    handle_load_dataset_cmd(
+                        web_state, cmd, default_output=output
+                    )
+                    continue
                 if action == "delete_cancel":
                     web_state.update(delete_pending=None, message="delete cancelled")
                     continue
                 if action == "delete_request":
+                    env = web_state.env
+                    if env is None:
+                        web_state.update(message="尚未加载数据目录")
+                        continue
                     eid = cmd.get("episode_id")
                     n = int(env.replay_buffer.n_episodes)
                     if eid is None or int(eid) < 0 or int(eid) >= n:
@@ -1019,6 +1097,9 @@ def run_viewer_only(
                         )
                     continue
                 if action == "delete_confirm":
+                    env = web_state.env
+                    if env is None:
+                        continue
                     eid = cmd.get("episode_id", web_state.delete_pending)
                     if eid is not None:
                         ok = delete_saved_episode(env, int(eid))
@@ -1036,10 +1117,13 @@ def run_viewer_only(
                     web_state.update(
                         message="viewer_only: collect controls disabled"
                     )
+            env = web_state.env
             web_state.update(
                 mode="VIEW",
                 viewer_only=True,
-                n_episodes=int(env.replay_buffer.n_episodes),
+                n_episodes=(
+                    int(env.replay_buffer.n_episodes) if env is not None else 0
+                ),
             )
             time.sleep(0.1)
     except KeyboardInterrupt:
@@ -1114,7 +1198,7 @@ def run_web_hub(
     print(f"  output     : {output}")
     print(f"  web        : http://{web_host}:{web_port}/")
     print("  collect    : needs ZMQ robot server running")
-    print("  manage     : offline viewer / delete (no robot)")
+    print("  manage     : offline viewer / delete / load other folder (no robot)")
     print("  quit       : Ctrl+C or Q on hub page")
     print("=" * 60)
 
@@ -1142,28 +1226,31 @@ def run_web_hub(
 
                 if phase == "hub":
                     if action == "enter_manage":
-                        try:
-                            env = OfflineDatasetEnv(output)
-                        except FileNotFoundError as exc:
-                            web_state.update(mode="HUB", message=str(exc))
-                            print(f"[hub] manage failed: {exc}")
-                            continue
-                        try:
-                            check_episode_alignment(env)
-                        except RuntimeError as exc:
-                            print(f"[hub] alignment warning: {exc}")
-                        web_state.env = env
-                        web_state.viewer_only = True
                         if hasattr(web_state, "clear_logs"):
                             web_state.clear_logs()
-                        web_state.update(
-                            mode="VIEW",
-                            viewer_only=True,
-                            recording=False,
-                            zero_force_active=False,
-                            n_episodes=int(env.replay_buffer.n_episodes),
-                            message="数据管理：回看 / 删除（无机械臂）",
-                        )
+                        try:
+                            env = open_offline_dataset(output)
+                            apply_manage_dataset(
+                                web_state,
+                                env,
+                                message="数据管理：回看 / 删除（无机械臂）· 可切换目录",
+                            )
+                        except (FileNotFoundError, OSError) as exc:
+                            web_state.env = None
+                            web_state.output_dir = resolve_dataset_dir(output)
+                            web_state.viewer_only = True
+                            web_state.update(
+                                mode="VIEW",
+                                viewer_only=True,
+                                recording=False,
+                                zero_force_active=False,
+                                n_episodes=0,
+                                message=(
+                                    "默认目录无数据，请填写其它含 "
+                                    f"replay_buffer.zarr 的路径后点「加载」· {exc}"
+                                ),
+                            )
+                            print(f"[hub] manage: default missing, UI ready: {exc}")
                         phase = "manage"
                         print("[hub] entered manage")
                         continue
@@ -1222,6 +1309,7 @@ def run_web_hub(
                         "delete_request",
                         "delete_confirm",
                         "delete_cancel",
+                        "load_dataset",
                     ):
                         web_state.update(message="请先选择模式")
                     continue
@@ -1233,12 +1321,18 @@ def run_web_hub(
                     return_to_hub(message="已返回入口")
                     print("[hub] back from manage")
                     continue
+                if action == "load_dataset":
+                    handle_load_dataset_cmd(
+                        web_state, cmd, default_output=output
+                    )
+                    continue
                 if action == "delete_cancel":
                     web_state.update(delete_pending=None, message="delete cancelled")
                     continue
                 if action == "delete_request":
                     env = web_state.env
                     if env is None:
+                        web_state.update(message="尚未加载数据目录")
                         continue
                     eid = cmd.get("episode_id")
                     n = int(env.replay_buffer.n_episodes)
@@ -1275,11 +1369,14 @@ def run_web_hub(
                 if action == "enter_manage":
                     continue
 
-            if phase == "manage" and web_state.env is not None:
+            if phase == "manage":
+                env = web_state.env
                 web_state.update(
                     mode="VIEW",
                     viewer_only=True,
-                    n_episodes=int(web_state.env.replay_buffer.n_episodes),
+                    n_episodes=(
+                        int(env.replay_buffer.n_episodes) if env is not None else 0
+                    ),
                 )
             elif phase == "hub":
                 # keep HUB mode sticky（CONNECTING 由 enter_collect 同步占用）

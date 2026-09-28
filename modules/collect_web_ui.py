@@ -131,6 +131,7 @@ class SharedCollectState:
 
     def snapshot(self) -> dict:
         with self._lock:
+            out_dir = getattr(self, "output_dir", None)
             return {
                 "mode": self.mode,
                 "zero_force_active": self.zero_force_active,
@@ -148,6 +149,7 @@ class SharedCollectState:
                 "frequency": self.frequency,
                 "live_n": len(self._live_series),
                 "viewer_only": bool(getattr(self, "viewer_only", False)),
+                "output_dir": str(out_dir) if out_dir is not None else "",
                 "logs": list(self.logs),
             }
 
