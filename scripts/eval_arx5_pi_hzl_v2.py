@@ -58,9 +58,10 @@ F (auto, default): one F saves the initial frame and continuously records all 3�
 F (manual, --manual-capture): capture initial frame, then each F starts one swap; press C to run policy
 C: start policy (manual capture, or --grasp-only after dummy history is seeded)
 S: stop policy and return to human control
+D: stop wrist-camera video recording (F starts it when --record-video)
 P: in human mode, return to init_pose and reset history for the next round
 Q: quit
---record-video / --no-record-video: record wrist-camera MP4 from swap capture through grasp (default ON)
+--record-video / --no-record-video: F starts wrist MP4 recording, D stops (default ON)
 --grasp-only --grasp-cup {left,middle,right}: skip F/swap capture; seed dummy 241 frames;
   F cycles left→middle→right (shown on screen); C starts grasp with the selected cup.
   Server skips MEM and freezes that cup prompt (restart serve_shellgame_real_m6_cached.py
@@ -305,6 +306,7 @@ def make_eval_vis(
     cup_overlay_positions: list[tuple[int, int]] | None = None,
     vis_scale: float = DEFAULT_VIS_SCALE,
     panel_height: int = DEFAULT_PANEL_HEIGHT,
+    recording: bool = False,
 ) -> np.ndarray:
     """Enlarged camera preview with cup markers + bottom status panel (collector style)."""
     cam = np.asarray(frame)
@@ -328,6 +330,22 @@ def make_eval_vis(
             cam,
             scaled_positions,
             highlight_cups=memory_highlight_cups(memory),
+        )
+
+    # Blinking red REC dot (RGB; imshow later converts with [..., ::-1]).
+    if recording and (int(time.monotonic() * 2) % 2 == 0):
+        radius = max(8, int(round(10 * scale)))
+        center = (max(radius + 8, int(round(22 * scale))), max(radius + 8, int(round(22 * scale))))
+        cv2.circle(cam, center, radius, (255, 0, 0), thickness=-1, lineType=cv2.LINE_AA)
+        cv2.putText(
+            cam,
+            "REC",
+            (center[0] + radius + 6, center[1] + radius // 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7 * min(scale, 2.0),
+            (255, 0, 0),
+            2,
+            cv2.LINE_AA,
         )
 
     h, w = cam.shape[:2]
@@ -808,17 +826,42 @@ def run_policy(
     force_cup: str | None = None,
     record_video: bool = True,
     recording_started: bool = False,
-) -> tuple[bool, bool, dict | None]:
-    """Run one policy episode. Returns (quit_requested, warmup_done, last_memory)."""
+) -> tuple[bool, bool, dict | None, bool]:
+    """Run one policy episode.
+
+    Returns (quit_requested, warmup_done, last_memory, recording_started).
+    Video recording is controlled by F/D in the human loop (and D here); not tied
+    to policy start/stop.
+    """
     from peripherals.keystroke_counter import KeyCode
 
     if not history.ready:
         print("History is incomplete; refusing to start policy")
-        return False, warmup_done, None
+        return False, warmup_done, None, recording_started
 
     camera_key = f"camera{wrist_camera_index}_rgb"
     last_infer_frame: np.ndarray | None = None
     last_memory: dict | None = None
+
+    def stop_recording(reason: str) -> None:
+        nonlocal recording_started
+        if not recording_started:
+            return
+        env.end_episode()
+        recording_started = False
+        print(f"[record] stopped ({reason})")
+
+    def handle_policy_keys() -> bool | None:
+        """Return True=quit, False=stop policy, None=continue. Handles D (stop record)."""
+        for key in key_counter.get_press_events():
+            if key == KeyCode(char="d"):
+                stop_recording("D")
+            elif key == KeyCode(char="s"):
+                print("S pressed: stopping policy")
+                return False
+            elif key == KeyCode(char="q"):
+                return True
+        return None
 
     def show_policy_view(
         frame: np.ndarray,
@@ -836,6 +879,7 @@ def run_policy(
             cup_overlay_positions=cup_overlay_positions,
             vis_scale=vis_scale,
             panel_height=panel_height,
+            recording=recording_started,
         )
         cv2.imshow("ARX5 ShellGame", view[..., ::-1])
         cv2.pollKey()
@@ -1023,7 +1067,7 @@ def run_policy(
             eef_offset=eef_offset,
             gripper_scale=gripper_scale,
         )
-        return False, warmup_done, last_memory
+        return False, warmup_done, last_memory, recording_started
 
     if rtc:
         if not policy_client.rtc_enabled:
@@ -1032,7 +1076,6 @@ def run_policy(
             f"[RTC] enabled: s_min={rtc_s_min}, delay_buf={rtc_delay_buffer_size}, "
             f"d_init={rtc_initial_delay_steps}, max_gw={rtc_max_guidance_weight}"
         )
-        episode_started = bool(recording_started)
         quit_requested = False
         episode_start_time = time.monotonic()
         worker: RTCInferenceWorker | None = None
@@ -1095,13 +1138,12 @@ def run_policy(
             print(f"[RTC] initial chunk H={len(current.relative_actions)}, latency={latency:.3f}s")
 
             while True:
-                for key in key_counter.get_press_events():
-                    if key == KeyCode(char="s"):
-                        print("S pressed: stopping policy")
-                        return False, warmup_done, last_memory
-                    if key == KeyCode(char="q"):
-                        quit_requested = True
-                        return True, warmup_done, last_memory
+                key_result = handle_policy_keys()
+                if key_result is False:
+                    return False, warmup_done, last_memory, recording_started
+                if key_result is True:
+                    quit_requested = True
+                    return True, warmup_done, last_memory, recording_started
 
                 polled = worker.poll()
                 if polled is not None:
@@ -1145,9 +1187,6 @@ def run_policy(
                     continue
 
                 first_timestamp = time.time() + action_lead_time
-                if record_video and not episode_started:
-                    env.start_episode(time.time())
-                    episode_started = True
                 env.exec_actions(
                     actions=world_eef[:1],
                     timestamps=np.asarray([first_timestamp], dtype=np.float64),
@@ -1164,7 +1203,7 @@ def run_policy(
                 show_policy_view(
                     live[camera_key][-1],
                     status="RTC CONTROL",
-                    help_text="S: stop  Q: quit",
+                    help_text="S: stop  D: stop record  Q: quit",
                     detail_lines=[
                         f"cursor {cursor}/{len(current.relative_actions)}, "
                         f"delay~{worker.delay_estimate}, "
@@ -1174,13 +1213,12 @@ def run_policy(
 
                 deadline = first_timestamp + 0.5 / frequency
                 while time.time() < deadline:
-                    for key in key_counter.get_press_events():
-                        if key == KeyCode(char="s"):
-                            print("S pressed: stopping policy")
-                            return False, warmup_done, last_memory
-                        if key == KeyCode(char="q"):
-                            quit_requested = True
-                            return True, warmup_done, last_memory
+                    key_result = handle_policy_keys()
+                    if key_result is False:
+                        return False, warmup_done, last_memory, recording_started
+                    if key_result is True:
+                        quit_requested = True
+                        return True, warmup_done, last_memory, recording_started
                     time.sleep(0.005)
 
                 if time.monotonic() - episode_start_time >= max_duration:
@@ -1193,25 +1231,21 @@ def run_policy(
             policy_client.reset_session()
             hold_current_pose(env)
             time.sleep(0.15)
-            if episode_started:
-                env.end_episode()
             print("Policy stopped; human control restored. Restore the cups, then press P.")
-        return quit_requested, warmup_done, last_memory
+        return quit_requested, warmup_done, last_memory, recording_started
 
-    episode_started = bool(recording_started)
     quit_requested = False
     episode_start_time = time.monotonic()
     infer_step = 0
     previous_command: dict[str, object] | None = None
     try:
         while True:
-            for key in key_counter.get_press_events():
-                if key == KeyCode(char="s"):
-                    print("S pressed: stopping policy")
-                    return False, warmup_done, last_memory
-                if key == KeyCode(char="q"):
-                    quit_requested = True
-                    return True, warmup_done, last_memory
+            key_result = handle_policy_keys()
+            if key_result is False:
+                return False, warmup_done, last_memory, recording_started
+            if key_result is True:
+                quit_requested = True
+                return True, warmup_done, last_memory, recording_started
 
             actions, anchor_link6, anchor_eef, obs, inference_latency, gripper_width, gripper_width_zmq = (
                 infer_once(label="policy")
@@ -1337,9 +1371,6 @@ def run_policy(
                 "the next inference starts after the last submitted deadline"
             )
 
-            if record_video and not episode_started:
-                env.start_episode(time.time())
-                episode_started = True
             env.exec_actions(
                 actions=selected,
                 timestamps=timestamps,
@@ -1356,7 +1387,7 @@ def run_policy(
             show_policy_view(
                 obs[f"camera{wrist_camera_index}_rgb"][-1],
                 status="POLICY CONTROL",
-                help_text="S: stop  Q: quit",
+                help_text="S: stop  D: stop record  Q: quit",
                 detail_lines=[
                     f"inference {inference_latency:.3f}s, execute {safe_count}/{len(actions)}",
                 ],
@@ -1364,13 +1395,12 @@ def run_policy(
 
             deadline = timestamps[-1]
             while time.time() < deadline:
-                for key in key_counter.get_press_events():
-                    if key == KeyCode(char="s"):
-                        print("S pressed: stopping policy")
-                        return False, warmup_done, last_memory
-                    if key == KeyCode(char="q"):
-                        quit_requested = True
-                        return True, warmup_done, last_memory
+                key_result = handle_policy_keys()
+                if key_result is False:
+                    return False, warmup_done, last_memory, recording_started
+                if key_result is True:
+                    quit_requested = True
+                    return True, warmup_done, last_memory, recording_started
                 time.sleep(0.01)
 
             if time.monotonic() - episode_start_time >= max_duration:
@@ -1382,10 +1412,8 @@ def run_policy(
         # interpolation, so S does not continue executing the old chunk.
         hold_current_pose(env)
         time.sleep(0.15)
-        if episode_started:
-            env.end_episode()
         print("Policy stopped; human control restored. Restore the cups, then press P.")
-    return quit_requested, warmup_done, last_memory
+    return quit_requested, warmup_done, last_memory, recording_started
 
 
 @click.command()
@@ -1580,9 +1608,9 @@ def run_policy(
 )
 @click.option(
     "--record-video/--no-record-video",
-    default=True,
-    show_default=True,
-    help="Record wrist-camera MP4 from swap capture through grasp via Arx5Env (output/videos/).",
+    default=False,
+    show_default=False,
+    help="F starts wrist-camera MP4; D stops. While recording, F does not restart.",
 )
 @click.option("--self-test", is_flag=True, help="Validate transforms without opening cameras or robot hardware.")
 def main(
@@ -1823,7 +1851,7 @@ def main(
     )
     if record_video:
         print(
-            f"[record] wrist video ON (swap+grasp) → {output_path / 'videos'}"
+            f"[record] F=start / D=stop wrist MP4 → {output_path / 'videos'}"
         )
     else:
         print("[record] wrist video OFF (--no-record-video)")
@@ -1955,6 +1983,7 @@ def main(
                     cup_overlay_positions=cup_overlay_positions,
                     rtc=False,
                     record_video=record_video,
+                    recording_started=False,
                 )
                 print("[observe-only] done.")
                 cv2.destroyAllWindows()
@@ -1989,10 +2018,10 @@ def main(
                 )
 
             quit_requested = False
+            recording_started = False
             while not quit_requested:
                 target_pose, target_gripper = current_robot_pose_and_gripper(env)
                 start_policy = False
-                recording_started = False
                 iteration = 0
                 loop_start = time.monotonic()
                 was_ready = history.ready
@@ -2012,7 +2041,16 @@ def main(
                         if key == KeyCode(char="q"):
                             quit_requested = True
                             break
-                        if key == KeyCode(char="f"):
+                        if key == KeyCode(char="d"):
+                            if recording_started:
+                                env.end_episode()
+                                recording_started = False
+                                message = "[record] stopped (D)"
+                                print(message)
+                            else:
+                                message = "[record] not recording"
+                                print(message)
+                        elif key == KeyCode(char="f"):
                             if grasp_only:
                                 assert force_cup is not None
                                 cup_idx = CUP_NAMES.index(force_cup)
@@ -2022,22 +2060,22 @@ def main(
                                     f"({force_cup})"
                                 )
                                 print(message)
-                                continue
-                            message = history.press_f(frame, current_link6_pose)
-                            print_init_link6_alignment(
-                                "press-F",
-                                target_link6_pose6,
-                                current_link6_pose,
-                                target_zmq_eef=init_pose6,
-                                live_zmq_eef=current_pose,
-                                direct_origin3=direct_origin3,
-                            )
-                            print(message)
-                            # Start MP4 at the beginning of swap capture (not only grasp).
-                            if record_video and not recording_started and history.locked:
+                            else:
+                                message = history.press_f(frame, current_link6_pose)
+                                print_init_link6_alignment(
+                                    "press-F",
+                                    target_link6_pose6,
+                                    current_link6_pose,
+                                    target_zmq_eef=init_pose6,
+                                    live_zmq_eef=current_pose,
+                                    direct_origin3=direct_origin3,
+                                )
+                                print(message)
+                            # F starts recording only when not already recording.
+                            if record_video and not recording_started:
                                 env.start_episode(time.time())
                                 recording_started = True
-                                print("[record] started at swap capture")
+                                print("[record] started (F)")
                         elif key == KeyCode(char="c"):
                             if history.ready:
                                 start_policy = True
@@ -2047,10 +2085,6 @@ def main(
                         elif key == KeyCode(char="p"):
                             reset_target = "current pose" if observe_only else "init_pose"
                             print(f"P pressed: clearing history and returning to {reset_target}")
-                            if recording_started:
-                                env.end_episode()
-                                recording_started = False
-                                print("[record] stopped (reset before policy)")
                             policy_client.reset_session()
                             history.reset()
                             last_memory = None
@@ -2117,12 +2151,13 @@ def main(
                             compensate_latency=False,
                         )
 
+                    rec_hint = "  D: stop record" if recording_started else "  F: start record"
                     if grasp_only:
-                        help_text = f"F: cycle cup  C: grasp  P: reset  Q: quit"
+                        help_text = f"F: cycle cup+rec  C: grasp  P: reset  Q: quit{rec_hint}"
                     elif auto_capture:
-                        help_text = "F: auto-capture→policy  P: reset  Q: quit"
+                        help_text = f"F: auto-capture→policy  P: reset  Q: quit{rec_hint}"
                     else:
-                        help_text = "F: capture  C: policy  P: reset  Q: quit"
+                        help_text = f"F: capture  C: policy  P: reset  Q: quit{rec_hint}"
                     remaining = ""
                     if history.collecting:
                         swap_left = SWAP_FRAMES - len(history.active_segment or [])
@@ -2150,6 +2185,8 @@ def main(
                             f"{len(history.active_segment or [])}/{SWAP_FRAMES}"
                         )
                     detail_lines = [line for line in (remaining, message) if line]
+                    if recording_started:
+                        detail_lines = ["VIDEO RECORDING — press D to stop", *detail_lines]
                     if grasp_only and force_cup is not None:
                         detail_lines = [
                             f"selected: {force_cup.upper()}  "
@@ -2165,6 +2202,7 @@ def main(
                         cup_overlay_positions=cup_overlay_positions,
                         vis_scale=vis_scale,
                         panel_height=panel_height,
+                        recording=recording_started,
                     )
                     cv2.imshow("ARX5 ShellGame", view[..., ::-1])
                     cv2.pollKey()
@@ -2175,9 +2213,9 @@ def main(
                     if recording_started:
                         env.end_episode()
                         recording_started = False
-                        print("[record] stopped (quit during capture)")
+                        print("[record] stopped (quit)")
                     break
-                quit_requested, warmup_done, last_memory = run_policy(
+                quit_requested, warmup_done, last_memory, recording_started = run_policy(
                     env=env,
                     policy_client=policy_client,
                     history=history,
