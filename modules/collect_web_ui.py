@@ -130,6 +130,16 @@ class SharedCollectState:
         self.pos: list[float] = [0.0, 0.0, 0.0]
         self.rotvec: list[float] = [0.0, 0.0, 0.0]
         self.grip: float = 0.0
+        # Dual-arm: [{pos, rotvec, grip, label}, ...]；单臂时长度 1（与 pos/rotvec/grip 同步）
+        self.robots: list[dict] = [
+            {
+                "pos": [0.0, 0.0, 0.0],
+                "rotvec": [0.0, 0.0, 0.0],
+                "grip": 0.0,
+                "label": "L",
+            }
+        ]
+        self.n_robots: int = 1
         self.delete_pending: Optional[int] = None
         self.message: str = ""
         self.frequency: float = 60.0
@@ -181,6 +191,7 @@ class SharedCollectState:
         rot: np.ndarray,
         grip: float,
         action: Optional[np.ndarray] = None,
+        robots: Optional[list[dict]] = None,
         max_points: int = 8000,
     ) -> None:
         sample = {
@@ -190,9 +201,12 @@ class SharedCollectState:
             "rot": [float(x) for x in np.asarray(rot, dtype=np.float64).reshape(3)],
             "grip": float(grip),
         }
+        if robots is not None:
+            sample["robots"] = robots
         if action is not None:
             a = np.asarray(action, dtype=np.float64).reshape(-1)
-            sample["action"] = [float(x) for x in a[:7]]
+            # Keep full action (7 * n_robots); UI decides how many dims to plot.
+            sample["action"] = [float(x) for x in a]
         with self._lock:
             self._live_series.append(sample)
             if len(self._live_series) > max_points:
@@ -201,6 +215,7 @@ class SharedCollectState:
     def snapshot(self) -> dict:
         with self._lock:
             out_dir = getattr(self, "output_dir", None)
+            robots = list(getattr(self, "robots", []) or [])
             return {
                 "mode": self.mode,
                 "zero_force_active": self.zero_force_active,
@@ -213,6 +228,8 @@ class SharedCollectState:
                 "pos": list(self.pos),
                 "rotvec": list(self.rotvec),
                 "grip": float(self.grip),
+                "robots": robots,
+                "n_robots": int(getattr(self, "n_robots", len(robots) or 1)),
                 "delete_pending": self.delete_pending,
                 "message": self.message,
                 "frequency": self.frequency,
@@ -273,6 +290,107 @@ def _rb_slice_array(replay_buffer, key: str, sl: slice) -> np.ndarray:
     return np.asarray(replay_buffer.data[key][sl])
 
 
+def _count_robots_in_buffer(replay_buffer) -> int:
+    n = 0
+    while f"robot{n}_eef_pos" in replay_buffer.data:
+        n += 1
+    return max(n, 1)
+
+
+def _slice_robot_pose_series(replay_buffer, robot_idx: int, sl: slice, n_hint: int = 0):
+    pos = _rb_slice_array(replay_buffer, f"robot{robot_idx}_eef_pos", sl)
+    if pos.ndim == 1:
+        pos = pos.reshape(-1, 3) if pos.size else np.zeros((0, 3))
+    elif pos.ndim >= 2:
+        pos = pos.reshape(-1, pos.shape[-1])[:, :3]
+    n = int(pos.shape[0]) if pos.size else int(n_hint)
+
+    rot = _rb_slice_array(replay_buffer, f"robot{robot_idx}_eef_rot_axis_angle", sl)
+    if rot.size == 0:
+        rot = np.zeros((n, 3), dtype=np.float64)
+    else:
+        rot = np.asarray(rot, dtype=np.float64).reshape(-1, 3)
+
+    grip = _rb_slice_array(replay_buffer, f"robot{robot_idx}_gripper_width", sl)
+    if grip.size == 0:
+        grip = np.zeros((n,), dtype=np.float64)
+    else:
+        grip = np.asarray(grip, dtype=np.float64).reshape(-1)
+    return pos, rot, grip, n
+
+
+_ARM_LABELS = ("L", "R", "A2", "A3")
+
+
+def _live_series_robots(series: list[dict]) -> list[dict]:
+    """
+    Rebuild per-arm time series for /api/live/series.
+
+    Prefer sample['robots']; if missing, synthesize from action (7 dims each).
+    Length always matches len(series).
+    """
+    if not series:
+        return []
+
+    n_r = 1
+    for s in series:
+        if isinstance(s.get("robots"), list) and len(s["robots"]) > n_r:
+            n_r = len(s["robots"])
+        act = s.get("action")
+        if act is not None:
+            try:
+                n_r = max(n_r, int(len(act) // 7))
+            except Exception:
+                pass
+
+    out: list[dict] = []
+    for ridx in range(max(n_r, 1)):
+        label = _ARM_LABELS[ridx] if ridx < len(_ARM_LABELS) else f"A{ridx}"
+        xyz_list: list = []
+        rot_list: list = []
+        grip_list: list = []
+        for s in series:
+            robots = s.get("robots")
+            if isinstance(robots, list) and ridx < len(robots):
+                arm = robots[ridx]
+                xyz_list.append(list(arm.get("xyz") or [0.0, 0.0, 0.0]))
+                rot_list.append(list(arm.get("rot") or [0.0, 0.0, 0.0]))
+                grip_list.append(float(arm.get("grip") or 0.0))
+                continue
+            act = s.get("action")
+            if act is not None and len(act) >= 7 * (ridx + 1):
+                base = 7 * ridx
+                xyz_list.append(
+                    [float(act[base]), float(act[base + 1]), float(act[base + 2])]
+                )
+                rot_list.append(
+                    [
+                        float(act[base + 3]),
+                        float(act[base + 4]),
+                        float(act[base + 5]),
+                    ]
+                )
+                grip_list.append(float(act[base + 6]))
+                continue
+            if ridx == 0:
+                xyz_list.append(list(s.get("xyz") or [0.0, 0.0, 0.0]))
+                rot_list.append(list(s.get("rot") or [0.0, 0.0, 0.0]))
+                grip_list.append(float(s.get("grip") or 0.0))
+            else:
+                xyz_list.append([0.0, 0.0, 0.0])
+                rot_list.append([0.0, 0.0, 0.0])
+                grip_list.append(0.0)
+        out.append(
+            {
+                "label": label,
+                "xyz": xyz_list,
+                "rot": rot_list,
+                "grip": grip_list,
+            }
+        )
+    return out
+
+
 def episode_series_from_buffer(
     replay_buffer, episode_id: int, *, max_points: int = 2000
 ) -> dict:
@@ -281,36 +399,42 @@ def episode_series_from_buffer(
         raise IndexError(f"episode {episode_id} out of range 0..{n_ep - 1}")
     sl = replay_buffer.get_episode_slice(episode_id)
 
-    pos = _rb_slice_array(replay_buffer, "robot0_eef_pos", sl)
-    if pos.ndim == 1:
-        pos = pos.reshape(-1, 3) if pos.size else np.zeros((0, 3))
-    elif pos.ndim >= 2:
-        pos = pos.reshape(-1, pos.shape[-1])[:, :3]
-    n = int(pos.shape[0])
-
-    rot = _rb_slice_array(replay_buffer, "robot0_eef_rot_axis_angle", sl)
-    if rot.size == 0:
-        rot = np.zeros((n, 3), dtype=np.float64)
-    else:
-        rot = np.asarray(rot, dtype=np.float64).reshape(-1, 3)
-
-    grip = _rb_slice_array(replay_buffer, "robot0_gripper_width", sl)
-    if grip.size == 0:
-        grip = np.zeros((n,), dtype=np.float64)
-    else:
-        grip = np.asarray(grip, dtype=np.float64).reshape(-1)
+    n_robots = _count_robots_in_buffer(replay_buffer)
 
     action = _rb_slice_array(replay_buffer, "action", sl)
-    if action.size == 0:
-        action = np.zeros((n, 7), dtype=np.float64)
-    else:
+    if action.size:
         action = np.asarray(action, dtype=np.float64)
         if action.ndim == 1:
-            action = action.reshape(-1, 7)
-        elif action.shape[-1] < 7:
-            pad = np.zeros((action.shape[0], 7), dtype=np.float64)
-            pad[:, : action.shape[-1]] = action
-            action = pad
+            # Ambiguous; prefer known robot count.
+            cols = max(7 * n_robots, 7)
+            action = action.reshape(-1, cols) if action.size else np.zeros((0, cols))
+        # Infer dual-arm from action width even if robot1_* keys missing.
+        if action.ndim >= 2 and action.shape[-1] >= 14:
+            n_robots = max(n_robots, int(action.shape[-1] // 7))
+
+    act_dim = 7 * n_robots
+    if action.size == 0:
+        action = np.zeros((0, act_dim), dtype=np.float64)
+    elif action.shape[-1] < act_dim:
+        pad = np.zeros((action.shape[0], act_dim), dtype=np.float64)
+        pad[:, : action.shape[-1]] = action
+        action = pad
+
+    robots_raw = []
+    n = 0
+    for ridx in range(n_robots):
+        pos, rot, grip, n_r = _slice_robot_pose_series(replay_buffer, ridx, sl, n)
+        if ridx == 0:
+            n = n_r if n_r > 0 else int(action.shape[0])
+        # Fallback: synthesize pose from action block when robot{i}_* missing.
+        if pos.shape[0] == 0 and action.shape[0] > 0 and action.shape[-1] >= 7 * (ridx + 1):
+            block = action[:, 7 * ridx : 7 * (ridx + 1)]
+            pos = block[:, :3].copy()
+            rot = block[:, 3:6].copy()
+            grip = block[:, 6].copy()
+            if ridx == 0 and n == 0:
+                n = int(pos.shape[0])
+        robots_raw.append((pos, rot, grip))
 
     ts = _rb_slice_array(replay_buffer, "timestamp", sl)
     if ts.size == n and n > 0:
@@ -320,24 +444,40 @@ def episode_series_from_buffer(
         t = np.arange(n, dtype=np.float64)
 
     idx = _downsample_indices(n, max_points)
-    pos_d = pos[idx] if n else pos
-    rot_d = rot[idx] if rot.shape[0] == n and n else np.zeros((idx.shape[0], 3))
-    grip_d = grip[idx] if grip.shape[0] == n and n else np.zeros((idx.shape[0],))
+    robots_out = []
+    for ridx, (pos, rot, grip) in enumerate(robots_raw):
+        pos_d = pos[idx] if n and pos.shape[0] == n else np.zeros((idx.shape[0], 3))
+        rot_d = rot[idx] if n and rot.shape[0] == n else np.zeros((idx.shape[0], 3))
+        grip_d = grip[idx] if n and grip.shape[0] == n else np.zeros((idx.shape[0],))
+        label = _ARM_LABELS[ridx] if ridx < len(_ARM_LABELS) else f"A{ridx}"
+        robots_out.append(
+            {
+                "label": label,
+                "xyz": pos_d.tolist(),
+                "rot": rot_d.tolist(),
+                "grip": grip_d.tolist(),
+            }
+        )
+
     act_d = (
         action[idx]
         if action.shape[0] == n and n
-        else np.zeros((idx.shape[0], 7), dtype=np.float64)
+        else np.zeros((idx.shape[0], act_dim), dtype=np.float64)
     )
     t_d = t[idx] if t.shape[0] == n and n else np.arange(idx.shape[0], dtype=np.float64)
 
+    # robot0 aliases for older UI / single-arm
+    r0 = robots_out[0] if robots_out else {"xyz": [], "rot": [], "grip": []}
     return {
         "episode_id": int(episode_id),
         "n_steps": n,
+        "n_robots": int(n_robots),
         "steps": idx.tolist(),
         "t": t_d.tolist(),
-        "xyz": pos_d.tolist(),
-        "rot": rot_d.tolist(),
-        "grip": grip_d.tolist(),
+        "xyz": r0["xyz"],
+        "rot": r0["rot"],
+        "grip": r0["grip"],
+        "robots": robots_out,
         "action": act_d.tolist(),
     }
 
@@ -411,13 +551,36 @@ def episode_frame_jpeg(
     )
     if cam_keys and n_steps > 0:
         try:
-            frame = np.asarray(rb.data[cam_keys[0]][sl.start + idx])
-            jpeg = rgb_to_jpeg(frame, quality=quality)
+            tiles = []
+            for key in cam_keys:
+                frame = np.asarray(rb.data[key][sl.start + idx])
+                if frame.dtype != np.uint8:
+                    if np.issubdtype(frame.dtype, np.floating) and float(
+                        np.nanmax(frame)
+                    ) <= 1.5:
+                        frame = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+                    else:
+                        frame = np.clip(frame, 0, 255).astype(np.uint8)
+                tiles.append(frame)
+            if len(tiles) == 1:
+                strip = tiles[0]
+            else:
+                # Match heights for hstack (obs may differ slightly).
+                h0 = min(t.shape[0] for t in tiles)
+                resized = []
+                for t in tiles:
+                    if t.shape[0] != h0:
+                        scale = h0 / float(t.shape[0])
+                        w2 = max(1, int(round(t.shape[1] * scale)))
+                        t = cv2.resize(t, (w2, h0), interpolation=cv2.INTER_AREA)
+                    resized.append(t)
+                strip = np.concatenate(resized, axis=1)
+            jpeg = rgb_to_jpeg(strip, quality=quality)
             if jpeg:
-                h, w = int(frame.shape[0]), int(frame.shape[1])
+                h, w = int(strip.shape[0]), int(strip.shape[1])
                 return jpeg, {
                     "source": "zarr",
-                    "key": cam_keys[0],
+                    "key": "+".join(cam_keys),
                     "width": w,
                     "height": h,
                     "warning": "",
@@ -603,15 +766,18 @@ class CollectWebServer:
 
                     if path == "/api/live/series":
                         series = state.get_live_series()
+                        robots_series = _live_series_robots(series)
                         self._send_json(
                             200,
                             {
                                 "n_steps": len(series),
+                                "n_robots": len(robots_series) or 1,
                                 "steps": [s["step"] for s in series],
                                 "t": [s["t"] for s in series],
                                 "xyz": [s["xyz"] for s in series],
                                 "rot": [s["rot"] for s in series],
                                 "grip": [s["grip"] for s in series],
+                                "robots": robots_series,
                                 "action": [s.get("action") for s in series],
                             },
                         )
@@ -781,13 +947,27 @@ def start_collect_web_ui(
 
 def publish_pose_from_env(state: SharedCollectState, env) -> None:
     try:
-        st = env.get_robot_state()[0]
-        pose = np.asarray(st["ActualTCPPose"], dtype=np.float64).reshape(6)
-        grip = float(st["gripper_position"])
+        states = env.get_robot_state()
+        robots = []
+        for ridx, st in enumerate(states):
+            pose = np.asarray(st["ActualTCPPose"], dtype=np.float64).reshape(6)
+            grip = float(st["gripper_position"])
+            label = _ARM_LABELS[ridx] if ridx < len(_ARM_LABELS) else f"A{ridx}"
+            robots.append(
+                {
+                    "pos": [float(pose[0]), float(pose[1]), float(pose[2])],
+                    "rotvec": [float(pose[3]), float(pose[4]), float(pose[5])],
+                    "grip": grip,
+                    "label": label,
+                }
+            )
+        r0 = robots[0]
         state.update(
-            pos=[float(pose[0]), float(pose[1]), float(pose[2])],
-            rotvec=[float(pose[3]), float(pose[4]), float(pose[5])],
-            grip=grip,
+            pos=list(r0["pos"]),
+            rotvec=list(r0["rotvec"]),
+            grip=float(r0["grip"]),
+            robots=robots,
+            n_robots=len(robots),
             n_episodes=int(env.replay_buffer.n_episodes),
         )
     except Exception:

@@ -966,15 +966,36 @@ def append_live_from_obs(
     if step > 0 and step % 3 != 0:
         return
     try:
-        xyz = np.asarray(obs["robot0_eef_pos"][-1], dtype=np.float64).reshape(3)
-        rot = np.asarray(
-            obs["robot0_eef_rot_axis_angle"][-1], dtype=np.float64
-        ).reshape(3)
-        grip = float(np.asarray(obs["robot0_gripper_width"][-1]).squeeze())
-        # Web UI 只展示前 7 维（robot0）；完整 action 仍按 n_robots 拼接
+        labels = ("L", "R", "A2", "A3")
+        robots = []
+        for ridx in range(n_robots):
+            xyz_i = np.asarray(
+                obs[f"robot{ridx}_eef_pos"][-1], dtype=np.float64
+            ).reshape(3)
+            rot_i = np.asarray(
+                obs[f"robot{ridx}_eef_rot_axis_angle"][-1], dtype=np.float64
+            ).reshape(3)
+            grip_i = float(
+                np.asarray(obs[f"robot{ridx}_gripper_width"][-1]).squeeze()
+            )
+            robots.append(
+                {
+                    "label": labels[ridx] if ridx < len(labels) else f"A{ridx}",
+                    "xyz": [float(v) for v in xyz_i],
+                    "rot": [float(v) for v in rot_i],
+                    "grip": grip_i,
+                }
+            )
         action = action_from_obs(obs, n_robots)
+        r0 = robots[0]
         web_state.append_live_sample(
-            step=step, t=t_elapsed, xyz=xyz, rot=rot, grip=grip, action=action
+            step=step,
+            t=t_elapsed,
+            xyz=np.asarray(r0["xyz"], dtype=np.float64),
+            rot=np.asarray(r0["rot"], dtype=np.float64),
+            grip=float(r0["grip"]),
+            action=action,
+            robots=robots,
         )
     except Exception:
         pass

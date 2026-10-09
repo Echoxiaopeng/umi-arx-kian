@@ -710,7 +710,7 @@
             <div><dt>Episode</dt><dd id="curEp">—</dd></div>
             <div><dt>Live pts</dt><dd id="liveN">0</dd></div>
           </dl>
-          <div class="pose" id="poseBox">pos — · rot — · grip —</div>
+          <div class="pose" id="poseBox">L/R pose —</div>
           <div class="btns" id="collectBtns">
             <button id="btnDrag" class="primary">P · Drag</button>
             <button id="btnStart" class="ok">C · Start</button>
@@ -767,9 +767,14 @@
                 <button type="button" data-chan="rot" title="TCP orientation as axis-angle / rotvec (rad)">rot (axis-angle)</button>
                 <button type="button" data-chan="action" title="Action: xyz + rotvec + gripper">action</button>
               </div>
+              <div class="chan-btns" id="armBtns" style="margin-top:6px">
+                <button type="button" data-arm="both" class="active" title="Show left + right arm curves">Both arms</button>
+                <button type="button" data-arm="L" title="Left arm only">L</button>
+                <button type="button" data-arm="R" title="Right arm only">R</button>
+              </div>
               <div class="msg" id="chanHint" style="margin-top:2px">
-                rot = TCP 姿态的 axis-angle（旋转向量，单位 rad；方向=转轴，模长=转角）·
-                左键拖动移动黄线 · 滚轮缩放曲线 · 双击复位
+                双臂曲线带 L_/R_ 前缀 · rot = axis-angle（rad）·
+                左键拖动黄线 · 滚轮缩放 · 双击复位
               </div>
           </div>
           <div id="chart"></div>
@@ -833,6 +838,7 @@
       entries: [],
     };
     let chartChannel = "all"; // all | pos | gripper | rot | action
+    let chartArmFilter = "both"; // both | L | R
     let chartTitle = "";
     let chartFrameIdx = 0;
     const FONT_MIN = 16;
@@ -1217,12 +1223,7 @@
       $("tElapsed").textContent = (s.t_elapsed ?? 0).toFixed(1) + "s";
       $("curEp").textContent = s.recording ? (s.episode_id ?? "—") : "—";
       $("liveN").textContent = s.live_n ?? 0;
-      const pos = s.pos || [0,0,0];
-      const rot = s.rotvec || [0,0,0];
-      $("poseBox").textContent =
-        `pos [${pos.map(v => v.toFixed(3)).join(", ")}]  ` +
-        `rot [${rot.map(v => v.toFixed(3)).join(", ")}]  ` +
-        `grip ${(s.grip ?? 0).toFixed(4)}`;
+      $("poseBox").innerHTML = formatPoseHtml(s);
       if (s.message) setMsg(s.message);
       syncDatasetPathLabel(s);
 
@@ -1278,6 +1279,92 @@
       });
     }
 
+    function formatPoseHtml(s) {
+      const arms = (s.robots && s.robots.length)
+        ? s.robots
+        : [{
+            label: "L",
+            pos: s.pos || [0, 0, 0],
+            rotvec: s.rotvec || [0, 0, 0],
+            grip: s.grip ?? 0,
+          }];
+      return arms.map((arm) => {
+        const lab = arm.label || "?";
+        const pos = arm.pos || [0, 0, 0];
+        const rot = arm.rotvec || [0, 0, 0];
+        const grip = arm.grip ?? 0;
+        return (
+          `<div><strong>${lab}</strong> ` +
+          `pos [${pos.map((v) => Number(v).toFixed(3)).join(", ")}]  ` +
+          `rot [${rot.map((v) => Number(v).toFixed(3)).join(", ")}]  ` +
+          `grip ${Number(grip).toFixed(4)}</div>`
+        );
+      }).join("");
+    }
+
+    function armSeriesList(data) {
+      const n =
+        (data.steps && data.steps.length) ||
+        (data.t && data.t.length) ||
+        (data.xyz && data.xyz.length) ||
+        0;
+      let arms = [];
+      if (data.robots && data.robots.length) {
+        arms = data.robots.map((r, i) => ({
+          label: r.label || (i === 0 ? "L" : i === 1 ? "R" : `A${i}`),
+          xyz: r.xyz || [],
+          rot: r.rot || [],
+          grip: r.grip || [],
+        }));
+      } else {
+        arms = [{
+          label: "L",
+          xyz: data.xyz || [],
+          rot: data.rot || [],
+          grip: data.grip || [],
+        }];
+      }
+
+      // Synthesize missing arms from action (7 dims each) so curves always show R.
+      const action = data.action || [];
+      const act0 = action.find((a) => a != null);
+      const actDim = act0 ? act0.length : 0;
+      const nFromAct = Math.max(1, Math.floor(actDim / 7));
+      while (arms.length < nFromAct) {
+        const ridx = arms.length;
+        const base = 7 * ridx;
+        const xyz = [];
+        const rot = [];
+        const grip = [];
+        for (let i = 0; i < n; i++) {
+          const a = action[i];
+          if (a && a.length >= base + 7) {
+            xyz.push([a[base], a[base + 1], a[base + 2]]);
+            rot.push([a[base + 3], a[base + 4], a[base + 5]]);
+            grip.push(a[base + 6]);
+          } else {
+            xyz.push([0, 0, 0]);
+            rot.push([0, 0, 0]);
+            grip.push(0);
+          }
+        }
+        arms.push({
+          label: ridx === 0 ? "L" : ridx === 1 ? "R" : `A${ridx}`,
+          xyz,
+          rot,
+          grip,
+        });
+      }
+
+      if (chartArmFilter === "L") {
+        return arms.filter((a) => a.label === "L" || a.label === "A0");
+      }
+      if (chartArmFilter === "R") {
+        return arms.filter((a) => a.label === "R" || a.label === "A1");
+      }
+      return arms;
+    }
+
     function plotSeries(data, title, frameIdx) {
       series = data;
       if (title != null) chartTitle = title;
@@ -1287,32 +1374,47 @@
 
       const n = (data.steps && data.steps.length) || (data.t && data.t.length) || 0;
       const x = data.steps && data.steps.length ? data.steps : Array.from({length: n}, (_, i) => i);
-      const xyz = data.xyz || [];
-      const rot = data.rot || [];
-      const grip = data.grip || [];
+      const arms = armSeriesList(data);
       const action = data.action || [];
       const chan = chartChannel;
+      // Prefix L_/R_ whenever dataset is dual-arm (even if filter shows one arm).
+      const multi = (data.n_robots && data.n_robots > 1) ||
+        (data.robots && data.robots.length > 1) ||
+        (action[0] && action[0].length >= 14) ||
+        arms.length > 1;
 
       const axisCommon = { gridcolor: "#2d3a4d", zeroline: false, color: "#8b9bb4" };
       let traces = [];
       let layout;
 
       if (chan === "all") {
-        traces = [
-          { x, y: xyz.map(p => p[0]), name: "pos_x", xaxis: "x", yaxis: "y", line: { width: 1.5 } },
-          { x, y: xyz.map(p => p[1]), name: "pos_y", xaxis: "x", yaxis: "y", line: { width: 1.5 } },
-          { x, y: xyz.map(p => p[2]), name: "pos_z", xaxis: "x", yaxis: "y", line: { width: 1.5 } },
-          { x, y: grip, name: "grip", xaxis: "x2", yaxis: "y2", line: { width: 1.5 } },
-          { x, y: rot.map(p => p[0]), name: "rotvec_x", xaxis: "x3", yaxis: "y3", line: { width: 1.5 } },
-          { x, y: rot.map(p => p[1]), name: "rotvec_y", xaxis: "x3", yaxis: "y3", line: { width: 1.5 } },
-          { x, y: rot.map(p => p[2]), name: "rotvec_z", xaxis: "x3", yaxis: "y3", line: { width: 1.5 } },
-        ];
-        if (action.length && action[0] != null) {
+        arms.forEach((arm) => {
+          const pfx = multi ? `${arm.label}_` : "";
+          const xyz = arm.xyz;
+          const rot = arm.rot;
+          const grip = arm.grip;
           traces.push(
-            { x, y: action.map(a => (a && a[0]) || 0), name: "act_x", xaxis: "x4", yaxis: "y4", line: { width: 1.5 } },
-            { x, y: action.map(a => (a && a[1]) || 0), name: "act_y", xaxis: "x4", yaxis: "y4", line: { width: 1.5 } },
-            { x, y: action.map(a => (a && a[2]) || 0), name: "act_z", xaxis: "x4", yaxis: "y4", line: { width: 1.5 } },
+            { x, y: xyz.map(p => p[0]), name: `${pfx}pos_x`, xaxis: "x", yaxis: "y", line: { width: 1.5 } },
+            { x, y: xyz.map(p => p[1]), name: `${pfx}pos_y`, xaxis: "x", yaxis: "y", line: { width: 1.5 } },
+            { x, y: xyz.map(p => p[2]), name: `${pfx}pos_z`, xaxis: "x", yaxis: "y", line: { width: 1.5 } },
+            { x, y: grip, name: `${pfx}grip`, xaxis: "x2", yaxis: "y2", line: { width: 1.5 } },
+            { x, y: rot.map(p => p[0]), name: `${pfx}rot_x`, xaxis: "x3", yaxis: "y3", line: { width: 1.5 } },
+            { x, y: rot.map(p => p[1]), name: `${pfx}rot_y`, xaxis: "x3", yaxis: "y3", line: { width: 1.5 } },
+            { x, y: rot.map(p => p[2]), name: `${pfx}rot_z`, xaxis: "x3", yaxis: "y3", line: { width: 1.5 } },
           );
+        });
+        if (action.length && action[0] != null) {
+          arms.forEach((arm) => {
+            const r = arm.label === "R" || arm.label === "A1" ? 1 : 0;
+            const base = 7 * r;
+            const pfx = multi ? `${arm.label}_` : "";
+            if ((action[0].length || 0) <= base) return;
+            traces.push(
+              { x, y: action.map(a => (a && a[base + 0]) || 0), name: `${pfx}act_x`, xaxis: "x4", yaxis: "y4", line: { width: 1.5 } },
+              { x, y: action.map(a => (a && a[base + 1]) || 0), name: `${pfx}act_y`, xaxis: "x4", yaxis: "y4", line: { width: 1.5 } },
+              { x, y: action.map(a => (a && a[base + 2]) || 0), name: `${pfx}act_z`, xaxis: "x4", yaxis: "y4", line: { width: 1.5 } },
+            );
+          });
         }
         const shapes = [];
         const annotations = [];
@@ -1350,32 +1452,55 @@
           dragmode: false,
         };
       } else {
-        // 单独通道：一张大图
+        // 单独通道：一张大图（双臂时曲线带 L_/R_ 前缀）
         if (chan === "pos") {
-          traces = [
-            { x, y: xyz.map(p => p[0]), name: "pos_x", mode: "lines", line: { width: 2 } },
-            { x, y: xyz.map(p => p[1]), name: "pos_y", mode: "lines", line: { width: 2 } },
-            { x, y: xyz.map(p => p[2]), name: "pos_z", mode: "lines", line: { width: 2 } },
-          ];
+          arms.forEach((arm) => {
+            const pfx = multi ? `${arm.label}_` : "";
+            const xyz = arm.xyz;
+            traces.push(
+              { x, y: xyz.map(p => p[0]), name: `${pfx}pos_x`, mode: "lines", line: { width: 2 } },
+              { x, y: xyz.map(p => p[1]), name: `${pfx}pos_y`, mode: "lines", line: { width: 2 } },
+              { x, y: xyz.map(p => p[2]), name: `${pfx}pos_z`, mode: "lines", line: { width: 2 } },
+            );
+          });
         } else if (chan === "gripper") {
-          traces = [
-            { x, y: grip, name: "gripper_width", mode: "lines", line: { width: 2, color: "#3ecf8e" } },
-          ];
+          arms.forEach((arm, i) => {
+            const pfx = multi ? `${arm.label}_` : "";
+            traces.push({
+              x,
+              y: arm.grip,
+              name: `${pfx}gripper`,
+              mode: "lines",
+              line: { width: 2, color: i === 0 ? "#3ecf8e" : "#3d9cf0" },
+            });
+          });
         } else if (chan === "rot") {
-          traces = [
-            { x, y: rot.map(p => p[0]), name: "rotvec_x", mode: "lines", line: { width: 2 } },
-            { x, y: rot.map(p => p[1]), name: "rotvec_y", mode: "lines", line: { width: 2 } },
-            { x, y: rot.map(p => p[2]), name: "rotvec_z", mode: "lines", line: { width: 2 } },
-          ];
+          arms.forEach((arm) => {
+            const pfx = multi ? `${arm.label}_` : "";
+            const rot = arm.rot;
+            traces.push(
+              { x, y: rot.map(p => p[0]), name: `${pfx}rot_x`, mode: "lines", line: { width: 2 } },
+              { x, y: rot.map(p => p[1]), name: `${pfx}rot_y`, mode: "lines", line: { width: 2 } },
+              { x, y: rot.map(p => p[2]), name: `${pfx}rot_z`, mode: "lines", line: { width: 2 } },
+            );
+          });
         } else if (chan === "action") {
           const hasAct = action.length && action[0] != null;
-          const dim = hasAct ? Math.min(7, action[0].length || 7) : 0;
-          const names = ["act_x","act_y","act_z","act_rx","act_ry","act_rz","act_grip"];
+          const dim = hasAct ? (action[0].length || 7) : 0;
+          const baseNames = ["act_x","act_y","act_z","act_rx","act_ry","act_rz","act_grip"];
+          const allowedLabels = new Set(arms.map((a) => a.label));
           for (let d = 0; d < dim; d++) {
+            const armIdx = Math.floor(d / 7);
+            const local = d % 7;
+            const armLab = armIdx === 0 ? "L" : armIdx === 1 ? "R" : `A${armIdx}`;
+            if (multi && chartArmFilter !== "both" && !allowedLabels.has(armLab)) {
+              continue;
+            }
+            const pfx = multi ? `${armLab}_` : "";
             traces.push({
               x,
               y: action.map(a => (a && a[d]) || 0),
-              name: names[d] || `act_${d}`,
+              name: `${pfx}${baseNames[local] || `act_${local}`}`,
               mode: "lines",
               line: { width: 2 },
             });
@@ -1401,10 +1526,10 @@
           action: "action",
         }[chan] || chan;
         const titleExtra = {
-          pos: "TCP xyz",
-          gripper: "gripper width (m)",
-          rot: "axis-angle rotvec",
-          action: "xyz+rotvec+grip",
+          pos: multi ? "TCP xyz (L/R)" : "TCP xyz",
+          gripper: multi ? "gripper width L/R (m)" : "gripper width (m)",
+          rot: multi ? "axis-angle rotvec (L/R)" : "axis-angle rotvec",
+          action: multi ? "L/R xyz+rotvec+grip" : "xyz+rotvec+grip",
         }[chan] || chan;
         const yTickFormat = chan === "gripper" ? ".4f" : undefined;
         layout = {
@@ -1449,6 +1574,14 @@
       chartChannel = chan;
       document.querySelectorAll("#chanBtns button").forEach((btn) => {
         btn.classList.toggle("active", btn.dataset.chan === chan);
+      });
+      if (series) plotSeries(series, chartTitle, chartFrameIdx);
+    }
+
+    function setChartArmFilter(arm) {
+      chartArmFilter = arm || "both";
+      document.querySelectorAll("#armBtns button").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.arm === chartArmFilter);
       });
       if (series) plotSeries(series, chartTitle, chartFrameIdx);
     }
@@ -1530,11 +1663,22 @@
           best = i;
         }
       }
-      const xyz = (series.xyz && series.xyz[best]) || [0, 0, 0];
-      const rot = (series.rot && series.rot[best]) || [0, 0, 0];
-      const grip = series.grip ? series.grip[best] : 0;
+      const arms = armSeriesList(series).map((arm) => ({
+        label: arm.label,
+        xyz: (arm.xyz && arm.xyz[best]) || [0, 0, 0],
+        rot: (arm.rot && arm.rot[best]) || [0, 0, 0],
+        grip: arm.grip ? arm.grip[best] : 0,
+      }));
       const act = series.action ? series.action[best] : null;
-      return { i: best, step: xs[best], xyz, rot, grip, action: act };
+      return {
+        i: best,
+        step: xs[best],
+        xyz: arms[0].xyz,
+        rot: arms[0].rot,
+        grip: arms[0].grip,
+        arms,
+        action: act,
+      };
     }
 
     function fmt3(v) {
@@ -1546,21 +1690,33 @@
       if (!s) return [`step ${step}`];
       const lines = [`step ${s.step}`];
       const chan = chartChannel;
-      if (chan === "all" || chan === "pos") {
-        lines.push(`pos [${s.xyz.map(fmt3).join(", ")}] m`);
-      }
-      if (chan === "all" || chan === "gripper") {
-        lines.push(`grip ${Number(s.grip).toFixed(4)} m`);
-      }
-      if (chan === "all" || chan === "rot") {
-        lines.push(`rotvec [${s.rot.map(fmt3).join(", ")}] rad`);
-      }
+      const arms = s.arms || [{ label: "L", xyz: s.xyz, rot: s.rot, grip: s.grip }];
+      const multi = arms.length > 1;
+      arms.forEach((arm) => {
+        const pfx = multi ? `${arm.label} ` : "";
+        if (chan === "all" || chan === "pos") {
+          lines.push(`${pfx}pos [${arm.xyz.map(fmt3).join(", ")}] m`);
+        }
+        if (chan === "all" || chan === "gripper") {
+          lines.push(`${pfx}grip ${Number(arm.grip).toFixed(4)} m`);
+        }
+        if (chan === "all" || chan === "rot") {
+          lines.push(`${pfx}rotvec [${arm.rot.map(fmt3).join(", ")}] rad`);
+        }
+      });
       if ((chan === "all" || chan === "action") && s.action) {
         const a = s.action;
-        lines.push(
-          `action xyz [${fmt3(a[0])}, ${fmt3(a[1])}, ${fmt3(a[2])}]` +
-            (a.length > 6 ? ` grip ${Number(a[6]).toFixed(4)}` : "")
-        );
+        const nArm = Math.max(1, Math.ceil((a.length || 0) / 7));
+        for (let r = 0; r < nArm; r++) {
+          const base = 7 * r;
+          if (a.length <= base) break;
+          const lab = (arms[r] && arms[r].label) || (r === 0 ? "L" : "R");
+          const pfx = nArm > 1 ? `${lab} ` : "";
+          lines.push(
+            `${pfx}action xyz [${fmt3(a[base])}, ${fmt3(a[base + 1])}, ${fmt3(a[base + 2])}]` +
+              (a.length > base + 6 ? ` grip ${Number(a[base + 6]).toFixed(4)}` : "")
+          );
+        }
       }
       return lines;
     }
@@ -1930,6 +2086,9 @@
 
     document.querySelectorAll("#chanBtns button").forEach((btn) => {
       btn.onclick = () => setChartChannel(btn.dataset.chan);
+    });
+    document.querySelectorAll("#armBtns button").forEach((btn) => {
+      btn.onclick = () => setChartArmFilter(btn.dataset.arm);
     });
 
     // 网页内快捷键（焦点在浏览器时生效；与终端 P/C/S/D/Q 一致）
