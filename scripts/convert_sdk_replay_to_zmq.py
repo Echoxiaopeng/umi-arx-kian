@@ -72,12 +72,124 @@ def shift_tcp_along_z(
         pos = pos.reshape(1, 3)
         rotvec = rotvec.reshape(1, 3)
 
-    out = np.empty_like(pos)
     delta = np.array([0.0, 0.0, float(dz)], dtype=np.float64)
-    for i in range(pos.shape[0]):
-        r = st.Rotation.from_rotvec(rotvec[i])
-        out[i] = pos[i] + r.apply(delta)
+    # 批量旋转，避免 Python for-loop（30万帧也能秒级完成）
+    out = pos + st.Rotation.from_rotvec(rotvec).apply(delta)
     return out[0] if single else out
+
+
+def _assert_no_links(path: Path, *, label: str) -> None:
+    """拒绝输出里出现软链接；并抽查不应与源共享 inode（硬链接）。"""
+    symlinks = [p for p in path.rglob("*") if p.is_symlink()]
+    if symlinks:
+        raise RuntimeError(
+            f"{label} 含软链接（禁止）: 例 {symlinks[0]}"
+        )
+
+
+def copy_tree_no_links(src: Path, dst: Path) -> None:
+    """物理拷贝目录树：跟随源侧软链接内容，但不创建软/硬链接。"""
+    if dst.exists():
+        shutil.rmtree(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    def _copy_file(src_f: str, dst_f: str) -> str:
+        # copy2：新 inode，不保留硬链接关系
+        return shutil.copy2(src_f, dst_f, follow_symlinks=True)
+
+    shutil.copytree(src, dst, symlinks=False, copy_function=_copy_file)
+    _assert_no_links(dst, label=str(dst))
+
+
+def patch_zarr_sdk_to_zmq(
+    zarr_path: Path,
+    *,
+    eef_offset: float,
+    invert_grip: bool,
+    gripper_min: float,
+    gripper_max: float,
+) -> dict:
+    """在已拷贝的 zarr 上原地改写 eef_pos / gripper / action（不碰 RGB）。"""
+    import zarr
+
+    root = zarr.open(str(zarr_path), mode="r+")
+    data = root["data"]
+    n_robots = 0
+    while f"robot{n_robots}_eef_pos" in data:
+        n_robots += 1
+    if n_robots == 0:
+        raise KeyError("zarr 中没有 robot*_eef_pos")
+
+    action = np.asarray(data["action"][:], dtype=np.float64)
+    if action.ndim != 2 or action.shape[1] < 7 * n_robots:
+        raise ValueError(f"action shape 异常: {action.shape}")
+
+    stats = {"n_robots": n_robots, "n_steps": int(action.shape[0])}
+    for ridx in range(n_robots):
+        pos_key = f"robot{ridx}_eef_pos"
+        rot_key = f"robot{ridx}_eef_rot_axis_angle"
+        grip_key = f"robot{ridx}_gripper_width"
+        pos = np.asarray(data[pos_key][:], dtype=np.float64)
+        rot = np.asarray(data[rot_key][:], dtype=np.float64)
+        grip = np.asarray(data[grip_key][:], dtype=np.float64)
+
+        pos_before_mean = pos.mean(axis=0).tolist()
+        grip_before_mean = float(grip.mean())
+
+        if eef_offset != 0.0:
+            pos = shift_tcp_along_z(pos, rot, eef_offset)
+            data[pos_key][:] = pos
+            action[:, 7 * ridx : 7 * ridx + 3] = pos
+
+        if invert_grip:
+            grip = invert_gripper(
+                grip, gripper_min=gripper_min, gripper_max=gripper_max
+            )
+            data[grip_key][:] = grip
+            action[:, 7 * ridx + 6] = grip.reshape(-1)
+
+        stats[f"robot{ridx}"] = {
+            "pos_mean_before": pos_before_mean,
+            "pos_mean_after": pos.mean(axis=0).tolist(),
+            "grip_mean_before": grip_before_mean,
+            "grip_mean_after": float(grip.mean()),
+        }
+
+    data["action"][:] = action
+    return stats
+
+
+def assert_independent_from_source(src: Path, dst: Path, sample: int = 32) -> None:
+    """抽查 dst 文件与 src 无相同 inode（排除硬链接共用）。"""
+    src = src.resolve()
+    dst = dst.resolve()
+    files = [p for p in dst.rglob("*") if p.is_file() and not p.is_symlink()]
+    if not files:
+        raise RuntimeError(f"输出为空: {dst}")
+    # 优先抽查会被改写的数组 + 若干 RGB chunk
+    prefer = []
+    for sub in (
+        "data/robot0_eef_pos",
+        "data/robot0_gripper_width",
+        "data/action",
+        "data/camera0_rgb",
+    ):
+        prefer.extend(sorted((dst / sub).glob("*"))[:8])
+    candidates = [p for p in prefer if p.is_file()] + files
+    checked = 0
+    for p in candidates:
+        if checked >= sample:
+            break
+        rel = p.relative_to(dst)
+        src_p = src / rel
+        if not src_p.is_file():
+            continue
+        if p.stat().st_ino == src_p.stat().st_ino and p.stat().st_dev == src_p.stat().st_dev:
+            raise RuntimeError(
+                f"输出与源共享 inode（硬链接）: {rel}  ino={p.stat().st_ino}"
+            )
+        checked += 1
+    print(f"[check] independent inodes ok (sampled {checked} files)")
 
 
 def invert_gripper(
@@ -234,6 +346,14 @@ def summarize_gripper(buf: ReplayBuffer, tag: str) -> None:
     default=False,
     help="只打印将转换的 episode 数与 gripper 统计，不写盘",
 )
+@click.option(
+    "--mode",
+    type=click.Choice(["copy_patch", "episode"]),
+    default="copy_patch",
+    show_default=True,
+    help="copy_patch=物理拷贝后只改位姿/夹爪（推荐，无软硬链接）；"
+    "episode=逐集重写全部字段（慢，含 RGB 重压缩）",
+)
 def main(
     input_zarr: Path,
     output_zarr: Path,
@@ -243,6 +363,7 @@ def main(
     gripper_max: float,
     do_copy_videos: bool,
     dry_run: bool,
+    mode: str,
 ):
     input_zarr = input_zarr.resolve()
     output_zarr = output_zarr.resolve()
@@ -259,6 +380,8 @@ def main(
     print(f"  input        : {input_zarr}")
     print(f"  output       : {output_zarr}")
     print(f"  n_episodes   : {n_ep}")
+    print(f"  n_steps      : {src.n_steps}")
+    print(f"  mode         : {mode}")
     print(f"  eef_offset   : {eef_offset} m (link6 → eef_link along TCP Z)")
     print(f"  invert_grip  : {invert_gripper}  (range [{gripper_min}, {gripper_max}])")
     print(f"  copy_videos  : {do_copy_videos}")
@@ -267,6 +390,11 @@ def main(
 
     if dry_run:
         ep0 = src.get_episode(0, copy=True)
+        # dry_run 不读相机，避免大数组
+        ep0.pop("camera0_rgb", None)
+        for k in list(ep0.keys()):
+            if k.startswith("camera") and k.endswith("_rgb"):
+                ep0.pop(k, None)
         demo = convert_episode(
             ep0,
             eef_offset=eef_offset,
@@ -286,33 +414,51 @@ def main(
         print("dry_run 完成，未写盘。")
         return
 
-    if output_zarr.exists():
-        shutil.rmtree(output_zarr)
-    output_zarr.parent.mkdir(parents=True, exist_ok=True)
-
-    # mode=a：与采数脚本一致；目录已清空，会建成空 buffer
-    dst = ReplayBuffer.create_from_path(str(output_zarr), mode="a")
     meta = {
         "source": str(input_zarr),
         "convert": "sdk_to_zmq",
+        "mode": mode,
         "eef_offset_tcp_z": float(eef_offset),
         "invert_gripper": bool(invert_gripper),
         "gripper_min": float(gripper_min),
         "gripper_max": float(gripper_max),
+        "no_symlinks": True,
+        "no_hardlinks_to_source": True,
     }
 
-    for i in range(n_ep):
-        ep = src.get_episode(i, copy=True)
-        converted = convert_episode(
-            ep,
+    if mode == "copy_patch":
+        print("[1/3] physically copying zarr (no symlinks / no hardlinks)...")
+        copy_tree_no_links(input_zarr, output_zarr)
+        print("[2/3] patching eef_pos / gripper / action...")
+        patch_stats = patch_zarr_sdk_to_zmq(
+            output_zarr,
             eef_offset=eef_offset,
             invert_grip=invert_gripper,
             gripper_min=gripper_min,
             gripper_max=gripper_max,
         )
-        dst.add_episode(converted, compressors="disk")
-        if (i + 1) % 10 == 0 or i + 1 == n_ep:
-            print(f"  converted {i + 1}/{n_ep}")
+        meta["patch_stats"] = patch_stats
+        print("[3/3] verifying independence from source...")
+        assert_independent_from_source(input_zarr, output_zarr)
+        dst = ReplayBuffer.create_from_path(str(output_zarr), mode="r")
+    else:
+        if output_zarr.exists():
+            shutil.rmtree(output_zarr)
+        output_zarr.parent.mkdir(parents=True, exist_ok=True)
+        dst = ReplayBuffer.create_from_path(str(output_zarr), mode="a")
+        for i in range(n_ep):
+            ep = src.get_episode(i, copy=True)
+            converted = convert_episode(
+                ep,
+                eef_offset=eef_offset,
+                invert_grip=invert_gripper,
+                gripper_min=gripper_min,
+                gripper_max=gripper_max,
+            )
+            dst.add_episode(converted, compressors="disk")
+            if (i + 1) % 10 == 0 or i + 1 == n_ep:
+                print(f"  converted {i + 1}/{n_ep}")
+        assert_independent_from_source(input_zarr, output_zarr)
 
     summarize_gripper(dst, "after")
 
@@ -321,8 +467,14 @@ def main(
     print(f"Wrote meta: {meta_path}")
 
     if do_copy_videos:
-        n = copy_video_dirs(input_zarr, output_zarr)
-        print(f"Copied {n} video episode dirs.")
+        src_videos = input_zarr.parent / "videos"
+        dst_videos = output_zarr.parent / "videos"
+        if src_videos.is_dir():
+            print(f"Copying videos: {src_videos} -> {dst_videos}")
+            copy_tree_no_links(src_videos, dst_videos)
+            print(f"Copied videos dir ({sum(1 for _ in dst_videos.iterdir() if _.is_dir())} episodes).")
+        else:
+            print(f"[warn] 无视频目录可复制: {src_videos}")
 
     print(f"Done. output episodes={dst.n_episodes} steps={dst.n_steps}")
 

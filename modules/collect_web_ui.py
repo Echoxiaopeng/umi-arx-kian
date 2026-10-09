@@ -387,7 +387,15 @@ def _open_episode_video(env, episode_id: int) -> Optional[cv2.VideoCapture]:
     return cap
 
 
-def episode_frame_jpeg(env, episode_id: int, index: int, quality: int = 80) -> bytes:
+def episode_frame_jpeg(
+    env, episode_id: int, index: int, quality: int = 80
+) -> tuple[bytes, dict]:
+    """
+    取 episode 某一帧 JPEG。
+
+    优先 zarr 相机（与训练数据一致）；失败再回退 mp4。
+    返回 (jpeg_bytes, meta)，meta 含 source=zarr|mp4 与可选 warning。
+    """
     n_ep = int(env.replay_buffer.n_episodes)
     if episode_id < 0 or episode_id >= n_ep:
         raise IndexError(f"episode {episode_id} out of range")
@@ -397,30 +405,60 @@ def episode_frame_jpeg(env, episode_id: int, index: int, quality: int = 80) -> b
     n_steps = int(sl.stop - sl.start)
     idx = int(np.clip(index, 0, max(n_steps - 1, 0)))
 
-    # 优先 zarr 单帧（随机访问快）；避免每次打开整段 mp4 seek
+    zarr_err: Optional[str] = None
     cam_keys = sorted(
         k for k in rb.data.keys() if "camera" in k and "rgb" in k
     )
     if cam_keys and n_steps > 0:
         try:
             frame = np.asarray(rb.data[cam_keys[0]][sl.start + idx])
-            return rgb_to_jpeg(frame, quality=quality)
-        except Exception:
-            pass
+            jpeg = rgb_to_jpeg(frame, quality=quality)
+            if jpeg:
+                h, w = int(frame.shape[0]), int(frame.shape[1])
+                return jpeg, {
+                    "source": "zarr",
+                    "key": cam_keys[0],
+                    "width": w,
+                    "height": h,
+                    "warning": "",
+                }
+            zarr_err = "jpeg encode failed"
+        except Exception as exc:  # noqa: BLE001
+            zarr_err = str(exc)
+    elif not cam_keys:
+        zarr_err = "zarr 无 camera*_rgb"
+    else:
+        zarr_err = "episode 步数为 0"
 
     cap = _open_episode_video(env, episode_id)
     if cap is not None:
         try:
             n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            vidx = int(np.clip(index, 0, max(n_frames - 1, 0)))
+            if n_frames > 0 and n_steps > 1 and n_frames != n_steps:
+                vidx = int(round(idx * (n_frames - 1) / (n_steps - 1)))
+            else:
+                vidx = idx
+            vidx = int(np.clip(vidx, 0, max(n_frames - 1, 0)))
             cap.set(cv2.CAP_PROP_POS_FRAMES, vidx)
             ok, bgr = cap.read()
             if ok and bgr is not None:
-                return _encode_jpeg_bgr(bgr, quality=quality)
+                jpeg = _encode_jpeg_bgr(bgr, quality=quality)
+                h, w = int(bgr.shape[0]), int(bgr.shape[1])
+                reason = zarr_err or "zarr 不可用"
+                return jpeg, {
+                    "source": "mp4",
+                    "key": "",
+                    "width": w,
+                    "height": h,
+                    "warning": f"zarr 不可用，已回退 mp4（{reason}）",
+                }
         finally:
             cap.release()
 
-    raise FileNotFoundError(f"no video/images for episode {episode_id}")
+    raise FileNotFoundError(
+        f"no video/images for episode {episode_id}"
+        + (f" · zarr: {zarr_err}" if zarr_err else "")
+    )
 
 
 class CollectWebServer:
@@ -456,12 +494,27 @@ class CollectWebServer:
                     return
                 super().log_message(fmt, *args)
 
-            def _send(self, code: int, body: bytes, content_type: str) -> None:
+            def _send(
+                self,
+                code: int,
+                body: bytes,
+                content_type: str,
+                extra_headers: Optional[dict] = None,
+            ) -> None:
                 self.send_response(code)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header(
+                    "Access-Control-Expose-Headers",
+                    "X-Frame-Source, X-Frame-Warning, X-Frame-Width, X-Frame-Height",
+                )
+                if extra_headers:
+                    for hk, hv in extra_headers.items():
+                        if hv is None or hv == "":
+                            continue
+                        self.send_header(str(hk), str(hv))
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -608,8 +661,18 @@ class CollectWebServer:
                         eid = int(parts[2])
                         index = int(qs.get("index", ["0"])[0])
                         try:
-                            jpeg = episode_frame_jpeg(state.env, eid, index)
-                            self._send(200, jpeg, "image/jpeg")
+                            jpeg, meta = episode_frame_jpeg(state.env, eid, index)
+                            self._send(
+                                200,
+                                jpeg,
+                                "image/jpeg",
+                                extra_headers={
+                                    "X-Frame-Source": meta.get("source", ""),
+                                    "X-Frame-Warning": meta.get("warning", ""),
+                                    "X-Frame-Width": meta.get("width", ""),
+                                    "X-Frame-Height": meta.get("height", ""),
+                                },
+                            )
                         except (IndexError, FileNotFoundError) as exc:
                             self._send_json(404, {"error": str(exc)})
                         except Exception as exc:  # noqa: BLE001

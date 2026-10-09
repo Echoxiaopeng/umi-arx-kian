@@ -97,12 +97,31 @@
       max-height: min(42vh, 480px);
       align-items: stretch;
     }
+    /* 数据管理：上方预览不被下方 episode 区挤扁 */
+    body.viewer-mode .row.top {
+      flex: 0 0 auto;
+      flex-shrink: 0;
+      height: min(38vh, 440px);
+      min-height: 240px;
+      max-height: min(42vh, 480px);
+    }
+    body.viewer-mode .panel.grow {
+      flex: 1 1 0;
+      min-height: 0;
+    }
+    body.viewer-mode #viewerOnlyBar {
+      flex: 0 0 auto;
+    }
     @media (max-width: 960px) {
       .row.top {
         flex: 0 0 auto;
         max-height: 50vh;
         grid-template-columns: 1fr;
         overflow: auto;
+      }
+      body.viewer-mode .row.top {
+        height: min(32vh, 320px);
+        min-height: 180px;
       }
     }
     .panel {
@@ -146,10 +165,12 @@
     .live-img {
       flex: 1 1 auto;
       width: 100%;
-      min-height: 0;
+      min-height: 160px;
       max-height: none;
-      height: auto;
+      /* 用满面板；避免 224² 之类低分辨率按「原始像素」缩在角落里 */
+      height: 100%;
       object-fit: contain;
+      object-position: center center;
       background: #000;
       border-radius: 6px;
     }
@@ -674,6 +695,7 @@
       <div class="panel" id="livePanel">
         <h2 id="videoHeading">Live preview</h2>
         <img id="liveCam" class="live-img" alt="live" src="/api/video" />
+        <div class="msg" id="frameSourceHint" style="margin-top:6px;flex:0 0 auto"></div>
       </div>
       <div class="panel panel-control" id="controlPanel">
         <h2>Control</h2>
@@ -931,6 +953,7 @@
       const connecting = mode === "CONNECTING";
       hubMode = mode === "HUB" || connecting;
       viewerOnly = !!(s && s.viewer_only) || mode === "VIEW";
+      document.body.classList.toggle("viewer-mode", viewerOnly && !hubMode);
 
       $("hubPage").classList.toggle("show", hubMode);
       $("mainWrap").style.display = hubMode ? "none" : "flex";
@@ -1657,7 +1680,61 @@
       }
       if (selectedEp == null) return;
       cam.dataset.stream = "0";
-      cam.src = `/api/episodes/${selectedEp}/frame?index=${index}&t=${Date.now()}`;
+      try {
+        const r = await fetch(
+          `/api/episodes/${selectedEp}/frame?index=${index}&t=${Date.now()}`
+        );
+        if (!r.ok) {
+          let err = r.statusText;
+          try {
+            const j = await r.json();
+            if (j && j.error) err = j.error;
+          } catch (_) {}
+          setFrameSourceHint("error", err);
+          return;
+        }
+        const source = r.headers.get("X-Frame-Source") || "";
+        const warn = r.headers.get("X-Frame-Warning") || "";
+        const w = r.headers.get("X-Frame-Width") || "";
+        const h = r.headers.get("X-Frame-Height") || "";
+        const blob = await r.blob();
+        if (cam._blobUrl) {
+          try { URL.revokeObjectURL(cam._blobUrl); } catch (_) {}
+        }
+        cam._blobUrl = URL.createObjectURL(blob);
+        cam.src = cam._blobUrl;
+        setFrameSourceHint(source, warn, w, h);
+      } catch (e) {
+        setFrameSourceHint("error", e.message || String(e));
+      }
+    }
+
+    function setFrameSourceHint(source, warn, width, height) {
+      const el = $("frameSourceHint");
+      if (!el) return;
+      if (source === "error") {
+        el.style.color = "var(--danger)";
+        el.textContent = "帧加载失败: " + (warn || "");
+        return;
+      }
+      const wh =
+        width && height ? `${width}×${height}` : "";
+      if (source === "mp4") {
+        el.style.color = "var(--warn)";
+        el.textContent =
+          (warn || "已回退 mp4") + (wh ? ` · ${wh}` : "");
+        return;
+      }
+      if (source === "zarr") {
+        el.style.color = "var(--muted)";
+        el.textContent =
+          "来源 zarr" + (wh ? ` · ${wh}` : "") +
+          (Number(width) > 0 && Number(width) < 480
+            ? "（训练分辨率，偏小属正常）"
+            : "");
+        return;
+      }
+      el.textContent = "";
     }
 
     function showLiveStream({ force = false } = {}) {
@@ -1667,7 +1744,12 @@
         el.dataset.stream === "1" && String(el.src || "").indexOf("/api/video") >= 0;
       if (!force && already) return;
       el.dataset.stream = "1";
+      if (el._blobUrl) {
+        try { URL.revokeObjectURL(el._blobUrl); } catch (_) {}
+        el._blobUrl = null;
+      }
       el.src = "/api/video?t=" + Date.now();
+      if ($("frameSourceHint")) $("frameSourceHint").textContent = "";
       if ($("videoHeading") && !viewerOnly) {
         $("videoHeading").textContent = status.recording
           ? "Live preview · REC"

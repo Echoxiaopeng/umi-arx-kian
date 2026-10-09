@@ -12,22 +12,27 @@
 这里的rot6d,是按照旋转矩阵的前两行flatten得到的
 
 1. State (20维) = flatten(eef_pos[2,3], eef_rot[2,6], gripper[2,1])
+   默认 state_ref=current（相对当前 EE）:
    - hist_pos  = R_t^T (p_{t-s} - p_t)
    - curr_pos  = 0
    - hist_rot6 = rot6d(R_t^T R_{t-s})
    - curr_rot6 = identity
-   - grip      = [g_{t-s}, g_t]
-2. Action (10维) = 相对当前 EE 的下一步实际 TCP
+   - grip      = [g_{t-s}, g_t]（绝对值）
+   state_ref=episode_first（相对 episode 第一帧）:
+   - hist_pos/rot6 = T_0^{-1} @ T_{t-s}
+   - curr_pos/rot6 = T_0^{-1} @ T_t
+   - grip      = [g_{t-s}, g_t]（绝对值）
+2. Action (10维) = 相对当前 EE 的下一步实际 TCP（两种 state 模式共用）
    - pos  = R_t^T (p_{t+s} - p_t)
    - rot6 = rot6d(R_t^T R_{t+s})
-   - grip = g_{t+s}
+   - grip = g_{t+s}（绝对值）
 3. FPS: 默认 60→20（stride=3）
 4. 视频: camera0_rgb → uint8 → observation.images.wrist_image
 
 用法:
     python scripts/convert_replay_buffer_to_lerobot_rel.py
     python scripts/convert_replay_buffer_to_lerobot_rel.py --episode 0
-    python scripts/convert_replay_buffer_to_lerobot_rel.py --episode 0 --skip-video-stats
+    python scripts/convert_replay_buffer_to_lerobot_rel.py --state-ref episode_first
 """
 
 from __future__ import annotations
@@ -143,7 +148,17 @@ def convert_episode_arrays(
     fps_src: int = 60,
     fps_dst: int = 20,
     index_start: int = 0,
+    state_ref: str = "current",
 ) -> tuple[pa.Table, int]:
+    """Convert one episode to LeRobot parquet columns.
+
+    state_ref:
+      - current: hist/curr relative to current EE (legacy Light-WAM)
+      - episode_first: hist/curr relative to episode first frame
+    Action is always relative to current EE; gripper is absolute.
+    """
+    if state_ref not in ("current", "episode_first"):
+        raise ValueError(f"state_ref must be 'current' or 'episode_first', got {state_ref}")
     if fps_src % fps_dst != 0:
         raise ValueError(f"fps_src ({fps_src}) must be divisible by fps_dst ({fps_dst})")
     stride = fps_src // fps_dst
@@ -154,6 +169,9 @@ def convert_episode_arrays(
         raise ValueError(
             f"Length mismatch: pos={n_frames}, rot={len(eef_rot_aa)}, grip={len(gripper)}"
         )
+
+    pos_first = eef_pos[0]
+    rot_first = eef_rot_aa[0]
 
     dst_indices = list(range(0, n_frames, stride))
     n_dst = len(dst_indices)
@@ -172,15 +190,27 @@ def convert_episode_arrays(
         grip_cur = float(gripper[src_idx])
         grip_hist = float(gripper[hist_idx])
 
-        hist_pos, hist_rot6 = pose_rel_to_current(
-            eef_pos[hist_idx], eef_rot_aa[hist_idx], pos_cur, rot_cur
-        )
+        if state_ref == "current":
+            hist_pos, hist_rot6 = pose_rel_to_current(
+                eef_pos[hist_idx], eef_rot_aa[hist_idx], pos_cur, rot_cur
+            )
+            curr_pos = np.zeros(3, dtype=np.float32)
+            curr_rot6 = IDENTITY_ROT6.copy()
+        else:
+            # Both hist and curr expressed in episode-first frame.
+            hist_pos, hist_rot6 = pose_rel_to_current(
+                eef_pos[hist_idx], eef_rot_aa[hist_idx], pos_first, rot_first
+            )
+            curr_pos, curr_rot6 = pose_rel_to_current(
+                pos_cur, rot_cur, pos_first, rot_first
+            )
+
         state = np.concatenate(
             [
                 hist_pos,
-                np.zeros(3, dtype=np.float32),
+                curr_pos,
                 hist_rot6,
-                IDENTITY_ROT6.copy(),
+                curr_rot6,
                 np.array([grip_hist, grip_cur], dtype=np.float32),
             ]
         ).astype(np.float32)
@@ -466,10 +496,19 @@ def convert_replay_buffer(
     skip_videos: bool = False,
     stats_only: bool = False,
     skip_video_stats: bool = False,
-) -> None:
+    state_ref: str = "current",
+    episode_index_offset: int = 0,
+    index_start_offset: int = 0,
+) -> dict:
+    """Convert one zarr replay buffer to LeRobot v2.1.
+
+    Returns summary dict with n_episodes / n_frames / global index offset used.
+    """
     dst_meta = dst_dir / "meta"
     dst_meta.mkdir(parents=True, exist_ok=True)
-    episode_filter = {episode} if episode is not None else None
+    episode_filter = (
+        {episode + episode_index_offset} if episode is not None else None
+    )
 
     if stats_only:
         n = write_episodes_stats(
@@ -478,7 +517,7 @@ def convert_replay_buffer(
             episode_filter=episode_filter,
         )
         print(f"\n已写入 episodes_stats.jsonl ({n} episodes) -> {dst_meta / 'episodes_stats.jsonl'}")
-        return
+        return {"n_episodes": n, "n_frames": 0}
 
     src = zarr.open(str(src_zarr), mode="r")
     episode_ends = np.asarray(src["meta"]["episode_ends"])
@@ -487,28 +526,29 @@ def convert_replay_buffer(
     if episode is not None:
         if episode < 0 or episode >= len(slices):
             raise ValueError(f"episode {episode} out of range [0, {len(slices)})")
-        episode_indices = [episode]
+        local_episode_indices = [episode]
     else:
-        episode_indices = list(range(len(slices)))
+        local_episode_indices = list(range(len(slices)))
 
     stride = fps_src // fps_dst
     dst_data = dst_dir / "data" / "chunk-000"
     dst_video_dir = dst_dir / "videos" / "chunk-000" / "observation.images.wrist_image"
     dst_data.mkdir(parents=True, exist_ok=True)
 
-    index_offsets: dict[int, int] = {}
-    next_index = 0
+    # Precompute per-local-episode frame counts for global index offsets.
+    local_n_dst: dict[int, int] = {}
     for i, (s, e) in enumerate(slices):
         n_src = e - s
-        n_dst = (n_src + stride - 1) // stride
-        index_offsets[i] = next_index
-        next_index += n_dst
+        local_n_dst[i] = (n_src + stride - 1) // stride
 
     print(f"源 zarr: {src_zarr}")
-    print(f"Episodes: {len(episode_indices)}")
+    print(f"Episodes: {len(local_episode_indices)}")
     print(f"FPS: {fps_src} → {fps_dst} (stride={stride})")
     print("Action: 10D = next EE pose relative to current EE (from actual TCP, not data/action)")
-    print("State:  20D = flatten(hist/curr eef_pos, eef_rot6d, gripper)")
+    if state_ref == "episode_first":
+        print("State:  20D = hist/curr relative to episode first frame + abs gripper")
+    else:
+        print("State:  20D = hist/curr relative to current EE + abs gripper")
     print(f"Output: {dst_dir}")
     if "action" in src["data"]:
         print("注意: 忽略 data/action（指令流），只用 robot0_eef_* + gripper")
@@ -520,30 +560,42 @@ def convert_replay_buffer(
 
     total_frames = 0
     new_episodes = []
+    next_index = index_start_offset
+    # Build index_start for each local episode in conversion order.
+    running = index_start_offset
+    index_starts: dict[int, int] = {}
+    for local_ep in local_episode_indices:
+        index_starts[local_ep] = running
+        running += local_n_dst[local_ep]
 
-    for ep_idx in tqdm(episode_indices, desc="转换 episodes"):
-        start, end = slices[ep_idx]
+    for local_ep in tqdm(local_episode_indices, desc="转换 episodes"):
+        start, end = slices[local_ep]
+        global_ep = local_ep + episode_index_offset
         table, n_dst = convert_episode_arrays(
             eef_pos=np.asarray(pos_arr[start:end]),
             eef_rot_aa=np.asarray(rot_arr[start:end]),
             gripper=np.asarray(grip_arr[start:end]),
-            episode_index=ep_idx,
+            episode_index=global_ep,
             fps_src=fps_src,
             fps_dst=fps_dst,
-            index_start=index_offsets[ep_idx],
+            index_start=index_starts[local_ep],
+            state_ref=state_ref,
         )
-        pq.write_table(table, str(dst_data / f"episode_{ep_idx:06d}.parquet"))
+        pq.write_table(table, str(dst_data / f"episode_{global_ep:06d}.parquet"))
 
         if not skip_videos:
             src_indices = np.arange(0, end - start, stride)
             encode_video(
                 np.asarray(rgb_arr[start + src_indices]),
-                dst_video_dir / f"episode_{ep_idx:06d}.mp4",
+                dst_video_dir / f"episode_{global_ep:06d}.mp4",
                 fps=fps_dst,
             )
 
         total_frames += n_dst
-        new_episodes.append({"episode_index": ep_idx, "tasks": [task], "length": n_dst})
+        next_index = index_starts[local_ep] + n_dst
+        new_episodes.append(
+            {"episode_index": global_ep, "tasks": [task], "length": n_dst}
+        )
 
     episodes_path = dst_meta / "episodes.jsonl"
     if episode_filter is not None and episodes_path.exists():
@@ -577,6 +629,7 @@ def convert_replay_buffer(
         total_tasks=1,
         fps_dst=fps_dst,
     )
+    info["state_ref"] = state_ref
     assert info["features"]["observation.state"]["names"]["motors"] == STATE_NAMES
     assert info["features"]["action"]["names"]["motors"] == ACTION_NAMES
     with open(dst_meta / "info.json", "w") as f:
@@ -590,13 +643,25 @@ def convert_replay_buffer(
 
     print("\n转换完成!")
     print(f"  输出目录: {dst_dir}")
-    print(f"  Episodes (本次): {len(episode_indices)}")
+    print(f"  Episodes (本次): {len(local_episode_indices)}")
     print(f"  本次帧数: {total_frames} ({total_frames / fps_dst:.1f}s @ {fps_dst}fps)")
     print("  Action 维度: 10 (下一步相对当前 EE)")
-    print("  State 维度:  20 (hist/curr 相对当前 EE + gripper)")
+    if state_ref == "episode_first":
+        print("  State 维度:  20 (hist/curr 相对 episode 第一帧 + abs gripper)")
+    else:
+        print("  State 维度:  20 (hist/curr 相对当前 EE + abs gripper)")
     print("  视频: observation.images.wrist_image")
     print("  Meta: info.json / episodes.jsonl / tasks.jsonl / episodes_stats.jsonl")
     print(f"  FPS: {fps_dst}")
+    return {
+        "n_episodes": len(local_episode_indices),
+        "n_frames": total_frames,
+        "next_episode_index": episode_index_offset + (
+            (local_episode_indices[-1] + 1) if local_episode_indices else 0
+        ),
+        "next_index": next_index,
+        "state_ref": state_ref,
+    }
 
 
 def main() -> None:
@@ -617,6 +682,13 @@ def main() -> None:
     parser.add_argument("--skip-videos", action="store_true")
     parser.add_argument("--stats-only", action="store_true")
     parser.add_argument("--skip-video-stats", action="store_true")
+    parser.add_argument(
+        "--state-ref",
+        type=str,
+        choices=["current", "episode_first"],
+        default="current",
+        help="state 参考系：current=相对当前 EE；episode_first=相对 episode 第一帧",
+    )
     args = parser.parse_args()
 
     if not args.stats_only and not args.src_zarr.exists():
@@ -632,6 +704,7 @@ def main() -> None:
         skip_videos=args.skip_videos,
         stats_only=args.stats_only,
         skip_video_stats=args.skip_video_stats,
+        state_ref=args.state_ref,
     )
 
 
