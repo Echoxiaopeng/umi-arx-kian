@@ -68,8 +68,10 @@ SSH 远程控制（无 X11）:
 
 export DISPLAY=:1
 export XAUTHORITY=/run/user/1000/gdm/Xauthority
+conda activate umi-arx-kian
 python scripts/eval_real_umi_lingbot.py --terminal_keys --policy_port 5566
 
+python scripts/eval_real_umi_lingbot.py --terminal_keys --policy_port 5566 --sync_infer
 
 python scripts/eval_real_umi_lingbot.py --policy_host 58.251.254.222 --policy_port 5566
 

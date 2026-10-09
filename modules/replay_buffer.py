@@ -98,8 +98,13 @@ class ReplayBuffer:
         assert "data" in root
         assert "meta" in root
         assert "episode_ends" in root["meta"]
+        episode_ends = root["meta"]["episode_ends"]
+        # 空 buffer：episode_ends 长度为 0，不能取 [-1]
+        n_steps = int(episode_ends[-1]) if len(episode_ends) > 0 else 0
         for key, value in root["data"].items():
-            assert value.shape[0] == root["meta"]["episode_ends"][-1]
+            assert value.shape[0] == n_steps, (
+                f"data[{key!r}] length {value.shape[0]} != episode_ends n_steps {n_steps}"
+            )
         self.root = root
 
     # ============= create constructors ===============
@@ -145,7 +150,7 @@ class ReplayBuffer:
         Open a on-disk zarr directly (for dataset larger than memory).
         Slower.
         """
-        group = zarr.open(os.path.expanduser(zarr_path), mode)
+        group = zarr.open(os.path.expanduser(zarr_path), mode=mode)
         return cls.create_from_group(group, **kwargs)
 
     # ============= copy constructors ===============
@@ -243,7 +248,7 @@ class ReplayBuffer:
         if backend == "numpy":
             print("backend argument is deprecated!")
             store = None
-        group = zarr.open(os.path.expanduser(zarr_path), "r")
+        group = zarr.open(os.path.expanduser(zarr_path), mode="r")
         return cls.copy_from_store(
             src_store=group.store,
             store=store,
@@ -574,6 +579,54 @@ class ReplayBuffer:
             self.episode_ends.resize(len(episode_ends) - 1)
         else:
             self.episode_ends.resize(len(episode_ends) - 1, refcheck=False)
+
+    def delete_episode(self, idx: int):
+        """删除任意一条 episode（含中间条），并重算后续 episode_ends。"""
+        n = int(self.n_episodes)
+        if idx < 0 or idx >= n:
+            raise IndexError(f"episode {idx} out of range 0..{n - 1}")
+        if idx == n - 1:
+            self.drop_episode()
+            return
+
+        ends = np.asarray(self.episode_ends[:], dtype=np.int64).copy()
+        start = 0 if idx == 0 else int(ends[idx - 1])
+        end = int(ends[idx])
+        remove_len = end - start
+        is_zarr = self.backend == "zarr"
+
+        for _key, value in self.data.items():
+            if remove_len <= 0:
+                continue
+            # 拼掉中间段；zarr 用整段读写避免复杂 in-place 移动
+            arr = value[:]
+            new_arr = np.concatenate([arr[:start], arr[end:]], axis=0)
+            if is_zarr:
+                value.resize(new_arr.shape)
+                if new_arr.size > 0:
+                    value[:] = new_arr
+            else:
+                value.resize(new_arr.shape, refcheck=False)
+                if new_arr.size > 0:
+                    value[:] = new_arr
+
+        new_ends = []
+        for i in range(n):
+            if i == idx:
+                continue
+            e = int(ends[i])
+            if i > idx:
+                e -= remove_len
+            new_ends.append(e)
+        new_ends_arr = np.asarray(new_ends, dtype=np.int64)
+        if is_zarr:
+            self.episode_ends.resize(len(new_ends_arr))
+            if len(new_ends_arr) > 0:
+                self.episode_ends[:] = new_ends_arr
+        else:
+            self.episode_ends.resize(len(new_ends_arr), refcheck=False)
+            if len(new_ends_arr) > 0:
+                self.episode_ends[:] = new_ends_arr
 
     def pop_episode(self):
         assert self.n_episodes > 0

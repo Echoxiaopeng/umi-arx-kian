@@ -228,6 +228,16 @@ class Arx5Client:
             raise ValueError(f"Error: {reply_msg['data']}")
         self.get_state()
 
+    def sync_after_drag(self):
+        """
+        拖拽结束后同步 ZMQ server 的 last_eef_cmd（ac_one / ac_one_evan）。
+        避免退出阻尼后因距离检查拒绝 SET_EE_POSE。
+        """
+        reply_msg = self.send_recv({"cmd": "EVAN_SYNC_AFTER_DRAG", "data": None})
+        assert reply_msg["cmd"] == "EVAN_SYNC_AFTER_DRAG"
+        if reply_msg["data"] != "OK":
+            raise ValueError(f"Error: {reply_msg['data']}")
+        self.get_state()
 
     def set_gravity_compensation(self, gravity_compensation: bool):
         reply_msg = self.send_recv({"cmd": "SET_GRAVITY_COMPENSATION", "data": gravity_compensation})

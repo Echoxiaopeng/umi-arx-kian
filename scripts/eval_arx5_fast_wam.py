@@ -2,7 +2,13 @@
 
 真实机器人 UMI 策略评估脚本（Fast-WAM 适配版）。
 
-对齐数据集: data/umi_pick_elec_lerobot_real
+对齐数据集 / 训练标签:
+  - data/umi_pick_elec_lerobot_real 及 FastWAM replay_buffer_lerobot_rel*
+  - FastWAM dataloader 经 StepRelativeEEF10ToCurrentRelative 后，
+    action horizon 为 current-relative:
+      A_i = T_cur^{-1} @ T_{t0+i+1}
+    decode: T_i = T_cur @ A_i（每步相对同一当前 EE，不链式积分）
+
 通过 WebSocket 连接 Fast-WAM 推理服务（serve_real_robot_policy.py），
 不需要在本脚本内加载模型权重。
 
@@ -28,16 +34,17 @@ Recording control:
 Recording control:
     - 按 "S" → 停止评估，控制权交还给人
 
-与 umi_pick_elec_lerobot_real 对齐:
+与 umi_pick_elec_lerobot_real / FastWAM current-relative 对齐:
   1. 图像 float[0,1] → uint8
   2. state (20): flatten(eef_pos[2,3], eef_rot[2,6], gripper[2,1])
      相对当前 EE（UMI get_real_umi_obs_dict）:
        [pos_hist(3), pos_curr(3≈0), rot_hist(6), rot_curr(6≈I), grip_hist, grip_curr]
      夹爪 state[18:20] 使用训练集极性（越大越夹紧），由 _build_umi_state 从 ZMQ 读数转换
-  3. action (10): 相对当前 EE 的下一步目标 [pos(3), rot6d(6), gripper]
-     SE(3): T_next = T_cur @ T_action
-       p_next = p_cur + R_cur @ a_pos
-       R_next = R_cur @ R(a_rot6)
+  3. action (10): current-relative waypoint [pos(3), rot6d(6), gripper]
+     A_i = T_cur^{-1} @ T_{target,i}
+     SE(3) decode（相对同一当前 EE，不链式）:
+       p_i = p_cur + R_cur @ A_i_pos
+       R_i = R_cur @ R(A_i_rot6)
      模型输出的 action[...,9] 同样是训练集极性；下发前 invert 回 ZMQ 物理开口
   4. rot6 约定: 旋转矩阵前两行展平 [r00,r01,r02, r10,r11,r12]
   5. 夹爪极性（采集 zarr / 训练集 vs 真机 ZMQ）:
@@ -48,7 +55,7 @@ Recording control:
        - --no_invert_gripper 同时关闭 state/action 两侧转换
        - 人工 SpaceMouse / init_gripper_delta 始终操作 ZMQ 物理开口，不 invert
   6. 训练/采集使用 link6，ZMQ 读写 eef_link：
-     eef_link → 沿 TCP Z 退回 0.145m 到 link6 → 在 link6 上构造 state / 积分 action
+     eef_link → 沿 TCP Z 退回 0.145m 到 link6 → 在 link6 上构造 state / decode action
      → 沿新姿态 TCP Z 前移 0.145m 到 eef_link → 下发绝对 TCP
 
 Policy 控制循环（串行，不开流水线）:
@@ -85,8 +92,12 @@ export XAUTHORITY=/run/user/1000/gdm/Xauthority
 
 python /data1/projects/umi-arx-kian/scripts/eval_arx5_fast_wam.py \
     -o data_local/umi_eval_output \
+    --policy_port 5566 --terminal_keys\
+    -eh 32 \
+    -f 10
+
+
     --policy_host 112.91.138.78 \
-    --policy_port 5566 --terminal_keys
 
 """
 
@@ -156,17 +167,16 @@ def _msgpack_decode(obj):
 
 
 # ===========================================================================
-# 与 umi_pick_elec_lerobot_real 对齐
-# Action (10): [pos(3), rot6d(6), gripper(abs)]  — T_action = T_cur^{-1} @ T_next
+# 与 FastWAM current-relative 训练标签对齐
+# Action (10): [pos(3), rot6d(6), gripper(abs)]
+#   A_i = T_cur^{-1} @ T_{target,i}（horizon 内每步相对同一当前 EE）
+#   decode: T_i = T_cur @ A_i
+#           p_i = p_cur + R_cur @ A_i_pos
+#           R_i = R_cur @ R_from_rot6(A_i_rot6)
 # State  (20): [pos_hist(3), pos_curr(3), rot_hist(6), rot_curr(6), grip_hist, grip_curr]
 #   - 位姿: 相对当前 EE（curr≈0 / I；hist = T_cur^{-1} @ T_hist）
 #   - 旋转: 6D = 旋转矩阵前两行 [r00,r01,r02, r10,r11,r12]
-#   - 复合: T_next = T_cur @ T_action
-#           p_next = p_cur + R_cur @ a_pos
-#           R_next = R_cur @ R_from_rot6(a_rot6)
-#   - 夹爪: 训练集绝对值，越大越夹紧（与 zarr robot0_gripper_width 同语义）
-#           真机 ZMQ 为物理开口（越大越张开）；state/action 经 _invert_gripper_width 互转
-#           人工遥操与 init 仍用 ZMQ 物理开口，不经 invert
+#   - 夹爪: 训练集绝对值，越大越夹紧；真机 ZMQ 为物理开口（越大越张开）
 # ===========================================================================
 
 ACTION_DIM = 10
@@ -206,7 +216,6 @@ def _invert_gripper_width(
     """训练集极性（越大越夹紧）↔ ZMQ 物理开口（越大越张开）。
 
     线性对翻: g' = gripper_min + gripper_max - g，在 [min, max] 内自逆。
-    例: min=0.011, max=0.085 时，ZMQ 全开 0.085 → 训练 ≈0.011；ZMQ 闭合 0.011 → 训练 ≈0.085。
     """
     return (
         gripper_min_width
@@ -272,7 +281,6 @@ def _read_live_tcp_pose(env) -> tuple[np.ndarray, np.ndarray, float, float]:
     """
     直接从机器人 ring buffer 读最新绝对 TCP（不走相机对齐，开销远低于 get_obs）。
 
-    位姿与 get_obs["robot0_eef_*"] 同源（ActualTCPPose）。
     返回 (pos(3), rotvec(3), gripper, robot_timestamp)；
     gripper 为 ZMQ 物理开口（越大越张开，未 invert）。
     """
@@ -358,7 +366,7 @@ def _build_umi_state(
     gripper_max_width: float = DEFAULT_GRIPPER_MAX_WIDTH,
 ) -> np.ndarray:
     """
-    构造 20 维 UMI state（与 umi_pick_elec_lerobot_real / 训练分布一致）:
+    构造 20 维 UMI state（与训练分布一致）:
         [pos_hist(3), pos_curr(3), rot_hist(6), rot_curr(6), grip_hist, grip_curr]
 
     需要 robot_obs_horizon >= 2。
@@ -369,9 +377,8 @@ def _build_umi_state(
         hist → T_cur^{-1} @ T_hist
 
     夹爪:
-        训练集为绝对值、越大越夹紧（与 convert_replay_buffer_to_lerobot_rel 一致）
+        训练集为绝对值、越大越夹紧
         默认 invert_gripper=True：把 ZMQ 物理开口转为训练极性后再写入 state[18:20]
-        后续 _clip_umi_state_for_model 在训练极性下 clip 到 TRAIN_STATE_GRIP_* 范围
     """
     eef_pos = np.asarray(obs["robot0_eef_pos"], dtype=np.float64)
     if eef_pos.ndim != 2 or eef_pos.shape[0] < 2:
@@ -386,11 +393,9 @@ def _build_umi_state(
     pos_hist_rel, rot_hist_rel = _pose_relative_to(
         pos_hist, rotvec_hist, ref_pos=pos_curr, ref_rotvec=rotvec_curr
     )
-    # curr 相对自身恒为 0 / I（与数据集数值一致）
     pos_curr_rel = np.zeros(3, dtype=np.float64)
     rot_curr_rel = IDENTITY_ROT6.copy()
 
-    # ZMQ 物理开口 → 训练集极性（与 action 侧 invert 对称）
     grip_pair = np.array([grip_hist, grip_curr], dtype=np.float64)
     if invert_gripper:
         grip_pair = _invert_gripper_width(
@@ -439,29 +444,61 @@ def _delta_chunk_to_absolute_pose(
     invert_gripper: bool = True,
 ) -> np.ndarray:
     """
-    将模型输出（相对当前 EE 的逐步 SE(3)）积分为绝对 TCP，供 env.exec_actions。
+    模型输出 → 机器人可执行的绝对 TCP 轨迹。
 
-    每步 action ≈ T_t^{-1} @ T_{t+1}，链式复合:
-        p <- p + R @ a_pos
-        R <- R @ R_from_rot6(a_rot6)
+    ---------------------------------------------------------------------------
+    模型给的是什么？（current-relative，不是逐步相对）
+    ---------------------------------------------------------------------------
+    action_chunk[i] = A_i = [pos(3), rot6d(6), grip(1)]
 
-    夹爪:
-        模型 action[...,9] 为训练集绝对值（越大越夹紧）
-        invert_gripper=True 时先转为 ZMQ 物理开口，再可选二值化与 clip
-        gripper_close_threshold 在 ZMQ 物理开口空间判定（小于阈值 → 闭合）
+    约定（与 FastWAM StepRelativeEEF10ToCurrentRelative 训练标签一致）:
+        A_i  描述的是「从【当前】末端到【第 i 个目标】」的相对位姿
+        A_i = T_cur^{-1} @ T_i
+        即：horizon 里每一步都锚定在同一张拍照时的 cur，而不是上一步。
 
-    返回 (N, 7): [x,y,z, rx,ry,rz, grip]，grip 为 ZMQ 物理开口
+    例子（只看位置）:
+        当前末端在世界系 p_cur
+        A_0.pos = [0.01, 0, 0]  → 第 0 个目标在末端前方 1cm
+        A_3.pos = [0.04, 0, 0]  → 第 3 个目标在末端前方 4cm（仍相对 cur，不是相对 A_2）
+
+    ---------------------------------------------------------------------------
+    和「旧版链式积分」的区别（容易混）
+    ---------------------------------------------------------------------------
+    旧 step-relative（已废弃）:
+        a_i = T_i^{-1} @ T_{i+1}          # 每步相对「上一步自己」
+        执行时必须链式:  T <- T @ a_i     # 走完第 i 步，基准才变成新位姿
+
+    现在 current-relative:
+        A_i = T_cur^{-1} @ T_i            # 每步相对「同一当前」
+        执行时各自独立:  T_i = T_cur @ A_i
+        循环里 cur / R_cur 全程不变，不要写成 T <- T @ A_i。
+
+    公式展开（SE(3) 左乘）:
+        T_i = T_cur @ A_i
+        ⇒  p_i = p_cur + R_cur @ A_i.pos
+        ⇒  R_i = R_cur @ R_from_rot6(A_i.rot6)
+
+    ---------------------------------------------------------------------------
+    夹爪
+    ---------------------------------------------------------------------------
+    action[..., 9] 是训练集极性（越大越夹紧）。
+    invert 后变成 ZMQ 物理开口（越大越张开），再可选二值化 / clip。
+
+    返回 (N, 7): [x,y,z, rx,ry,rz, grip_zmq]
     """
     deltas = np.asarray(action_chunk, dtype=np.float64)
     if deltas.ndim != 2 or deltas.shape[1] != ACTION_DIM:
         raise ValueError(f"Expected action chunk (N, {ACTION_DIM}), got {deltas.shape}")
 
     out = np.zeros((deltas.shape[0], 7), dtype=np.float64)
-    pos = np.asarray(cur_pos, dtype=np.float64).reshape(3).copy()
-    r_cur = st.Rotation.from_rotvec(np.asarray(cur_rotvec, dtype=np.float64).reshape(3))
 
+    # 解码基准 = 推理时的「当前」末端（通常是拍照/rebase 后的 link6 位姿）。
+    # 下面整个 for 循环都用这一对 (pos_base, r_base)，不会随 i 更新。
+    pos_base = np.asarray(cur_pos, dtype=np.float64).reshape(3).copy()
+    r_base = st.Rotation.from_rotvec(np.asarray(cur_rotvec, dtype=np.float64).reshape(3))
+
+    # ----- 夹爪：训练极性 → ZMQ 物理开口 -----
     abs_grip = deltas[:, GRIPPER_ACTION_INDEX].copy()
-    # 训练极性 → ZMQ 物理开口
     if invert_gripper:
         abs_grip = _invert_gripper_width(
             abs_grip,
@@ -469,15 +506,23 @@ def _delta_chunk_to_absolute_pose(
             gripper_max_width=gripper_max_width,
         )
     if binarize_gripper:
+        # 阈值在「物理开口」空间：开口小于阈值 → 视为闭合
         abs_grip = np.where(abs_grip < gripper_close_threshold, gripper_min_width, gripper_max_width)
     abs_grip = np.clip(abs_grip, gripper_min_width, gripper_max_width)
 
+    # ----- 位姿：每个 A_i 独立左乘到同一 T_cur -----
     for i in range(deltas.shape[0]):
-        pos = pos + r_cur.apply(deltas[i, :3])
-        r_delta = st.Rotation.from_matrix(_rotation_6d_to_matrix(deltas[i, 3:9]))
-        r_cur = r_cur * r_delta
-        out[i, :3] = pos
-        out[i, 3:6] = r_cur.as_rotvec()
+        # p_i = p_cur + R_cur @ A_i.pos
+        #   A_i.pos 是「在当前 EE 坐标系里」的位移；
+        #   r_base.apply(...) 把它转到世界系，再加到当前世界系位置上。
+        out[i, :3] = pos_base + r_base.apply(deltas[i, :3])
+
+        # R_i = R_cur @ R(A_i.rot6)
+        #   A_i.rot6 → 相对当前 EE 的旋转；左乘 R_cur 得到世界系姿态。
+        #   注意: 这里始终是 r_base * Rd，不是「上一步的 R」再乘 Rd。
+        r_i = r_base * st.Rotation.from_matrix(_rotation_6d_to_matrix(deltas[i, 3:9]))
+        out[i, 3:6] = r_i.as_rotvec()
+
         out[i, 6] = abs_grip[i]
     return out
 
@@ -488,22 +533,52 @@ def _clip_action_chunk(
     max_delta_pos: float,
     max_delta_rot: float,
 ) -> tuple[np.ndarray, int, int]:
-    """安全限位：位置逐维 clip；旋转按转角幅值缩放 rot6。返回 (clipped, n_pos_clip, n_rot_clip)。"""
-    clipped = np.asarray(action_chunk, dtype=np.float64).copy()
-    if clipped.ndim != 2 or clipped.shape[1] != ACTION_DIM:
-        raise ValueError(f"Expected action chunk (N, {ACTION_DIM}), got {clipped.shape}")
+    """安全限位（current-relative waypoints）。
 
-    n_pos_clip = int(np.sum(np.abs(clipped[:, :3]) > max_delta_pos))
-    clipped[:, :3] = np.clip(clipped[:, :3], -max_delta_pos, max_delta_pos)
+    不能直接对每个 A_i 做 |pos| clip（后期 waypoint 离当前 EE 可以很远）。
+    做法: A → 逐步相对 a_i = A_{i-1}^{-1}@A_i → clip a_i → 再复合回 A'。
+    返回 (clipped, n_pos_clip, n_rot_clip)。
+    """
+    waypoints = np.asarray(action_chunk, dtype=np.float64).copy()
+    if waypoints.ndim != 2 or waypoints.shape[1] != ACTION_DIM:
+        raise ValueError(f"Expected action chunk (N, {ACTION_DIM}), got {waypoints.shape}")
 
+    n = waypoints.shape[0]
+    n_pos_clip = 0
     n_rot_clip = 0
-    for i in range(clipped.shape[0]):
-        before = clipped[i, 3:9].copy()
-        after = _clip_rotation_6d(before, max_delta_rot)
-        if not np.allclose(before, after, atol=1e-8):
+
+    prev_pos = np.zeros(3, dtype=np.float64)
+    prev_rot = np.eye(3, dtype=np.float64)
+    cum_pos = np.zeros(3, dtype=np.float64)
+    cum_rot = np.eye(3, dtype=np.float64)
+
+    out = waypoints.copy()
+    for i in range(n):
+        cur_pos = waypoints[i, :3]
+        cur_rot = _rotation_6d_to_matrix(waypoints[i, 3:9])
+        rel_rot = prev_rot.T @ cur_rot
+        rel_pos = prev_rot.T @ (cur_pos - prev_pos)
+
+        before_pos = rel_pos.copy()
+        rel_pos = np.clip(rel_pos, -max_delta_pos, max_delta_pos)
+        n_pos_clip += int(np.sum(np.abs(before_pos) > max_delta_pos))
+
+        before_rot6 = _matrix_to_rotation_6d(rel_rot)
+        after_rot6 = _clip_rotation_6d(before_rot6, max_delta_rot)
+        if not np.allclose(before_rot6, after_rot6, atol=1e-8):
             n_rot_clip += 1
-        clipped[i, 3:9] = after
-    return clipped, n_pos_clip, n_rot_clip
+        rel_rot = _rotation_6d_to_matrix(after_rot6)
+
+        cum_pos = cum_pos + cum_rot @ rel_pos
+        cum_rot = cum_rot @ rel_rot
+        out[i, :3] = cum_pos
+        out[i, 3:9] = _matrix_to_rotation_6d(cum_rot)
+        out[i, 9] = waypoints[i, 9]
+
+        prev_pos = cum_pos.copy()
+        prev_rot = cum_rot.copy()
+
+    return out, n_pos_clip, n_rot_clip
 
 
 def _fmt_vec3(vec: np.ndarray, *, unit: str = "") -> str:
@@ -555,13 +630,7 @@ def _print_direction_triplet_compare(
     decode_step_world: np.ndarray,
     actual_exec_world: np.ndarray | None,
 ) -> dict[str, float | None]:
-    """
-    打印「模型首步 / 解码世界 / 实际执行」三方向对比。
-
-    - 模型首步：raw action 的 EE-relative pos delta → 世界系
-    - 解码后世界：clip 后 delta 经 R_cur 转到世界系（≈ abs[0]-cur_pos）
-    - 实际执行：上周期 exec 后观测到的世界系位移（本周期 cur - 上周期 state）
-    """
+    """打印「模型首步 / 解码世界 / 实际执行」三方向对比。"""
     cos_model_decode = _dir_cosine(model_step_world, decode_step_world)
     cos_decode_actual = None
     cos_model_actual = None
@@ -608,7 +677,7 @@ def _absolute_pose_to_delta_step(
     cur_pos: np.ndarray,
     cur_rotvec: np.ndarray,
 ) -> np.ndarray:
-    """单步 decode 的逆：从绝对位姿反推 EE-relative action（10 维，用于自检）。
+    """单步 decode 的逆：从绝对位姿反推 current-relative action（10 维，用于自检）。
 
     abs_pose[6] 为 ZMQ 物理开口；返回 delta[9] 仍为 ZMQ 值（未转回训练极性）。
     """
@@ -623,7 +692,7 @@ def _absolute_pose_to_delta_step(
 
 
 def _summarize_action_steps(raw_exec: np.ndarray) -> str:
-    """一行摘要：每步位移/转角/夹爪（raw_exec[...,9] 为训练极性）。"""
+    """一行摘要：每步位移/转角/夹爪（raw_exec[...,9] 为训练极性；pos 相对当前 EE）。"""
     raw_exec = np.asarray(raw_exec, dtype=np.float64)
     pos_mm = np.linalg.norm(raw_exec[:, :3], axis=1) * 1000.0
     rot_deg = np.array(
@@ -632,8 +701,8 @@ def _summarize_action_steps(raw_exec: np.ndarray) -> str:
     )
     grips = raw_exec[:, GRIPPER_ACTION_INDEX]
     return (
-        f"pos_mm/step={np.array2string(pos_mm, precision=2, suppress_small=True)} "
-        f"rot_deg/step={np.array2string(rot_deg, precision=2, suppress_small=True)} "
+        f"pos_mm/from_cur={np.array2string(pos_mm, precision=2, suppress_small=True)} "
+        f"rot_deg/from_cur={np.array2string(rot_deg, precision=2, suppress_small=True)} "
         f"grip_abs={np.array2string(grips, precision=4, suppress_small=True)}"
     )
 
@@ -719,7 +788,7 @@ def _collect_diag_hints(
     if decode_roundtrip_pos_mm > 0.05 or decode_roundtrip_rot_deg > 0.1:
         hints.append(
             f"[DECODE] roundtrip 误差 pos={decode_roundtrip_pos_mm:.3f}mm "
-            f"rot={decode_roundtrip_rot_deg:.3f}deg；检查 delta→abs 转换。"
+            f"rot={decode_roundtrip_rot_deg:.3f}deg；检查 current-relative→abs 转换。"
         )
     if track_pos_err_mm is not None and track_pos_err_mm > 10.0:
         hints.append(
@@ -807,13 +876,22 @@ def _print_policy_cycle_diag(
     raw_exec = np.asarray(raw_action_chunk[:n_exec], dtype=np.float64)
     clipped_exec = np.asarray(action_chunk[:n_exec], dtype=np.float64)
 
-    # 旋转限位按转角判断（与 _clip_action_chunk 一致）
-    n_pos_clip = int(np.sum(np.abs(raw_exec[:, :3]) > max_delta_pos))
+    # clip 统计：对 current-relative 看相邻 waypoint 的逐步相对幅值
+    n_pos_clip = 0
     n_rot_clip = 0
+    prev_pos = np.zeros(3, dtype=np.float64)
+    prev_rot = np.eye(3, dtype=np.float64)
     for i in range(raw_exec.shape[0]):
-        angle = float(np.linalg.norm(_rotation_6d_to_rotvec(raw_exec[i, 3:9])))
+        cur_p = raw_exec[i, :3]
+        cur_r = _rotation_6d_to_matrix(raw_exec[i, 3:9])
+        rel_pos = prev_rot.T @ (cur_p - prev_pos)
+        rel_rot = prev_rot.T @ cur_r
+        n_pos_clip += int(np.sum(np.abs(rel_pos) > max_delta_pos))
+        angle = float(np.linalg.norm(_rotation_6d_to_rotvec(_matrix_to_rotation_6d(rel_rot))))
         if angle > max_delta_rot + 1e-8:
             n_rot_clip += 1
+        prev_pos = cur_p
+        prev_rot = cur_r
 
     track_pos_err_mm = None
     track_rot_err_deg = None
@@ -823,7 +901,6 @@ def _print_policy_cycle_diag(
     move_dir_cos = None
     cos_decode_actual = None
 
-    # 解码基准可能与观测位姿不同（推理后 rebase）；方向/自检都以实际解码基准为准。
     base_model_pos = (
         np.asarray(model_cur_pos, dtype=np.float64)
         if decode_base_pos is None
@@ -943,7 +1020,7 @@ def _print_policy_cycle_diag(
     print(f"[DIAG][MODEL] {_summarize_action_steps(raw_exec)}")
     if n_pos_clip or n_rot_clip:
         print(
-            f"[DIAG][MODEL][clip] pos_elems={n_pos_clip} rot_steps={n_rot_clip} "
+            f"[DIAG][MODEL][clip] consecutive_step pos_elems={n_pos_clip} rot_steps={n_rot_clip} "
             f"(limits pos±{max_delta_pos}m rot±{max_delta_rot}rad)"
         )
     print(f"[DIAG][MODEL][raw_exec]\n{raw_exec}")
@@ -956,7 +1033,7 @@ def _print_policy_cycle_diag(
             f"vs 观测 pos={rebase_shift_mm:.1f}mm rot={rot_txt} state_age={age_txt}"
         )
 
-    # decode 自检必须在训练使用的 link6 坐标点上进行。
+    # decode 自检：每步都相对同一 decode base（current-relative）
     implied_delta = _absolute_pose_to_delta_step(
         abs_model_exec[0], cur_pos=base_model_pos, cur_rotvec=base_rotvec
     )
@@ -971,7 +1048,7 @@ def _print_policy_cycle_diag(
         f"zmq_grip={abs_exec[0, 6]:.4f}m"
     )
     print(
-        f"[DIAG][DECODE] step0 delta pos={_fmt_vec3(clipped_exec[0, :3], unit='m')} "
+        f"[DIAG][DECODE] step0 A_from_cur pos={_fmt_vec3(clipped_exec[0, :3], unit='m')} "
         f"drot6={np.array2string(clipped_exec[0, 3:9], precision=4)} "
         f"train_grip={clipped_exec[0, GRIPPER_ACTION_INDEX]:.4f}m"
     )
@@ -996,12 +1073,12 @@ def _print_policy_cycle_diag(
     if n_exec > 1:
         step1_implied = _absolute_pose_to_delta_step(
             abs_model_exec[1],
-            cur_pos=abs_model_exec[0, :3],
-            cur_rotvec=abs_model_exec[0, 3:6],
+            cur_pos=base_model_pos,
+            cur_rotvec=base_rotvec,
         )
         print(
-            f"[DIAG][DECODE] step1 delta pos={_fmt_vec3(clipped_exec[1, :3], unit='m')} "
-            f"(EE-frame；相对执行完 step0 后的位姿)"
+            f"[DIAG][DECODE] step1 A_from_cur pos={_fmt_vec3(clipped_exec[1, :3], unit='m')} "
+            f"（相对同一当前 EE，非相对 step0）"
         )
         print(
             f"[DIAG][DECODE] step1 roundtrip pos_err="
@@ -1066,15 +1143,12 @@ class LightWAMClient:
         参数:
             wrist_image: HWC uint8 ndarray, shape (H, W, 3)，腕部相机图片
             state:       float32 ndarray, shape (20,)，EE-relative UMI state
-                         [pos_hist(3), pos_curr(3), rot_hist(6), rot_curr(6),
-                          grip_hist, grip_curr]
-                         grip_hist/grip_curr 已为训练集极性（越大越夹紧）
             prompt:      str，任务描述
 
         返回:
             action_chunk: float32 ndarray, shape (action_horizon, 10)
-              EE-relative SE(3): [pos(3), rot6d(6), gripper]
-              gripper 维为训练集极性（越大越夹紧），下发前由 _delta_chunk_to_absolute_pose invert
+              current-relative SE(3): A_i = T_cur^{-1} @ T_{target,i}
+              gripper 维为训练集极性（越大越夹紧）
         """
         wrist_image = _to_uint8_hwc(wrist_image)
         state = np.asarray(state, dtype=np.float32).reshape(-1)
@@ -1084,7 +1158,6 @@ class LightWAMClient:
             "prompt": prompt,
             "images": {"wrist_image": wrist_image},
             "state": state,
-            # 服务端不做夹爪后处理；state/action 极性转换与二值化均在客户端完成
             "apply_gripper_postprocess": False,
             "apply_real_gripper_snap": False,
         }
@@ -1119,7 +1192,6 @@ class LightWAMClient:
         )
 
     async def _infer_async(self, obs: dict) -> np.ndarray:
-        # 连接中断时重连一次；服务端正常情况下复用同一条 WebSocket。
         for attempt in range(2):
             try:
                 await self._ensure_connected()
@@ -1277,12 +1349,14 @@ def _clear_key_events(key_counter, terminal_reader):
               help="位姿微调: dx,dy,dz,drx,dry,drz（米/弧度）")
 @click.option("--init_gripper_delta", type=float, default=0.11,
               help="夹爪开度微调（米，ZMQ 物理开口；越大越张开）")
-@click.option("--gripper_min_width", type=float, default=0.011,
+@click.option("--gripper_min_width", type=float, default=0.005,
               help="ZMQ 物理开口下界（米，≈闭合；也用于 invert 映射）")
 @click.option("--gripper_max_width", type=float, default=DEFAULT_GRIPPER_MAX_WIDTH,
               help="ZMQ 物理开口上界（米，≈全开；也用于 invert 映射）")
-@click.option("--max_delta_pos", type=float, default=0.03, help="单步位置 delta 安全限位（米）")
-@click.option("--max_delta_rot", type=float, default=0.3, help="单步相对旋转 delta 安全限位（弧度）")
+@click.option("--max_delta_pos", type=float, default=0.05,
+              help="相邻 waypoint 逐步相对位置安全限位（米）")
+@click.option("--max_delta_rot", type=float, default=0.3,
+              help="相邻 waypoint 逐步相对旋转安全限位（弧度）")
 @click.option("--no_binarize_gripper", is_flag=True, default=False,
               help="不对 invert 后的 ZMQ 物理开口做开/关二值化")
 @click.option(
@@ -1316,7 +1390,8 @@ def _clear_key_events(key_counter, terminal_reader):
 @click.option(
     "--debug_fixed_delta",
     default=None,
-    help="调试用：跳过模型，使用固定 10 维 EE-relative action；grip 维为训练极性",
+    help="调试用：跳过模型，使用固定 10 维 current-relative action；grip 维为训练极性。"
+         "注意: 会 tile 到整个 horizon，各步指向同一相对目标。",
 )
 @click.option(
     "--rebase_decode/--no_rebase_decode",
@@ -1443,8 +1518,8 @@ def main(
     print(
         "[CHANGE] UMI pipeline: "
         f"state={STATE_DIM}d (EE-relative pose + training-polarity grip); "
-        f"action={ACTION_DIM}d (EE-relative SE(3) + training-polarity grip); "
-        f"decode: p+=R@a_pos, R=R@Rd; grip invert on upload/exec; "
+        f"action={ACTION_DIM}d (current-relative SE(3) waypoints + training-polarity grip); "
+        f"decode: T_i=T_cur@A_i (NOT chain); grip invert on upload/exec; "
         f"clip_state_grip={clip_state_grip} "
         f"train_grip=[{train_state_grip_min:.4f},{train_state_grip_max:.4f}]; "
         "images uint8"
@@ -1459,7 +1534,7 @@ def main(
     )
     print(
         "[DIAG] 日志分段: [OBS]=输入  [TRACK]=执行跟踪  [DIR]=方向对比  "
-        "[MODEL]=推理输出  [REBASE]=解码基准  [DECODE]=rel→abs  "
+        "[MODEL]=推理输出  [REBASE]=解码基准  [DECODE]=current-rel→abs  "
         "[SCHED]=下发时序  [HINT]=问题定位"
     )
 
@@ -1574,7 +1649,6 @@ def main(
             # -----------------------------------------------------------------
             print("Warming up policy inference...")
             obs = env.get_obs()
-            # uint8 图像 + 20d state（位姿 EE-relative；夹爪已转训练极性）
             wrist_img = _to_uint8_hwc(obs["camera0_rgb"][-1])
             state_raw = _build_umi_state(
                 obs,
@@ -1634,7 +1708,6 @@ def main(
                     vis_img = obs["camera0_rgb"][-1]
                     obs = env.get_obs()
 
-                    # 可视化
                     text = f"Episode: {episode_id}"
                     vis_show = np.asarray(vis_img)
                     if vis_show.dtype != np.uint8:
@@ -1663,7 +1736,6 @@ def main(
                     cv2.imshow("default", vis_show[..., ::-1])
                     _ = cv2.pollKey()
 
-                    # 键盘事件（pynput 或 --terminal_keys）
                     press_events = _collect_key_events(key_counter, terminal_reader)
                     start_policy = False
                     for key_stroke in press_events:
@@ -1679,13 +1751,11 @@ def main(
                         elif key_stroke == KeyCode(char="1"):
                             control_robot_idx_list = [0]
 
-                    # 如果开始了模型推理，则不再往下跑
                     if start_policy:
                         break
 
                     precise_wait(t_sample)
 
-                    # SpaceMouse 遥操作
                     sm_state = sm.get_motion_state_transformed()
                     dpos = sm_state[:3] * (0.5 / frequency) * cartesian_speed
                     drot_xyz = sm_state[3:] * (1.5 / frequency) * orientation_speed
@@ -1697,7 +1767,6 @@ def main(
                             drot * st.Rotation.from_rotvec(target_pose[robot_idx, 3:])
                         ).as_rotvec()
 
-                    # 夹爪控制（ZMQ 物理开口；SpaceMouse 不参与训练极性 invert）
                     dpos = 0.0
                     if sm.is_button_pressed(0) and sm.is_button_pressed(1):
                         print("Reset to home...")
@@ -1721,7 +1790,6 @@ def main(
                             gripper_min_width, max_gripper_width,
                         )
 
-                    # 下发命令
                     action = np.zeros(7)
                     action[:6] = target_pose[0]
                     action[6] = np.clip(gripper_target_pos[0],
@@ -1748,7 +1816,6 @@ def main(
 
                     obs = env.get_obs()
 
-                    # 相机约 60Hz；wait 目标时刻略提前一帧，给成像留余量。
                     frame_latency = 1.0 / 60.0
                     precise_wait(eval_t_start - frame_latency, time_func=time.time)
                     print("Policy in control!")
@@ -1769,8 +1836,7 @@ def main(
 
                     while True:
                         # -----------------------------------------------------
-                        # 1. 拍照 + 读机器人状态（每轮只采一次）
-                        #    上一轮已 wait 到最后一个 waypoint，此时机械臂应已停稳。
+                        # 1. 拍照 + 读机器人状态
                         # -----------------------------------------------------
                         obs = env.get_obs()
                         obs_timestamps = obs["timestamp"]
@@ -1778,7 +1844,6 @@ def main(
 
                         s = time.time()
                         wrist_img = _to_uint8_hwc(obs["camera0_rgb"][-1])
-                        # 构造 20d state：link6 相对位姿 + 训练极性夹爪 → clip → 送模型
                         state_raw = _build_umi_state(
                             obs,
                             eef_offset=eef_offset,
@@ -1797,7 +1862,6 @@ def main(
                                 f"[STATE] clipped grip for model upload: "
                                 f"{state_raw[18:20]} -> {state[18:20]}"
                             )
-                        # ZMQ 观测/执行使用 eef_link；模型相对动作在训练的 link6 上展开。
                         cur_pos_robot, cur_rotvec, cur_grip = _read_tcp_pose(obs)
                         cur_pos_link6 = _x5_eef_to_link6(
                             cur_pos_robot,
@@ -1808,8 +1872,7 @@ def main(
                         episode_id = env.replay_buffer.n_episodes
 
                         # -----------------------------------------------------
-                        # 2. 阻塞推理：图 + 20d state → action chunk (N, 10)
-                        #    infer 返回前机械臂应保持上一轮末位姿（本脚本串行、无并行推理）。
+                        # 2. 阻塞推理
                         # -----------------------------------------------------
                         if fixed_delta_vec is not None:
                             raw_action_chunk = np.tile(
@@ -1838,10 +1901,7 @@ def main(
                         )
 
                         # -----------------------------------------------------
-                        # 3. 解码基准位姿（相对 EE delta → 绝对 TCP）
-                        #    默认用本轮 get_obs 的位姿。--rebase_decode 时再读一次
-                        #    实时 TCP：旧逻辑是防「推理期间上一轮还在动」导致 step0 回跳；
-                        #    现在已等上一轮跑完再拍，rebase 通常接近 0，可关。
+                        # 3. 解码基准位姿（current-relative → 绝对 TCP）
                         # -----------------------------------------------------
                         base_pos_robot = cur_pos_robot
                         base_rotvec = cur_rotvec
@@ -1880,7 +1940,6 @@ def main(
                                     eef_offset,
                                 )
 
-                        # 只积分并下发前 exec_horizon 步；chunk 后半丢弃，下一轮重新推理。
                         abs_link6 = _delta_chunk_to_absolute_pose(
                             action_chunk[:exec_horizon],
                             cur_pos=base_pos_link6,
@@ -1893,10 +1952,7 @@ def main(
                         abs_exec = _abs_exec_link6_to_x5_eef(abs_link6, eef_offset)
 
                         # -----------------------------------------------------
-                        # 4. 排期时间戳（墙钟 time.time()，与 exec_actions / wait 同一时钟）
-                        #    第 k 步目标时刻 = now + 0.05s + k * dt
-                        #    +0.05s: 给下发到控制器留缓冲，避免 timestamp 刚写下就过期。
-                        #    推理越慢，这批点的执行时刻整体越晚（不会补回到拍照时刻）。
+                        # 4. 排期时间戳
                         # -----------------------------------------------------
                         command_start_time = time.time() + 0.05
                         action_timestamps = (
@@ -1946,7 +2002,6 @@ def main(
                             gripper_max_width=max_gripper_width,
                         )
 
-                        # 异步下发：立刻返回。控制器按 timestamp 插值跟踪；过期点会被丢掉。
                         env.exec_actions(
                             actions=abs_exec,
                             timestamps=action_timestamps,
@@ -1954,7 +2009,6 @@ def main(
                         )
 
                         if sched["n_keep"] > 0:
-                            # 过期 waypoint 只会出现在前部；有效尾部的末命令始终是 -1。
                             last_cmd_abs = abs_exec[-1].copy()
                         else:
                             last_cmd_abs = np.concatenate(
@@ -1965,14 +2019,12 @@ def main(
                         last_state_rotvec = cur_rotvec.copy()
                         last_state_grip = cur_grip
 
-                        # 方向记录用实际解码基准的姿态，与下发命令保持同一坐标系。
                         r_store = st.Rotation.from_rotvec(base_rotvec)
                         prev_model_step_ee = raw_action_chunk[0, :3].astype(np.float64).copy()
                         prev_decode_step_ee = action_chunk[0, :3].astype(np.float64).copy()
                         prev_model_step_world = r_store.apply(prev_model_step_ee)
                         prev_decode_step_world = r_store.apply(prev_decode_step_ee)
 
-                        # --- 可视化 ---
                         vis_img = _to_uint8_hwc(obs["camera0_rgb"][-1]).copy()
                         text = f"Episode: {episode_id}, Time: {time.monotonic() - t_start:.1f}s"
                         cv2.putText(
@@ -1987,7 +2039,6 @@ def main(
                         cv2.imshow("default", vis_img[..., ::-1])
                         _ = cv2.pollKey()
 
-                        # --- 键盘事件 ---
                         press_events = _collect_key_events(key_counter, terminal_reader)
                         stop_episode = False
                         for key_stroke in press_events:
@@ -2001,10 +2052,6 @@ def main(
                         if stop_episode:
                             break
 
-                        # 等到本批最后一个 waypoint 的墙钟时刻（再加约 1 帧成像余量）。
-                        # 必须用 time.time：action_timestamps 是 Unix 墙钟，不能用 monotonic。
-                        # 不要用「本轮开头 + exec_horizon*dt」：推理慢时那个 deadline 早已过期，
-                        # wait 会变成 no-op，下一轮拍照会叠在这 4 步还在跑的时候。
                         precise_wait(
                             float(action_timestamps[-1]) + frame_latency,
                             time_func=time.time,
@@ -2023,4 +2070,3 @@ def main(
 
 if __name__ == "__main__":
     main()
-

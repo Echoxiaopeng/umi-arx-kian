@@ -1,0 +1,63 @@
+==== CONVERT collect_demo_pro Sun Sep 27 05:53:47 PM CST 2026 ====
+============================================================
+SDK → ZMQ replay_buffer convert
+  input        : /data1/projects/umi-arx-hzl/data/collect_demo_pro/replay_buffer_gripper_fixed.zarr
+  output       : /data1/projects/umi-arx-kian/data/collect_demo_pro_as_zmq/replay_buffer.zarr
+  n_episodes   : 200
+  n_steps      : 277024
+  mode         : copy_patch
+  eef_offset   : 0.145 m (link6 → eef_link along TCP Z)
+  invert_grip  : True  (range [0.011, 0.085])
+  copy_videos  : True
+============================================================
+[before] robot0_gripper_width min=0.0065 max=0.0850 mean=0.0637
+[before] action[...,6] min=0.0062 max=0.0850 mean=0.0638
+[1/3] physically copying zarr (no symlinks / no hardlinks)...
+[2/3] patching eef_pos / gripper / action...
+[3/3] verifying independence from source...
+[check] independent inodes ok (sampled 32 files)
+[after] robot0_gripper_width min=0.0110 max=0.0895 mean=0.0323
+[after] action[...,6] min=0.0110 max=0.0895 mean=0.0323
+Wrote meta: /data1/projects/umi-arx-kian/data/collect_demo_pro_as_zmq/sdk_to_zmq_convert_meta.json
+Copying videos: /data1/projects/umi-arx-hzl/data/collect_demo_pro/videos -> /data1/projects/umi-arx-kian/data/collect_demo_pro_as_zmq/videos
+Copied videos dir (200 episodes).
+Done. output episodes=200 steps=277024
+==== ANALYZE collect_demo_pro ====
+================================================================
+ANALYZE: collect_demo_pro_as_zmq
+  src: /data1/projects/umi-arx-hzl/data/collect_demo_pro/replay_buffer_gripper_fixed.zarr
+  dst: /data1/projects/umi-arx-kian/data/collect_demo_pro_as_zmq/replay_buffer.zarr
+  ref: /data1/projects/umi-arx-kian/data/collect_demo_zmq/replay_buffer.zarr
+================================================================
+[files] no_symlinks=True  n_files≈69991
+[files] hardlink overlap with src (sample): 0  PASS=True
+[size] src frames=277024 ep=200 | dst frames=277024 ep=200
+[geom] max|dst_pos - expected| = 0.000e+00 m
+[geom] max|dst_grip - expected| = 0.000e+00 m
+[geom] max|dst_rot - src_rot| = 0.000e+00  (expect 0)
+[geom] max|dst_joint - src_joint| = 0.000e+00  (expect 0)
+[sync] max|action[:3]-pos| = 0.000e+00
+[sync] max|action[3:6]-rot| = 1.654e+00
+[sync] max|action[6]-grip| = 0.000e+00
+[geom] Δpos·TCP_Z mean/std = 0.145000/0.000000 (expect 0.145)
+[vs KIAN] pos mean L2: src=0.2409  dst=0.2050  Δ=+0.0360
+[vs KIAN] |grip mean|: src=0.0229  dst=0.0085  Δ=+0.0144
+[vs KIAN] grip dst [0.0111,0.0895] mean=0.0323
+[vs KIAN] grip ref [-0.0009,0.0848] mean=0.0408
+----------------------------------------------------------------
+  PASS: no_symlinks
+  PASS: no_hardlink_to_src
+  PASS: frame_count_match
+  PASS: pos_matches_formula
+  PASS: grip_matches_formula
+  PASS: rot_unchanged
+  PASS: joint_unchanged
+  PASS: action_pos_sync
+  PASS: action_grip_sync
+  PASS: offset_along_tcp_z
+  PASS: pos_closer_to_kian
+  PASS: grip_closer_to_kian
+
+  overall: PASS
+Wrote /data1/projects/umi-arx-kian/data/collect_demo_pro_as_zmq/sdk_to_zmq_analyze.json
+==== ALL DONE Sun Sep 27 05:53:47 PM CST 2026 ====
