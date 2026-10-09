@@ -356,6 +356,8 @@ class Arx5EnvBimanualRS(Arx5Env):
         self.last_time_step = 0
         self.enable_depth = bool(enable_depth)
         self.rs_index = 1
+        self.last_align_camera_idx: Optional[int] = None
+        self.last_align_timestamp: Optional[float] = None
 
     def get_obs(self) -> dict:
         """Align over all opened cameras; emit camera1_depth when present."""
@@ -399,6 +401,8 @@ class Arx5EnvBimanualRS(Arx5Env):
                 align_camera_idx = camera_idx
 
         last_timestamp = self.last_camera_data[align_camera_idx]["timestamp"][-1]
+        self.last_align_camera_idx = int(align_camera_idx)
+        self.last_align_timestamp = float(last_timestamp)
         dt = 1 / self.frequency
         camera_obs_timestamps = last_timestamp - (
             np.arange(self.camera_obs_horizon)[::-1]

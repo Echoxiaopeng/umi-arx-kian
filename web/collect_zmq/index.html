@@ -711,6 +711,9 @@
             <div><dt>Live pts</dt><dd id="liveN">0</dd></div>
           </dl>
           <div class="pose" id="poseBox">L/R pose —</div>
+          <div class="pose" id="camLagBox" title="age = how old the shown frame is vs wall clock; skew = vs sync reference camera">
+            Cam lag —
+          </div>
           <div class="btns" id="collectBtns">
             <button id="btnDrag" class="primary">P · Drag</button>
             <button id="btnStart" class="ok">C · Start</button>
@@ -1224,6 +1227,7 @@
       $("curEp").textContent = s.recording ? (s.episode_id ?? "—") : "—";
       $("liveN").textContent = s.live_n ?? 0;
       $("poseBox").innerHTML = formatPoseHtml(s);
+      if ($("camLagBox")) $("camLagBox").innerHTML = formatCamLagHtml(s);
       if (s.message) setMsg(s.message);
       syncDatasetPathLabel(s);
 
@@ -1298,6 +1302,26 @@
           `pos [${pos.map((v) => Number(v).toFixed(3)).join(", ")}]  ` +
           `rot [${rot.map((v) => Number(v).toFixed(3)).join(", ")}]  ` +
           `grip ${Number(grip).toFixed(4)}</div>`
+        );
+      }).join("");
+    }
+
+    function formatCamLagHtml(s) {
+      const rows = s.camera_latency || [];
+      if (!rows.length) {
+        return `<div style="color:var(--muted)">Cam lag — (waiting for live cams)</div>`;
+      }
+      return rows.map((c) => {
+        const age = Number(c.age_ms);
+        let color = "var(--ok)";
+        if (age >= 160) color = "var(--danger)";
+        else if (age >= 80) color = "var(--warn)";
+        const ref = c.is_ref ? " · REF" : "";
+        return (
+          `<div><strong>${c.label || ("C"+c.idx)}</strong> ` +
+          `<span style="color:${color}">lag ${age.toFixed(0)}ms</span>` +
+          ` · skew ${Number(c.skew_ms).toFixed(0)}ms` +
+          ` · fresh ${Number(c.fresh_ms).toFixed(0)}ms${ref}</div>`
         );
       }).join("");
     }

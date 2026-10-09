@@ -742,8 +742,9 @@ def make_vis_image(
     recording: bool = False,
     delete_prompt: str | None = None,
     n_robots: int = 1,
+    camera_latency: list[dict] | None = None,
 ) -> np.ndarray:
-    vis = camera_strip_from_obs(obs).copy()
+    vis = camera_strip_from_obs(obs, latency=camera_latency).copy()
     if recording:
         status = "REC"
         help_text = "S save | D drop | I pose | Q quit"
@@ -808,43 +809,103 @@ _CAM_PANEL_LABELS = {
     1: "M  Mid D435",
     2: "R  Right wrist",
 }
+_CAM_SHORT_LABELS = {0: "L", 1: "M", 2: "R"}
 
 
-def _draw_cam_label(img: np.ndarray, text: str) -> np.ndarray:
-    """在单路画面左上角画半透明底 + 标签（原地修改并返回）。"""
+def compute_camera_latency(env, obs: dict | None = None) -> list[dict]:
+    """
+    当前预览帧相对墙钟的延迟（画面有多“旧”）。
+
+    age_ms  = now - 选中帧 timestamp（越大越滞后）
+    skew_ms = 选中帧 timestamp - 对齐基准时刻（相对其他相机的偏差）
+    fresh_ms = now - 该路 ring buffer 最新帧（采集是否跟上）
+    """
+    cam_data = getattr(env, "last_camera_data", None)
+    if not cam_data:
+        return []
+    now = time.time()
+    if obs is not None and "timestamp" in obs:
+        t_ref = float(np.asarray(obs["timestamp"][-1]))
+    else:
+        t_ref = float(getattr(env, "last_align_timestamp", None) or now)
+    align_idx = getattr(env, "last_align_camera_idx", None)
+    out: list[dict] = []
+    for cam_idx in sorted(cam_data.keys()):
+        value = cam_data[cam_idx]
+        ts = np.asarray(value["timestamp"], dtype=np.float64)
+        if ts.size == 0:
+            continue
+        nn = int(np.argmin(np.abs(ts - t_ref)))
+        t_sel = float(ts[nn])
+        t_latest = float(ts[-1])
+        # Prefer raw receive time for "how old is the buffer" if present.
+        recv = value.get("camera_receive_timestamp")
+        if recv is not None:
+            recv_arr = np.asarray(recv, dtype=np.float64)
+            t_recv_latest = float(recv_arr[-1]) if recv_arr.size else t_latest
+        else:
+            t_recv_latest = t_latest
+        item = {
+            "idx": int(cam_idx),
+            "label": _CAM_SHORT_LABELS.get(int(cam_idx), f"C{cam_idx}"),
+            "age_ms": round((now - t_sel) * 1000.0, 1),
+            "fresh_ms": round((now - t_recv_latest) * 1000.0, 1),
+            "skew_ms": round((t_sel - t_ref) * 1000.0, 1),
+            "is_ref": align_idx is not None and int(cam_idx) == int(align_idx),
+        }
+        out.append(item)
+    return out
+
+
+def _draw_cam_label(img: np.ndarray, lines: list[str]) -> np.ndarray:
+    """在单路画面左上角画半透明底 + 多行标签。"""
     out = np.ascontiguousarray(img)
     h, w = out.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = max(0.45, min(0.7, w / 320.0))
+    scale = max(0.40, min(0.65, w / 360.0))
     thickness = 2
-    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
-    pad = 6
+    pad = 5
+    sizes = [cv2.getTextSize(t, font, scale, thickness) for t in lines]
+    tw = max(s[0][0] for s in sizes)
+    line_h = max(s[0][1] for s in sizes) + 4
+    block_h = line_h * len(lines) + pad * 2
     x0, y0 = 4, 4
     x1 = min(w - 1, x0 + tw + pad * 2)
-    y1 = min(h - 1, y0 + th + baseline + pad * 2)
+    y1 = min(h - 1, y0 + block_h)
     roi = out[y0:y1, x0:x1]
     if roi.size:
         overlay = roi.copy()
         overlay[:] = (0, 0, 0)
         cv2.addWeighted(overlay, 0.55, roi, 0.45, 0, roi)
-    cv2.putText(
-        out,
-        text,
-        (x0 + pad, y0 + pad + th),
-        font,
-        scale,
-        (255, 255, 255),
-        thickness,
-        cv2.LINE_AA,
-    )
+    y = y0 + pad
+    for text, ((_, th), _) in zip(lines, sizes):
+        y += th
+        # Green <80ms, yellow <160ms, red otherwise (age shown on line 2)
+        color = (255, 255, 255)
+        if text.startswith("lag "):
+            try:
+                ms = float(text.split()[1].replace("ms", ""))
+                if ms < 80:
+                    color = (120, 255, 120)
+                elif ms < 160:
+                    color = (80, 220, 255)
+                else:
+                    color = (80, 80, 255)
+            except Exception:
+                pass
+        cv2.putText(out, text, (x0 + pad, y), font, scale, color, thickness, cv2.LINE_AA)
+        y += 4
     return out
 
 
-def camera_strip_from_obs(obs: dict) -> np.ndarray:
-    """三相机横向拼接，并标注左/中/右（供网页与 OpenCV 预览）。"""
+def camera_strip_from_obs(
+    obs: dict, latency: list[dict] | None = None
+) -> np.ndarray:
+    """三相机横向拼接，标注左/中/右 + 画面延迟。"""
     cam_keys = sorted(k for k in obs if k.startswith("camera") and k.endswith("_rgb"))
     if not cam_keys:
         raise RuntimeError("obs 中没有 camera*_rgb")
+    lat_by_idx = {int(d["idx"]): d for d in (latency or [])}
     frames = []
     for key in cam_keys:
         img = np.asarray(obs[key][-1])
@@ -853,13 +914,22 @@ def camera_strip_from_obs(obs: dict) -> np.ndarray:
                 img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
             else:
                 img = np.clip(img, 0, 255).astype(np.uint8)
-        # camera0_rgb -> 0
         try:
             cam_idx = int(key.replace("camera", "").replace("_rgb", ""))
         except ValueError:
             cam_idx = len(frames)
-        label = _CAM_PANEL_LABELS.get(cam_idx, f"cam{cam_idx}")
-        frames.append(_draw_cam_label(img.copy(), label))
+        name = _CAM_PANEL_LABELS.get(cam_idx, f"cam{cam_idx}")
+        lat = lat_by_idx.get(cam_idx)
+        if lat is not None:
+            ref = "*" if lat.get("is_ref") else ""
+            lines = [
+                f"{name}{ref}",
+                f"lag {lat['age_ms']:.0f}ms",
+                f"skew {lat['skew_ms']:+.0f}ms",
+            ]
+        else:
+            lines = [name]
+        frames.append(_draw_cam_label(img.copy(), lines))
     return np.concatenate(frames, axis=1) if len(frames) > 1 else frames[0]
 
 
@@ -921,6 +991,7 @@ def publish_web_frame(
     frequency: float,
     message: str = "",
     clean_rgb: np.ndarray | None = None,
+    camera_latency: list[dict] | None = None,
 ) -> None:
     if web_state is None:
         return
@@ -934,7 +1005,7 @@ def publish_web_frame(
     )
     publish_pose_from_env(web_state, env)
     jpeg = b""
-    # 网页预览用无叠加文字的干净画面；OpenCV 窗仍可用 vis_rgb
+    # 网页预览：带相机标签 + 延迟叠加的画面
     src = clean_rgb if clean_rgb is not None else vis_rgb
     if src is not None:
         try:
@@ -954,6 +1025,7 @@ def publish_web_frame(
         message=message,
         jpeg=jpeg,
         n_episodes=int(env.replay_buffer.n_episodes),
+        camera_latency=list(camera_latency or []),
     )
 
 
@@ -1971,6 +2043,7 @@ def run_collect_session(
 
                         try:
                             obs = env.get_obs()
+                            cam_lat = compute_camera_latency(env, obs)
                             if pose_print_enabled:
                                 now = time.monotonic()
                                 if now - last_pose_print_t >= pose_print_interval:
@@ -1997,6 +2070,7 @@ def run_collect_session(
                                 recording=False,
                                 delete_prompt=delete_prompt,
                                 n_robots=n_robots,
+                                camera_latency=cam_lat,
                             )
                             if not no_cv:
                                 cv2.imshow("drag_collect_bimanual", vis[..., ::-1])
@@ -2005,7 +2079,9 @@ def run_collect_session(
                                 web_state,
                                 env=env,
                                 vis_rgb=vis,
-                                clean_rgb=camera_strip_from_obs(obs),
+                                clean_rgb=camera_strip_from_obs(
+                                    obs, latency=cam_lat
+                                ),
                                 recording=False,
                                 zero_force_active=zero_force_active,
                                 no_zero_force=no_zero_force,
@@ -2015,6 +2091,7 @@ def run_collect_session(
                                 t_elapsed=0.0,
                                 episode_id=None,
                                 frequency=frequency,
+                                camera_latency=cam_lat,
                             )
                         except Exception:
                             pass
@@ -2119,6 +2196,7 @@ def run_collect_session(
                                     return
 
                             obs = env.get_obs()
+                            cam_lat = compute_camera_latency(env, obs)
                             if pose_print_enabled:
                                 if now - last_pose_print_t >= pose_print_interval:
                                     print_current_pose(env, tag="rec")
@@ -2142,6 +2220,7 @@ def run_collect_session(
                                 no_zero_force=no_zero_force,
                                 recording=True,
                                 n_robots=n_robots,
+                                camera_latency=cam_lat,
                             )
                             if not no_cv:
                                 cv2.imshow("drag_collect_bimanual", vis[..., ::-1])
@@ -2150,7 +2229,9 @@ def run_collect_session(
                                 web_state,
                                 env=env,
                                 vis_rgb=vis,
-                                clean_rgb=camera_strip_from_obs(obs),
+                                clean_rgb=camera_strip_from_obs(
+                                    obs, latency=cam_lat
+                                ),
                                 recording=True,
                                 zero_force_active=zero_force_active,
                                 no_zero_force=no_zero_force,
@@ -2160,6 +2241,7 @@ def run_collect_session(
                                 t_elapsed=t_elapsed,
                                 episode_id=episode_id,
                                 frequency=frequency,
+                                camera_latency=cam_lat,
                             )
 
                             if t_elapsed > max_duration:

@@ -140,6 +140,7 @@ class SharedCollectState:
             }
         ]
         self.n_robots: int = 1
+        self.camera_latency: list[dict] = []
         self.delete_pending: Optional[int] = None
         self.message: str = ""
         self.frequency: float = 60.0
@@ -230,6 +231,7 @@ class SharedCollectState:
                 "grip": float(self.grip),
                 "robots": robots,
                 "n_robots": int(getattr(self, "n_robots", len(robots) or 1)),
+                "camera_latency": list(getattr(self, "camera_latency", []) or []),
                 "delete_pending": self.delete_pending,
                 "message": self.message,
                 "frequency": self.frequency,
