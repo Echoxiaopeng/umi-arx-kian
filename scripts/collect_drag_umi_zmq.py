@@ -62,6 +62,9 @@ ARX5 拖拽采数脚本 — ZMQ 版本（重力补偿 / 零力拖拽）。
   I = 开关位姿打印：开后约每 0.5s 输出一次；再按关闭
   Q = 退出（停留当前位置，不回 init/home）
 
+注意: 按 P 后手臂可拖；夹爪为力矩辅助手捏（非键盘开合）。若仍偏硬可调
+DRAG_GRIPPER_FRICTION_COMP（modules/arx5_controller.py）。
+
 启动流程: reset_to_home → 按 --init_delta / --init_gripper_delta 微调（与 fast_wam 相同；
 --no_init_pose 跳过）→ 等 P 进零力（或 --no_zero_force 直接 C）。
 默认不刷屏；按 I 开始/停止持续打印当前位姿（可复制为 --init_pose）。
@@ -1728,7 +1731,8 @@ def run_collect_session(
                                 zero_force_active = True
                                 print(
                                     "Drag mode ON (gravity if supported, else damping). "
-                                    "Drag freely."
+                                    "Drag arm freely; squeeze gripper by hand "
+                                    "(torque assist)."
                                 )
                             else:
                                 leave_zero_force_to_init(
@@ -1825,8 +1829,9 @@ def run_collect_session(
                                     zero_force_active = True
                                     print(
                                         "Drag mode ON (gravity if supported, else damping). "
-                                        "Drag freely. Press P again to exit and return to "
-                                        "init, or C to record."
+                                        "Drag arm freely; squeeze gripper by hand "
+                                        "(torque assist). Press P again to exit and "
+                                        "return to init, or C to record."
                                     )
                                 else:
                                     leave_zero_force_to_init(

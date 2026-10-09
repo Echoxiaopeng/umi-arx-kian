@@ -187,14 +187,15 @@ class Arx5Client:
         return state
 
     def set_ee_pose(
-        self, pose_6d: npt.NDArray[np.float64], gripper_pos: Union[float, None] = None
+        self,
+        pose_6d: npt.NDArray[np.float64],
+        gripper_pos: Union[float, None] = None,
+        gripper_torque: Union[float, None] = None,
     ):
-        reply_msg = self.send_recv(
-            {
-                "cmd": "SET_EE_POSE",
-                "data": {"ee_pose": pose_6d, "gripper_pos": gripper_pos},
-            }
-        )
+        data: dict = {"ee_pose": pose_6d, "gripper_pos": gripper_pos}
+        if gripper_torque is not None:
+            data["gripper_torque"] = float(gripper_torque)
+        reply_msg = self.send_recv({"cmd": "SET_EE_POSE", "data": data})
         assert reply_msg["cmd"] == "SET_EE_POSE"
         if reply_msg["data"] == "KeyboardInterrupt" or reply_msg["data"] == "ZMQError":
             return self.latest_state
@@ -210,9 +211,10 @@ class Arx5Client:
         self,
         tcp_pose_6d: npt.NDArray[np.float64],
         gripper_pos: Union[float, None] = None,
+        gripper_torque: Union[float, None] = None,
     ):
         ee_pose = tcp2ee(tcp_pose_6d)
-        return self.set_ee_pose(ee_pose, gripper_pos)
+        return self.set_ee_pose(ee_pose, gripper_pos, gripper_torque=gripper_torque)
 
     def reset_to_home(self):
         reply_msg = self.send_recv({"cmd": "RESET_TO_HOME", "data": None})
@@ -227,6 +229,15 @@ class Arx5Client:
         if reply_msg["data"] != "OK":
             raise ValueError(f"Error: {reply_msg['data']}")
         self.get_state()
+
+    def set_gripper_torque(self, gripper_torque: float):
+        """拖拽时只下发夹爪力矩前馈，不改 EE 轨迹（避免手臂下落）。"""
+        reply_msg = self.send_recv(
+            {"cmd": "SET_GRIPPER_TORQUE", "data": float(gripper_torque)}
+        )
+        assert reply_msg["cmd"] == "SET_GRIPPER_TORQUE"
+        if reply_msg["data"] != "OK":
+            raise ValueError(f"Error: {reply_msg['data']}")
 
     def sync_after_drag(self):
         """
