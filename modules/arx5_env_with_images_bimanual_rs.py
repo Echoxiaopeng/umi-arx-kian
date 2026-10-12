@@ -10,7 +10,12 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from modules.arx5_env_bimanual_rs import Arx5EnvBimanualRS
-from utils.interpolation_util import PoseInterpolator, get_interp1d
+from utils.interpolation_util import (
+    PoseInterpolator,
+    continuize_action_rotvecs,
+    continuize_rotvecs,
+    get_interp1d,
+)
 
 
 class ImageAccumulator:
@@ -87,12 +92,17 @@ class Arx5EnvWithImages(Arx5EnvBimanualRS):
 
             if n_steps > 0:
                 timestamps = action_timestamps[:n_steps]
+                n_robots = len(self.robots)
+                # 去掉 rotvec 在 ±π 附近的表示翻转（欧氏≈2π、测地≈0）
+                episode_actions = continuize_action_rotvecs(
+                    actions[:n_steps], n_robots=n_robots
+                )
                 episode = {
                     "timestamp": timestamps,
-                    "action": actions[:n_steps],
+                    "action": episode_actions,
                 }
 
-                for robot_idx in range(len(self.robots)):
+                for robot_idx in range(n_robots):
                     robot_pose_interpolator = PoseInterpolator(
                         t=np.array(
                             self.obs_accumulator.timestamps[
@@ -105,7 +115,9 @@ class Arx5EnvWithImages(Arx5EnvBimanualRS):
                     )
                     robot_pose = robot_pose_interpolator(timestamps)
                     episode[f"robot{robot_idx}_eef_pos"] = robot_pose[:, :3]
-                    episode[f"robot{robot_idx}_eef_rot_axis_angle"] = robot_pose[:, 3:]
+                    episode[f"robot{robot_idx}_eef_rot_axis_angle"] = continuize_rotvecs(
+                        robot_pose[:, 3:]
+                    )
 
                     joint_pos_interpolator = get_interp1d(
                         np.array(

@@ -34,6 +34,8 @@ ARX5 双臂拖拽采数 — ZMQ + 双腕 GoPro（V4L）+ 中间 D435（pyrealsen
         --rs_serial 123456789012 --no_save_depth --web
 
 键盘: 与 collect_drag_umi_zmq.py 相同（P/C/S/D/E/I/Q）。
+拖拽手势: P 进零力后，连续两次开合 can1（默认 robot1/右臂）夹爪 → 开始采集；
+          再连续两次开合 → 保存 episode（手势本身不写入 zarr）。
 左右臂共用同一组 --init_delta / --init_gripper_delta（各自相对 home）。
 
 输出:
@@ -67,6 +69,7 @@ os.chdir(ROOT_DIR)
 
 from modules.arx5_env_with_images_bimanual_rs import Arx5EnvWithImages  # noqa: E402
 from modules.replay_buffer import ReplayBuffer  # noqa: E402
+from utils.interpolation_util import nearest_rotvec_equivalent  # noqa: E402
 from utils.other_util import precise_wait  # noqa: E402
 
 # pynput 在无 DISPLAY 时会炸；viewer_only 不需要键盘钩子
@@ -113,7 +116,8 @@ class TerminalKeyReader:
         print(
             "[terminal_keys] 在本终端按键: "
             "p=开关零力(再按回init), c=开始, s=保存, d=丢弃当前, "
-            "e=删已保存, i=开关位姿打印, q=回home退出"
+            "e=删已保存, i=开关位姿打印, q=退出; "
+            "拖拽中可双次开合 can1 夹爪开始/保存"
         )
         return self
 
@@ -509,16 +513,31 @@ def apply_init_delta_like_fast_wam(
     return targets
 
 
-def record_pose_action(env: Arx5EnvWithImages, obs: dict) -> None:
+def record_pose_action(
+    env: Arx5EnvWithImages,
+    obs: dict,
+    *,
+    last_rotvecs: list[np.ndarray | None] | None = None,
+) -> None:
     """
     把当前位姿记入 action_accumulator（不向机械臂下发指令）。
 
     时间戳用 get_obs 对齐后的相机时间，供 end_episode 做 episode 级插值对齐。
+    若传入 last_rotvecs，会对每臂 rotvec 做 2π 等价连续化，避免 ±π 表示翻转。
     """
     if env.action_accumulator is None:
         return
     n_robots = len(env.robots)
     action = action_from_obs(obs, n_robots)
+    if last_rotvecs is not None:
+        for robot_idx in range(n_robots):
+            sl = slice(7 * robot_idx + 3, 7 * robot_idx + 6)
+            rv = action[sl]
+            prev = last_rotvecs[robot_idx]
+            if prev is not None:
+                rv = nearest_rotvec_equivalent(rv, prev)
+                action[sl] = rv
+            last_rotvecs[robot_idx] = np.asarray(action[sl], dtype=np.float64).copy()
     t = float(np.asarray(obs["timestamp"][-1]))
     env.action_accumulator.put(action[None, :], np.array([t], dtype=np.float64))
 
@@ -540,6 +559,145 @@ def abort_episode(env: Arx5EnvWithImages) -> None:
     if getattr(env, "image_accumulator", None) is not None:
         env.image_accumulator = None
     print(f"Episode {episode_id} aborted (not saved).")
+
+
+class GripperDoubleOpenCloseDetector:
+    """检测单臂夹爪在短窗内连续两次「开合」（开↔关往返各一次算一合）。
+
+    用于拖拽模式下无键盘开始/保存：第二次双开合触发时，
+    ``last_gesture_start_t`` 指向本段双开合第一次半程开始时刻，便于截掉手势。
+    """
+
+    def __init__(
+        self,
+        *,
+        close_thresh: float,
+        open_thresh: float,
+        window_s: float = 1.5,
+        cooldown_s: float = 1.0,
+    ):
+        if open_thresh <= close_thresh:
+            raise ValueError(
+                f"open_thresh ({open_thresh}) must be > close_thresh ({close_thresh})"
+            )
+        self.close_thresh = float(close_thresh)
+        self.open_thresh = float(open_thresh)
+        self.window_s = float(window_s)
+        self.cooldown_s = float(cooldown_s)
+        self.last_gesture_start_t: float | None = None
+        self._state: str | None = None  # "open" | "closed"
+        self._half: str | None = None  # 本轮开合已到达的第一端
+        self._pending_start: float | None = None
+        self._cycle_times: list[float] = []
+        self._cycle_start_times: list[float] = []
+        self._last_trigger_t = -1e9
+
+    def reset(self) -> None:
+        self.last_gesture_start_t = None
+        self._state = None
+        self._half = None
+        self._pending_start = None
+        self._cycle_times.clear()
+        self._cycle_start_times.clear()
+
+    def _expire(self, t: float) -> None:
+        while self._cycle_times and (t - self._cycle_times[0]) > self.window_s:
+            self._cycle_times.pop(0)
+            self._cycle_start_times.pop(0)
+
+    def update(self, width: float, t: float | None = None) -> bool:
+        """喂入当前夹爪开口；若检测到双开合则返回 True。"""
+        now = time.time() if t is None else float(t)
+        w = float(width)
+
+        if w <= self.close_thresh:
+            new_state = "closed"
+        elif w >= self.open_thresh:
+            new_state = "open"
+        else:
+            new_state = None
+
+        if self._state is None:
+            if new_state is not None:
+                self._state = new_state
+            return False
+
+        in_cooldown = (now - self._last_trigger_t) < self.cooldown_s
+        if new_state is None or new_state == self._state:
+            return False
+
+        # open ↔ closed 边沿
+        if self._half is None:
+            self._half = new_state
+            self._pending_start = now
+            self._state = new_state
+            return False
+
+        if self._half == new_state:
+            self._state = new_state
+            return False
+
+        # 完成一次开合（往返）
+        cycle_start = (
+            self._pending_start if self._pending_start is not None else now
+        )
+        self._cycle_times.append(now)
+        self._cycle_start_times.append(cycle_start)
+        self._half = None
+        self._pending_start = None
+        self._state = new_state
+        self._expire(now)
+
+        if in_cooldown:
+            self._cycle_times.clear()
+            self._cycle_start_times.clear()
+            return False
+
+        if len(self._cycle_times) >= 2:
+            self.last_gesture_start_t = self._cycle_start_times[-2]
+            self._last_trigger_t = now
+            self._cycle_times.clear()
+            self._cycle_start_times.clear()
+            return True
+        return False
+
+
+def gripper_width_from_obs(obs: dict, robot_idx: int) -> float | None:
+    key = f"robot{robot_idx}_gripper_width"
+    if key not in obs:
+        return None
+    try:
+        return float(np.asarray(obs[key][-1]).squeeze())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def truncate_episode_before(env: Arx5EnvWithImages, cutoff_t: float) -> int:
+    """丢掉 cutoff_t 及之后的累计样本，使结束手势不进入 zarr。返回保留的 action 步数。"""
+    keep_actions = 0
+    aa = env.action_accumulator
+    if aa is not None and len(aa) > 0:
+        actual = np.asarray(aa.actual_timestamps, dtype=np.float64)
+        keep_actions = int(np.sum(actual < float(cutoff_t)))
+        aa.size = keep_actions
+
+    oa = env.obs_accumulator
+    if oa is not None:
+        for key in list(oa.timestamps.keys()):
+            ts = oa.timestamps[key]
+            n = sum(1 for t in ts if t < cutoff_t)
+            oa.timestamps[key] = ts[:n]
+            oa.data[key] = oa.data[key][:n]
+
+    ia = getattr(env, "image_accumulator", None)
+    if ia is not None:
+        for key in list(ia.timestamps.keys()):
+            ts = ia.timestamps[key]
+            n = sum(1 for t in ts if t < cutoff_t)
+            ia.timestamps[key] = ts[:n]
+            ia.data[key] = ia.data[key][:n]
+
+    return keep_actions
 
 
 def check_episode_alignment(env) -> None:
@@ -747,13 +905,13 @@ def make_vis_image(
     vis = camera_strip_from_obs(obs, latency=camera_latency).copy()
     if recording:
         status = "REC"
-        help_text = "S save | D drop | I pose | Q quit"
+        help_text = "S save | D drop | 2x grip(can1) save | I | Q"
     elif delete_prompt:
         status = "DEL"
         help_text = delete_prompt
     elif zero_force_active:
         status = "DRAG"
-        help_text = "C start | P->init | I pose | Q quit"
+        help_text = "C / 2x grip(can1) start | P->init | I | Q"
     elif no_zero_force:
         status = "READY"
         help_text = "C start | P zero-force | I pose | Q quit"
@@ -1574,6 +1732,9 @@ def run_collect_session(
     web_state=None,
     web_cmds=None,
     web_server=None,
+    grip_gesture_robot=1,
+    grip_gesture_window=1.5,
+    no_grip_gesture=False,
 ) -> None:
     """连接机械臂 + 相机，跑一轮数采会话；Q / 网页 quit 后返回（不退出进程）。
 
@@ -1651,6 +1812,14 @@ def run_collect_session(
         "  P=toggle zero-force (again -> init)  "
         "C=start  S=save  D=drop  E=del  I=pose  Q=quit(no home)"
     )
+    if no_grip_gesture:
+        print("  grip_gesture: OFF")
+    else:
+        print(
+            f"  grip_gesture: robot{int(grip_gesture_robot)} (can1) "
+            f"double open-close within {float(grip_gesture_window):.2f}s "
+            "→ start / save (gesture trimmed from zarr)"
+        )
     if web:
         print(f"  web        : http://{web_host}:{web_port}/  (no_cv={no_cv})")
     print("=" * 60)
@@ -1841,6 +2010,28 @@ def run_collect_session(
                 delete_buf = ""
                 delete_target = None
 
+                grip_robot_idx = int(grip_gesture_robot)
+                if grip_robot_idx < 0 or grip_robot_idx >= n_robots:
+                    raise ValueError(
+                        f"--grip_gesture_robot={grip_robot_idx} out of range "
+                        f"(n_robots={n_robots})"
+                    )
+                grip_span = float(gripper_max_width) - float(gripper_min_width)
+                grip_detector = None
+                if not no_grip_gesture:
+                    grip_detector = GripperDoubleOpenCloseDetector(
+                        close_thresh=float(gripper_min_width) + 0.25 * grip_span,
+                        open_thresh=float(gripper_min_width) + 0.75 * grip_span,
+                        window_s=float(grip_gesture_window),
+                        cooldown_s=1.0,
+                    )
+                    print(
+                        f"Gripper gesture ON: robot{grip_robot_idx} "
+                        f"(close≤{grip_detector.close_thresh:.3f} "
+                        f"open≥{grip_detector.open_thresh:.3f} m). "
+                        "In drag: double open-close to start; again to save."
+                    )
+
                 if no_zero_force:
                     print("Direct record mode: press C to start (P optional for drag).")
 
@@ -1895,11 +2086,19 @@ def run_collect_session(
                             if not zero_force_active:
                                 env.set_gravity_compensation()
                                 zero_force_active = True
+                                if grip_detector is not None:
+                                    grip_detector.reset()
                                 print(
                                     "Drag mode ON (gravity if supported, else damping). "
                                     "Drag arm freely; squeeze gripper by hand "
                                     "(torque assist)."
                                 )
+                                if grip_detector is not None:
+                                    print(
+                                        f"Double open-close robot{grip_robot_idx} "
+                                        "gripper to START recording "
+                                        "(or press C)."
+                                    )
                             else:
                                 leave_zero_force_to_init(
                                     env,
@@ -1908,9 +2107,13 @@ def run_collect_session(
                                     duration=init_duration,
                                 )
                                 zero_force_active = False
+                                if grip_detector is not None:
+                                    grip_detector.reset()
                         elif action == "start":
                             if zero_force_active or no_zero_force:
                                 start = True
+                                if grip_detector is not None:
+                                    grip_detector.reset()
                             else:
                                 print("Press P / Drag first to enter zero-force mode.")
                         elif action == "save":
@@ -1992,12 +2195,19 @@ def run_collect_session(
                                 if not zero_force_active:
                                     env.set_gravity_compensation()
                                     zero_force_active = True
+                                    if grip_detector is not None:
+                                        grip_detector.reset()
                                     print(
                                         "Drag mode ON (gravity if supported, else damping). "
                                         "Drag arm freely; squeeze gripper by hand "
                                         "(torque assist). Press P again to exit and "
                                         "return to init, or C to record."
                                     )
+                                    if grip_detector is not None:
+                                        print(
+                                            f"Or double open-close robot{grip_robot_idx} "
+                                            "gripper to START recording."
+                                        )
                                 else:
                                     leave_zero_force_to_init(
                                         env,
@@ -2006,9 +2216,13 @@ def run_collect_session(
                                         duration=init_duration,
                                     )
                                     zero_force_active = False
+                                    if grip_detector is not None:
+                                        grip_detector.reset()
                             if key_stroke == KeyCode(char="c"):
                                 if zero_force_active or no_zero_force:
                                     start_episode = True
+                                    if grip_detector is not None:
+                                        grip_detector.reset()
                                 else:
                                     print("Press P first to enter zero-force mode.")
                             if key_stroke == KeyCode(char="s"):
@@ -2044,6 +2258,23 @@ def run_collect_session(
                         try:
                             obs = env.get_obs()
                             cam_lat = compute_camera_latency(env, obs)
+                            if (
+                                grip_detector is not None
+                                and zero_force_active
+                                and delete_mode is None
+                            ):
+                                gw = gripper_width_from_obs(obs, grip_robot_idx)
+                                if gw is not None:
+                                    obs_t = float(np.asarray(obs["timestamp"][-1]))
+                                    if grip_detector.update(gw, obs_t):
+                                        print(
+                                            f"Gripper double open-close on "
+                                            f"robot{grip_robot_idx} → START recording."
+                                        )
+                                        start_episode = True
+                                        grip_detector.reset()
+                            if start_episode:
+                                break
                             if pose_print_enabled:
                                 now = time.monotonic()
                                 if now - last_pose_print_t >= pose_print_interval:
@@ -2102,6 +2333,12 @@ def run_collect_session(
                     start_delay = 0.5
                     eval_t_start = time.time() + start_delay
                     print(f"\n>>> Episode {episode_id} START")
+                    if grip_detector is not None:
+                        grip_detector.reset()
+                        print(
+                            f"Double open-close robot{grip_robot_idx} gripper "
+                            "to SAVE (gesture trimmed from zarr), or press S."
+                        )
                     if web_state is not None:
                         web_state.clear_live_series()
                     env.start_episode(eval_t_start)
@@ -2115,6 +2352,10 @@ def run_collect_session(
                     n_steps = 0
                     stop_save = False
                     stop_drop = False
+                    save_via_grip_gesture = False
+                    last_action_rotvecs: list[np.ndarray | None] = [
+                        None for _ in range(n_robots)
+                    ]
 
                     try:
                         while True:
@@ -2201,15 +2442,54 @@ def run_collect_session(
                                 if now - last_pose_print_t >= pose_print_interval:
                                     print_current_pose(env, tag="rec")
                                     last_pose_print_t = now
-                            record_pose_action(env, obs)
-                            n_steps += 1
-                            append_live_from_obs(
-                                web_state,
-                                obs,
-                                step=n_steps,
-                                t_elapsed=t_elapsed,
-                                n_robots=n_robots,
-                            )
+
+                            grip_save_triggered = False
+                            if grip_detector is not None and not (
+                                stop_save or stop_drop
+                            ):
+                                gw = gripper_width_from_obs(obs, grip_robot_idx)
+                                if gw is not None:
+                                    obs_t = float(np.asarray(obs["timestamp"][-1]))
+                                    if grip_detector.update(gw, obs_t):
+                                        grip_save_triggered = True
+                                        save_via_grip_gesture = True
+                                        # 略提前切断，避免手势起始抖动进数据集
+                                        cut_t = grip_detector.last_gesture_start_t
+                                        if cut_t is None:
+                                            cut_t = obs_t
+                                        cut_t = float(cut_t) - 0.05
+                                        kept = truncate_episode_before(env, cut_t)
+                                        n_steps = kept
+                                        print(
+                                            f"Gripper double open-close on "
+                                            f"robot{grip_robot_idx} → SAVE "
+                                            f"(trimmed gesture; keep {kept} steps)."
+                                        )
+                                        stop_save = True
+                                        if web_state is not None:
+                                            web_state.update(
+                                                mode="SAVING",
+                                                recording=True,
+                                                message=(
+                                                    f"夹爪手势保存 episode "
+                                                    f"{episode_id}…请稍候"
+                                                ),
+                                            )
+
+                            if not grip_save_triggered and not (
+                                stop_save or stop_drop
+                            ):
+                                record_pose_action(
+                                    env, obs, last_rotvecs=last_action_rotvecs
+                                )
+                                n_steps += 1
+                                append_live_from_obs(
+                                    web_state,
+                                    obs,
+                                    step=n_steps,
+                                    t_elapsed=t_elapsed,
+                                    n_robots=n_robots,
+                                )
 
                             vis = make_vis_image(
                                 obs,
@@ -2261,6 +2541,8 @@ def run_collect_session(
                                         message="正在丢弃当前 episode…",
                                     )
                                 abort_episode(env)
+                                if grip_detector is not None:
+                                    grip_detector.reset()
                                 if web_state is not None:
                                     web_state.clear_live_series()
                                     web_state.update(
@@ -2270,7 +2552,7 @@ def run_collect_session(
                                         recording=False,
                                         message="已丢弃，可继续采集",
                                     )
-                                # 丢弃后仍保持零力，可直接再按 C 录下一条
+                                # 丢弃后仍保持零力，可直接再按 C / 双开合 录下一条
                                 break
 
                             if stop_save:
@@ -2282,11 +2564,18 @@ def run_collect_session(
                                     )
                                 ok = save_episode(env, episode_id)
                                 if ok:
+                                    via = (
+                                        " [grip gesture, trimmed]"
+                                        if save_via_grip_gesture
+                                        else ""
+                                    )
                                     print(
-                                        f"Episode {episode_id} saved "
-                                        f"({n_steps} loop steps @ {frequency} Hz). "
+                                        f"Episode {episode_id} saved{via} "
+                                        f"({n_steps} steps @ {frequency} Hz). "
                                         "Press E to delete a saved episode."
                                     )
+                                if grip_detector is not None:
+                                    grip_detector.reset()
                                 if web_state is not None:
                                     web_state.clear_live_series()
                                     web_state.update(
@@ -2303,7 +2592,7 @@ def run_collect_session(
                                             else f"保存 episode {episode_id} 失败（无有效帧）"
                                         ),
                                     )
-                                # 保存后仍保持零力，可直接再按 C 录下一条
+                                # 保存后仍保持零力，可直接再按 C / 双开合 录下一条
                                 break
 
                             precise_wait(t_cycle_end, time_func=time.monotonic)
@@ -2315,7 +2604,15 @@ def run_collect_session(
                         leave_drag_mode(env)
                         zero_force_active = False
 
-                    if zero_force_active or no_zero_force:
+                    if grip_detector is not None:
+                        grip_detector.reset()
+                    if zero_force_active:
+                        print(
+                            "Ready for next episode. Press C or double open-close "
+                            f"robot{grip_robot_idx} gripper to start, "
+                            "E to delete, or Q to quit.\n"
+                        )
+                    elif no_zero_force:
                         print(
                             "Ready for next episode. Press C to start, "
                             "E to delete a saved episode, or Q to quit.\n"
@@ -2516,6 +2813,26 @@ def run_collect_session(
     default=False,
     help="跳过 hub，直达数据管理（网页回看/删除，不启机械臂与相机）",
 )
+@click.option(
+    "--grip_gesture_robot",
+    default=1,
+    type=int,
+    show_default=True,
+    help="双开合手势用的臂索引（默认 1=右臂/can1）",
+)
+@click.option(
+    "--grip_gesture_window",
+    default=1.5,
+    type=float,
+    show_default=True,
+    help="两次开合需落在该时间窗内（秒）才算双开合",
+)
+@click.option(
+    "--no_grip_gesture",
+    is_flag=True,
+    default=False,
+    help="关闭夹爪双开合开始/保存手势",
+)
 def main(
     output,
     robot_ip,
@@ -2554,6 +2871,9 @@ def main(
     no_cv,
     viewer_only,
     collect_direct,
+    grip_gesture_robot,
+    grip_gesture_window,
+    no_grip_gesture,
 ):
     if viewer_only:
         run_viewer_only(
@@ -2599,6 +2919,9 @@ def main(
         web_host=web_host,
         web_port=web_port,
         no_cv=no_cv,
+        grip_gesture_robot=grip_gesture_robot,
+        grip_gesture_window=grip_gesture_window,
+        no_grip_gesture=no_grip_gesture,
     )
 
     # --web 默认进 hub；--collect_direct 跳过选择页直连数采
