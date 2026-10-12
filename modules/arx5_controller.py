@@ -31,23 +31,35 @@ class Command(enum.Enum):
     RESTORE_GAINS_AFTER_DRAG = 11
 
 
-# 拖拽夹爪：中间行程跟手辅助 + 近限位虚拟墙（防 <-0.005 急停）。
-# 速度死区要够大，否则噪声会「自己开合」。
-# 闭限位：固件要求 gripper_pos ∈ [0, width]，越界 ±0.005 就急停。
-# 墙做成「外软内硬」：夹到底手感不猛，但快到 0 时必须够力顶住。
-# 标定后零点更准，墙可以收近；仍留一点余量防手捏过冲到 -0.005
-DRAG_GRIPPER_WALL_SOFT_LO = 0.006  # m，开始轻微顶开
-DRAG_GRIPPER_WALL_HARD_LO = 0.003  # m，进入强墙
-DRAG_GRIPPER_WALL_SOFT_TAU = 0.08  # Nm，软段最大
-DRAG_GRIPPER_WALL_HARD_TAU = 0.45  # Nm，硬段最大
+# 拖拽夹爪：全程张开回弹 + 跟手；旧硬墙默认关（曾偏猛）。
+# 死区/同号门限防振荡；回弹只朝张开，明确闭合时让开。
+DRAG_GRIPPER_WALL_ENABLE = False
+DRAG_GRIPPER_WALL_SOFT_LO = 0.028
+DRAG_GRIPPER_WALL_HARD_LO = 0.016
+DRAG_GRIPPER_WALL_SOFT_TAU = 0.45
+DRAG_GRIPPER_WALL_HARD_TAU = 0.95
+DRAG_GRIPPER_WALL_OPEN_FLOOR = 0.35
 DRAG_GRIPPER_WALL_HI = 0.082
 DRAG_GRIPPER_WALL_HI_TAU = 0.25
-DRAG_GRIPPER_VEL_EPS = 0.025
-DRAG_GRIPPER_FRICTION_OPEN = 0.10
-DRAG_GRIPPER_FRICTION_CLOSE = 0.07
+# 闭侧回弹（比硬墙温和；夹紧/偏紧/静止都顶开，不只卡死时）
+DRAG_GRIPPER_REBOUND_ENABLE = True
+DRAG_GRIPPER_REBOUND_LO = 0.032  # m，偏紧即开始回弹
+DRAG_GRIPPER_REBOUND_HARD_LO = 0.015
+DRAG_GRIPPER_REBOUND_TAU = 0.22  # Nm，软段
+DRAG_GRIPPER_REBOUND_HARD_TAU = 0.38  # Nm，夹很紧
+# 跟手：张开偏强，闭合偏弱；死区够大 + 同号才跟，防开合振荡
+DRAG_GRIPPER_VEL_EPS = 0.032
+DRAG_GRIPPER_FRICTION_OPEN = 0.20
+DRAG_GRIPPER_FRICTION_CLOSE = 0.05
 DRAG_GRIPPER_TORQUE_TO_ACC = 0.05
-DRAG_GRIPPER_ACC_THRESHOLD = 0.015
+DRAG_GRIPPER_ACC_THRESHOLD = 0.02
 DRAG_GRIPPER_TORQUE_MAX = 1.2
+DRAG_GRIPPER_VEL_SIGN_MIN = 4
+DRAG_GRIPPER_STUCK_VEL = 0.02
+DRAG_GRIPPER_STUCK_TAU = 0.55
+# P 键阻尼拖拽：臂 kp=0，kd 相对 set_to_damping 后再乘此系数（越小越轻、越飘）
+# 原 0.1 偏硬；0.03 约再软 3 倍。若仍沉可试 0.015；若发颤/难停再调回 0.05
+DRAG_ARM_KD_SCALE = 0.015
 
 
 def _sync_measured_tcp_gripper(robot_client: Arx5Client) -> None:
@@ -57,22 +69,49 @@ def _sync_measured_tcp_gripper(robot_client: Arx5Client) -> None:
 
 
 def _closed_wall_torque(g: float) -> float:
-    """闭限位外软内硬：正力矩 = 张开方向。"""
+    """闭限位外软内硬：正力矩 = 张开方向。进墙即有 OPEN_FLOOR 底力。"""
     if g >= DRAG_GRIPPER_WALL_SOFT_LO:
         return 0.0
-    # 软段：soft_lo → hard_lo，0 → soft_tau
+    floor = float(DRAG_GRIPPER_WALL_OPEN_FLOOR)
+    soft = float(DRAG_GRIPPER_WALL_SOFT_TAU)
+    hard = float(DRAG_GRIPPER_WALL_HARD_TAU)
     if g >= DRAG_GRIPPER_WALL_HARD_LO:
         span = max(DRAG_GRIPPER_WALL_SOFT_LO - DRAG_GRIPPER_WALL_HARD_LO, 1e-6)
         alpha = (DRAG_GRIPPER_WALL_SOFT_LO - g) / span
-        return DRAG_GRIPPER_WALL_SOFT_TAU * min(1.0, max(0.0, alpha))
-    # 硬段：hard_lo → 0，soft_tau → hard_tau（二次曲线，越近越猛）
+        alpha = min(1.0, max(0.0, alpha))
+        return floor + (soft - floor) * alpha
     span = max(DRAG_GRIPPER_WALL_HARD_LO, 1e-6)
     beta = (DRAG_GRIPPER_WALL_HARD_LO - g) / span
     beta = min(1.0, max(0.0, beta))
-    return (
-        DRAG_GRIPPER_WALL_SOFT_TAU
-        + (DRAG_GRIPPER_WALL_HARD_TAU - DRAG_GRIPPER_WALL_SOFT_TAU) * (beta * beta)
-    )
+    return soft + (hard - soft) * (beta * beta)
+
+
+def _rebound_open_torque(g: float) -> float:
+    """偏紧区间持续张开回弹（比硬墙温和）。"""
+    if g >= DRAG_GRIPPER_REBOUND_LO:
+        return 0.0
+    soft = float(DRAG_GRIPPER_REBOUND_TAU)
+    hard = float(DRAG_GRIPPER_REBOUND_HARD_TAU)
+    if g >= DRAG_GRIPPER_REBOUND_HARD_LO:
+        span = max(
+            DRAG_GRIPPER_REBOUND_LO - DRAG_GRIPPER_REBOUND_HARD_LO, 1e-6
+        )
+        alpha = (DRAG_GRIPPER_REBOUND_LO - g) / span
+        alpha = min(1.0, max(0.0, alpha))
+        # 软段也保留一点底力，静止偏紧时就能顶开
+        return 0.12 + (soft - 0.12) * alpha
+    span = max(DRAG_GRIPPER_REBOUND_HARD_LO, 1e-6)
+    beta = (DRAG_GRIPPER_REBOUND_HARD_LO - g) / span
+    beta = min(1.0, max(0.0, beta))
+    return soft + (hard - soft) * (beta * beta)
+
+
+def _vel_same_sign_count(gripper_vel_hist: list[float], sign: float) -> int:
+    n = 0
+    for vv in gripper_vel_hist:
+        if abs(float(vv)) >= DRAG_GRIPPER_VEL_EPS and float(vv) * sign > 0:
+            n += 1
+    return n
 
 
 def _gripper_assist_torque(
@@ -80,18 +119,36 @@ def _gripper_assist_torque(
     dt: float,
     gripper_pos: float | None = None,
 ) -> float:
-    """手捏跟手辅助 + 闭限位外软内硬墙（防急停且夹到底不猛顶）。"""
+    """张开回弹（全程偏开）+ 同号跟手；可选硬墙。"""
     torque = 0.0
     g = float(gripper_pos) if gripper_pos is not None else None
+    v_now = float(gripper_vel_hist[-1]) if gripper_vel_hist else 0.0
+    clearly_closing = (
+        v_now <= -DRAG_GRIPPER_VEL_EPS
+        and _vel_same_sign_count(gripper_vel_hist, -1.0)
+        >= DRAG_GRIPPER_VEL_SIGN_MIN
+    )
+    clearly_opening = (
+        v_now >= DRAG_GRIPPER_VEL_EPS
+        and _vel_same_sign_count(gripper_vel_hist, 1.0)
+        >= DRAG_GRIPPER_VEL_SIGN_MIN
+    )
 
-    # 1) 跟手：只有明显运动时才出力；进入软墙后不再加闭合方向辅助
-    if len(gripper_vel_hist) >= 5 and dt > 0:
-        v = gripper_vel_hist
-        v_now = float(v[-1])
+    # 1) 跟手：同向持续才出力（防噪声振荡）；张开力矩大于闭合
+    if len(gripper_vel_hist) >= 5 and dt > 0 and (
+        clearly_opening or clearly_closing
+    ):
         allow_follow = True
-        if g is not None and g < DRAG_GRIPPER_WALL_SOFT_LO and v_now < 0:
+        if (
+            (DRAG_GRIPPER_WALL_ENABLE or DRAG_GRIPPER_REBOUND_ENABLE)
+            and g is not None
+            and g < DRAG_GRIPPER_REBOUND_LO
+            and clearly_closing
+        ):
+            # 偏紧时不帮你继续捏死，交给回弹顶开
             allow_follow = False
-        if allow_follow and abs(v_now) >= DRAG_GRIPPER_VEL_EPS:
+        if allow_follow:
+            v = gripper_vel_hist
             gripper_acc = 0.5 * (v[-1] - v[0]) / (dt * (len(v) - 1)) + 0.5 * (
                 v[-2] - v[2]
             ) / (dt * (len(v) - 3))
@@ -102,18 +159,31 @@ def _gripper_assist_torque(
             else:
                 gripper_acc = 0.0
             torque += DRAG_GRIPPER_TORQUE_TO_ACC * float(gripper_acc)
-            if v_now > 0:
+            if clearly_opening:
                 torque += DRAG_GRIPPER_FRICTION_OPEN
             else:
                 torque -= DRAG_GRIPPER_FRICTION_CLOSE
 
-    # 2) 限位墙
-    if g is not None:
+    # 2) 回弹：偏紧就持续顶开（静止/微动/张开都出力；仅明确闭合时让开）
+    if DRAG_GRIPPER_REBOUND_ENABLE and g is not None and not clearly_closing:
+        rb = _rebound_open_torque(g)
+        if rb > 0:
+            if torque < 0:
+                torque = 0.0
+            torque = max(torque, rb)
+            # 已在张开时叠加一点，中间行程也更跟手
+            if clearly_opening:
+                torque = max(torque, rb + 0.5 * DRAG_GRIPPER_FRICTION_OPEN)
+
+    # 3) 旧硬墙（默认关）
+    if DRAG_GRIPPER_WALL_ENABLE and g is not None:
         wall = _closed_wall_torque(g)
         if wall > 0:
             if torque < 0:
                 torque = 0.0
-            torque += wall
+            torque = max(torque + wall, float(DRAG_GRIPPER_WALL_OPEN_FLOOR))
+            if abs(v_now) < DRAG_GRIPPER_STUCK_VEL:
+                torque = max(torque, float(DRAG_GRIPPER_STUCK_TAU))
         if g > DRAG_GRIPPER_WALL_HI:
             if torque > 0:
                 torque = 0.0
@@ -474,8 +544,16 @@ class Arx5Controller(mp.Process):
                     # 每拍下发（含 0），避免上次辅助力矩残留继续推夹爪
                     try:
                         self.robot_client.set_gripper_torque(assist_tau)
-                    except Exception:
-                        pass
+                    except Exception as grip_tau_exc:
+                        # 偶发失败不应打死环；但完全静默会导致「以为在辅助其实没下发」
+                        if not hasattr(self, "_grip_tau_fail_t"):
+                            self._grip_tau_fail_t = 0.0
+                        if time.monotonic() - float(self._grip_tau_fail_t) > 1.0:
+                            self._grip_tau_fail_t = time.monotonic()
+                            print(
+                                "[Arx5Controller] set_gripper_torque failed: "
+                                f"{grip_tau_exc} (gpos={gpos}, tau={assist_tau:.3f})"
+                            )
 
                 state = dict()
                 for key, func_name in self.receive_keys:
@@ -712,6 +790,21 @@ class Arx5Controller(mp.Process):
                         drag_gripper_vel_hist = [0.0] * 5
                         try:
                             self.robot_client.set_gravity_compensation(True)
+                            # 真零力路径也要把夹爪位置环清零，否则墙力矩会被 kp 顶住
+                            try:
+                                g_gc = self.robot_client.get_gain()
+                                g_gc = {
+                                    "kp": np.asarray(g_gc["kp"], dtype=np.float64),
+                                    "kd": np.asarray(g_gc["kd"], dtype=np.float64),
+                                    "gripper_kp": 0.0,
+                                    "gripper_kd": 0.0,
+                                }
+                                self.robot_client.set_gain(g_gc)
+                            except Exception as grip_gain_exc:
+                                print(
+                                    "[Arx5Controller] zero gripper gain after GC "
+                                    f"warning: {grip_gain_exc}"
+                                )
                             is_gravity_compensation = True
                             entered = True
                             print("[Arx5Controller] set_gravity_compensation -> True")
@@ -736,7 +829,10 @@ class Arx5Controller(mp.Process):
                                     "kp": np.zeros_like(
                                         np.asarray(gain["kp"], dtype=np.float64)
                                     ),
-                                    "kd": np.asarray(gain["kd"], dtype=np.float64) * 0.1,
+                                    "kd": (
+                                        np.asarray(gain["kd"], dtype=np.float64)
+                                        * float(DRAG_ARM_KD_SCALE)
+                                    ),
                                     "gripper_kp": 0.0,
                                     "gripper_kd": 0.0,
                                 }
@@ -748,7 +844,8 @@ class Arx5Controller(mp.Process):
                                 )
                                 print(
                                     "[Arx5Controller] damping drag ON "
-                                    "(arm kp=0, kd*=0.1; gripper kp=0 + torque assist). "
+                                    f"(arm kp=0, kd*={DRAG_ARM_KD_SCALE}; "
+                                    "gripper kp=0 + torque assist). "
                                     "Squeeze gripper by hand."
                                 )
                             except Exception as e2:
@@ -765,17 +862,20 @@ class Arx5Controller(mp.Process):
                                 )
                             try:
                                 g_now = self.robot_client.get_gain()
+                                parts = ["follow"]
+                                if DRAG_GRIPPER_REBOUND_ENABLE:
+                                    parts.append("rebound")
+                                if DRAG_GRIPPER_WALL_ENABLE:
+                                    parts.append("wall")
                                 print(
                                     "[Arx5Controller] drag gain check: "
                                     f"gripper_kp={float(g_now['gripper_kp']):.4f} "
                                     f"gripper_kd={float(g_now['gripper_kd']):.4f} "
-                                    f"assist=follow+wall "
+                                    f"assist={'+'.join(parts)} "
                                     f"open={DRAG_GRIPPER_FRICTION_OPEN} "
                                     f"close={DRAG_GRIPPER_FRICTION_CLOSE} "
-                                    f"soft_lo={DRAG_GRIPPER_WALL_SOFT_LO}/"
-                                    f"{DRAG_GRIPPER_WALL_SOFT_TAU} "
-                                    f"hard_lo={DRAG_GRIPPER_WALL_HARD_LO}/"
-                                    f"{DRAG_GRIPPER_WALL_HARD_TAU}"
+                                    f"rebound_lo={DRAG_GRIPPER_REBOUND_LO}/"
+                                    f"{DRAG_GRIPPER_REBOUND_TAU}"
                                 )
                             except Exception:
                                 pass
