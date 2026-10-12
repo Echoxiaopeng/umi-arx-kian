@@ -292,7 +292,20 @@ class Arx5Env:
             self.start_wait()
 
     def stop(self, wait=True):
-        self.end_episode()
+        try:
+            if self.obs_accumulator is not None or self.action_accumulator is not None:
+                self.end_episode()
+            else:
+                self.obs_accumulator = None
+                self.action_accumulator = None
+                if getattr(self, "image_accumulator", None) is not None:
+                    self.image_accumulator = None
+        except Exception as exc:  # noqa: BLE001
+            print(f"end_episode on stop warning: {exc}")
+            self.obs_accumulator = None
+            self.action_accumulator = None
+            if getattr(self, "image_accumulator", None) is not None:
+                self.image_accumulator = None
         if self.multi_cam_vis is not None:
             self.multi_cam_vis.stop(wait=False)
         for robot in self.robots:
@@ -556,7 +569,10 @@ class Arx5Env:
 
     def end_episode(self):
         "Stop recording"
-        assert self.is_ready
+        if not self.is_ready:
+            self.obs_accumulator = None
+            self.action_accumulator = None
+            return
 
         # stop video recorder
         self.camera.stop_recording()

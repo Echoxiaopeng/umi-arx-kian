@@ -246,6 +246,13 @@
       box-shadow: 0 0 0 1px #3d9cf066;
       animation: modePulse 0.7s ease-in-out infinite;
     }
+    .badge.REPLAY {
+      background: #2a1f4a;
+      color: #c9b3ff;
+      border-color: #8b6cf0;
+      box-shadow: 0 0 0 1px #8b6cf066;
+      animation: modePulse 0.9s ease-in-out infinite;
+    }
     .badge.DEL {
       background: #3a1f24;
       color: #ffb3b8;
@@ -326,6 +333,15 @@
     button.primary { background: #1e4d7a; border-color: var(--accent); }
     button.danger { background: #4a2228; border-color: var(--danger); }
     button.ok { background: #1a3d30; border-color: var(--ok); }
+    #replayArmBtns button.active {
+      border-color: var(--accent);
+      background: #1e4d7a;
+    }
+    #btnEStop {
+      background: #6b1018;
+      border-color: #ff3b4a;
+      font-weight: 700;
+    }
     .msg { margin-top: 8px; color: var(--muted); font-size: 0.9rem; min-height: 1.2em; }
 
     .viewer {
@@ -719,7 +735,16 @@
             <button id="btnStart" class="ok">C · Start</button>
             <button id="btnSave">S · Save</button>
             <button id="btnDrop">D · Drop</button>
+            <button id="btnReplay" title="Full replay of selected or last episode">R · Full</button>
+            <button id="btnStep" title="Step replay: first press goes to start, then one frame per press">J · Step</button>
+            <button id="btnEStop" class="danger" title="Emergency stop: clear trajectory, hold pose">X · E-Stop</button>
             <button id="btnQuit" class="danger">Q · Quit</button>
+          </div>
+          <div class="btns" id="replayArmBtns" style="margin-top:6px">
+            <span style="color:var(--muted);font-size:0.8rem;align-self:center">Replay arm:</span>
+            <button type="button" id="btnArmBoth" class="active" title="Both arms (key 2)">Both</button>
+            <button type="button" id="btnArmL" title="Left / robot0 only (key 0)">L</button>
+            <button type="button" id="btnArmR" title="Right / robot1 only (key 1)">R</button>
           </div>
           <div class="msg" id="msg"></div>
         </div>
@@ -907,7 +932,7 @@
     function setMsg(t) {
       const el = $("msg");
       el.textContent = t || "";
-      const busy = /保存|丢弃|稍候|写盘/.test(t || "");
+      const busy = /保存|丢弃|稍候|写盘|回放/.test(t || "");
       el.classList.toggle("busy", busy);
       if ($("msgView")) {
         $("msgView").textContent = t || "";
@@ -922,6 +947,7 @@
       DRAG: "拖拽中",
       REC: "录制中",
       SAVING: "保存中",
+      REPLAY: "轨迹回放",
       DEL: "删除确认",
       VIEW: "数据管理",
       HUB: "入口",
@@ -941,9 +967,10 @@
       setModeBadge($("modeBadge"), "SAVING");
       if (kind === "drop") setMsg("正在丢弃当前 episode…");
       else setMsg("正在保存…请稍候（写盘可能需要几秒）");
-      ["btnSave", "btnDrop", "btnDrag", "btnStart"].forEach((id) => {
+      ["btnSave", "btnDrop", "btnDrag", "btnStart", "btnReplay", "btnStep"].forEach((id) => {
         if ($(id)) $(id).disabled = true;
       });
+      // E-Stop stays enabled
     }
 
     function renderHubLogs(logs) {
@@ -1240,13 +1267,28 @@
 
       const rec = !!s.recording;
       const saving = mode === "SAVING";
+      const replaying = mode === "REPLAY";
+      const busy = saving || replaying;
       const drag = !!s.zero_force_active;
+      const nEp = Number(s.n_episodes ?? 0);
       $("btnDrag").textContent = drag ? "P · Exit drag" : "P · Drag";
-      $("btnStart").disabled = rec || saving || !(drag || s.no_zero_force);
-      $("btnSave").disabled = !rec || saving;
-      $("btnDrop").disabled = !rec || saving;
-      $("btnDrag").disabled = saving;
-      $("btnDelete").disabled = selectedEp === null || selectedEp === "live" || saving;
+      $("btnStart").disabled = rec || busy || !(drag || s.no_zero_force);
+      $("btnSave").disabled = !rec || busy;
+      $("btnDrop").disabled = !rec || busy;
+      $("btnDrag").disabled = busy;
+      if ($("btnReplay")) {
+        $("btnReplay").disabled = rec || busy || nEp <= 0;
+      }
+      if ($("btnStep")) {
+        $("btnStep").disabled = rec || busy || nEp <= 0;
+      }
+      if ($("btnEStop")) {
+        $("btnEStop").disabled = viewerOnly || hubMode;
+      }
+      ["btnArmBoth", "btnArmL", "btnArmR"].forEach((id) => {
+        if ($(id)) $(id).disabled = rec || busy;
+      });
+      $("btnDelete").disabled = selectedEp === null || selectedEp === "live" || busy;
 
       // 按下 C 进入录制：强制切回实时相机画面
       if (rec && !saving && !lastRecording) {
@@ -2039,6 +2081,64 @@
       beginSavingUi("drop");
       postCmd("drop").then(() => setMsg("正在丢弃…")).catch(e => setMsg(e.message));
     };
+    if ($("btnReplay")) {
+      $("btnReplay").onclick = () => {
+        const extra = {};
+        if (selectedEp !== null && selectedEp !== "live") {
+          extra.episode_id = Number(selectedEp);
+        }
+        setModeBadge($("modeBadge"), "REPLAY");
+        setMsg(
+          extra.episode_id != null
+            ? `正在整段回放 episode ${extra.episode_id}…`
+            : "正在整段回放最近一条 episode…"
+        );
+        ["btnSave", "btnDrop", "btnDrag", "btnStart", "btnReplay", "btnStep"].forEach((id) => {
+          if ($(id)) $(id).disabled = true;
+        });
+        postCmd("replay", extra)
+          .then(() => setMsg("整段回放中…可用 X / E-Stop 急停"))
+          .catch((e) => setMsg(e.message));
+      };
+    }
+    if ($("btnStep")) {
+      $("btnStep").onclick = () => {
+        const extra = {};
+        if (selectedEp !== null && selectedEp !== "live") {
+          extra.episode_id = Number(selectedEp);
+        }
+        setMsg("单步回放…");
+        postCmd("replay_step", extra)
+          .then(() => setMsg("单步已执行"))
+          .catch((e) => setMsg(e.message));
+      };
+    }
+    if ($("btnEStop")) {
+      $("btnEStop").onclick = () => {
+        setModeBadge($("modeBadge"), "READY");
+        setMsg("急停中…");
+        postCmd("estop")
+          .then(() => setMsg("急停：已钉住当前位姿"))
+          .catch((e) => setMsg(e.message));
+      };
+    }
+    function setReplayArmUi(which) {
+      const map = { both: "btnArmBoth", l: "btnArmL", r: "btnArmR" };
+      Object.values(map).forEach((id) => {
+        if ($(id)) $(id).classList.remove("active");
+      });
+      const bid = map[which] || "btnArmBoth";
+      if ($(bid)) $(bid).classList.add("active");
+    }
+    function sendReplayArm(which) {
+      setReplayArmUi(which);
+      postCmd("set_replay_arm", { arm: which })
+        .then(() => setMsg(`回放臂: ${which}`))
+        .catch((e) => setMsg(e.message));
+    }
+    if ($("btnArmBoth")) $("btnArmBoth").onclick = () => sendReplayArm("both");
+    if ($("btnArmL")) $("btnArmL").onclick = () => sendReplayArm("l");
+    if ($("btnArmR")) $("btnArmR").onclick = () => sendReplayArm("r");
     $("btnQuit").onclick = () => postCmd("quit").then(() => setMsg("quit…")).catch(e => setMsg(e.message));
     if ($("btnBackHub")) {
       $("btnBackHub").onclick = () =>
@@ -2197,6 +2297,27 @@
       } else if (k === "d" || k === "backspace") {
         ev.preventDefault();
         $("btnDrop").click();
+      } else if (k === "r") {
+        ev.preventDefault();
+        _keyBusyUntil = Date.now() + 350;
+        if ($("btnReplay") && !$("btnReplay").disabled) $("btnReplay").click();
+      } else if (k === "j") {
+        ev.preventDefault();
+        _keyBusyUntil = Date.now() + 200;
+        if ($("btnStep") && !$("btnStep").disabled) $("btnStep").click();
+      } else if (k === "x") {
+        ev.preventDefault();
+        _keyBusyUntil = Date.now() + 200;
+        if ($("btnEStop")) $("btnEStop").click();
+      } else if (k === "0") {
+        ev.preventDefault();
+        sendReplayArm("l");
+      } else if (k === "1") {
+        ev.preventDefault();
+        sendReplayArm("r");
+      } else if (k === "2") {
+        ev.preventDefault();
+        sendReplayArm("both");
       }
     });
 

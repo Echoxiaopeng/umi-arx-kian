@@ -64,8 +64,16 @@ class Arx5EnvWithImages(Arx5EnvBimanualRS):
         return obs_data
 
     def end_episode(self):
-        assert self.is_ready
-        self.camera.stop_recording()
+        if not self.is_ready:
+            self.obs_accumulator = None
+            self.action_accumulator = None
+            self.image_accumulator = None
+            return
+
+        try:
+            self.camera.stop_recording()
+        except Exception as exc:  # noqa: BLE001
+            print(f"stop_recording warning: {exc}")
 
         if self.obs_accumulator is not None:
             assert self.action_accumulator is not None

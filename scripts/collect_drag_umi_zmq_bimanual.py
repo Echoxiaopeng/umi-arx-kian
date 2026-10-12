@@ -33,7 +33,7 @@ ARX5 双臂拖拽采数 — ZMQ + 双腕 GoPro（V4L）+ 中间 D435（pyrealsen
     python scripts/collect_drag_umi_zmq_bimanual.py -o data/collect_bimanual \\
         --rs_serial 123456789012 --no_save_depth --web
 
-键盘: 与 collect_drag_umi_zmq.py 相同（P/C/S/D/E/I/Q）。
+键盘: 与 collect_drag_umi_zmq.py 相同（P/C/S/D/E/I/Q），另加 R=回放已保存 episode。
 拖拽手势: P 进零力后，连续两次开合 can1（默认 robot1/右臂）夹爪 → 开始采集；
           再连续两次开合 → 保存 episode（手势本身不写入 zarr）。
 左右臂共用同一组 --init_delta / --init_gripper_delta（各自相对 home）。
@@ -61,6 +61,7 @@ from pathlib import Path
 import click
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation, Slerp
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -69,7 +70,10 @@ os.chdir(ROOT_DIR)
 
 from modules.arx5_env_with_images_bimanual_rs import Arx5EnvWithImages  # noqa: E402
 from modules.replay_buffer import ReplayBuffer  # noqa: E402
-from utils.interpolation_util import nearest_rotvec_equivalent  # noqa: E402
+from utils.interpolation_util import (  # noqa: E402
+    continuize_action_rotvecs,
+    nearest_rotvec_equivalent,
+)
 from utils.other_util import precise_wait  # noqa: E402
 
 # pynput 在无 DISPLAY 时会炸；viewer_only 不需要键盘钩子
@@ -116,8 +120,8 @@ class TerminalKeyReader:
         print(
             "[terminal_keys] 在本终端按键: "
             "p=开关零力(再按回init), c=开始, s=保存, d=丢弃当前, "
-            "e=删已保存, i=开关位姿打印, q=退出; "
-            "拖拽中可双次开合 can1 夹爪开始/保存"
+            "e=删已保存, r=整段回放, j=单步回放, "
+            "0/1/2=回放臂(左/右/双), x=急停, i=位姿, q=退出"
         )
         return self
 
@@ -156,6 +160,12 @@ class TerminalKeyReader:
             return KeyCode(char="d")
         if ch in ("e", "E"):
             return KeyCode(char="e")
+        if ch in ("r", "R"):
+            return KeyCode(char="r")
+        if ch in ("j", "J"):
+            return KeyCode(char="j")
+        if ch in ("x", "X"):
+            return KeyCode(char="x")
         if ch in ("i", "I"):
             return KeyCode(char="i")
         if ch in ("y", "Y"):
@@ -398,6 +408,120 @@ def move_to_tcp_pose(
         compensate_latency=False,
     )
     time.sleep(float(duration) + 0.2)
+
+
+def move_to_tcp_pose_slerp(
+    env: Arx5EnvWithImages,
+    targets: list[tuple[np.ndarray, float | None]],
+    *,
+    frequency: float,
+    duration: float = 2.5,
+    label: str = "target",
+    ensure_end_control: bool = False,
+    poll_abort=None,
+) -> bool:
+    """缓动到目标：xyz/夹爪线性，姿态用 Slerp。返回 False 表示被急停打断。"""
+    if ensure_end_control and hasattr(env, "set_end_control"):
+        try:
+            env.set_end_control()
+        except Exception as exc:  # noqa: BLE001
+            print(f"set_end_control warning: {exc}")
+
+    robot_states = env.get_robot_state()
+    n_robots = len(robot_states)
+    if len(targets) != n_robots:
+        raise ValueError(f"targets len {len(targets)} != n_robots {n_robots}")
+
+    start_pose_all = []
+    start_grip_all = []
+    target_pose_all = []
+    target_grip_all = []
+    for ridx in range(n_robots):
+        curr6 = robot_states[ridx]["ActualTCPPose"].astype(np.float64).copy()
+        grip = float(robot_states[ridx]["gripper_position"])
+        tgt6 = np.asarray(targets[ridx][0], dtype=np.float64).reshape(6).copy()
+        # 把目标 rotvec 锚到当前表示，减少 as_rotvec 翻转造成的数值跳变
+        tgt6[3:6] = nearest_rotvec_equivalent(tgt6[3:6], curr6[3:6])
+        tgt_grip = targets[ridx][1]
+        tgt_grip = grip if tgt_grip is None else float(tgt_grip)
+        start_pose_all.append(curr6)
+        target_pose_all.append(tgt6)
+        start_grip_all.append(grip)
+        target_grip_all.append(tgt_grip)
+
+    start_pose_all = np.stack(start_pose_all, axis=0)
+    target_pose_all = np.stack(target_pose_all, axis=0)
+    start_grip_all = np.asarray(start_grip_all, dtype=np.float64)
+    target_grip_all = np.asarray(target_grip_all, dtype=np.float64)
+
+    print(f"Moving to {label} (Slerp rotation)...")
+    for ridx in range(n_robots):
+        geo = float(
+            (
+                Rotation.from_rotvec(start_pose_all[ridx, 3:])
+                .inv()
+                * Rotation.from_rotvec(target_pose_all[ridx, 3:])
+            ).magnitude()
+        )
+        print(
+            f"  robot{ridx}  from "
+            f"{np.array2string(start_pose_all[ridx], precision=4, separator=',')} "
+            f"grip={start_grip_all[ridx]:.4f}"
+        )
+        print(
+            f"  robot{ridx}    to "
+            f"{np.array2string(target_pose_all[ridx], precision=4, separator=',')} "
+            f"grip={target_grip_all[ridx]:.4f}  geo={geo:.3f}rad"
+        )
+
+    dt = 1.0 / float(frequency)
+    steps = max(2, int(float(duration) * float(frequency)))
+    blends = np.array(
+        [ease_in_out_quad(k / (steps - 1)) for k in range(steps)], dtype=np.float64
+    )
+    rot_interps = []
+    for ridx in range(n_robots):
+        key = Rotation.from_rotvec(
+            np.stack([start_pose_all[ridx, 3:], target_pose_all[ridx, 3:]], axis=0)
+        )
+        rot_interps.append(Slerp([0.0, 1.0], key))
+
+    actions = np.zeros((steps, 7 * n_robots), dtype=np.float64)
+    for k, a in enumerate(blends):
+        for ridx in range(n_robots):
+            actions[k, 7 * ridx : 7 * ridx + 3] = start_pose_all[ridx, :3] + a * (
+                target_pose_all[ridx, :3] - start_pose_all[ridx, :3]
+            )
+            rv = np.asarray(rot_interps[ridx]([a])[0].as_rotvec(), dtype=np.float64)
+            if k > 0:
+                rv = nearest_rotvec_equivalent(
+                    rv, actions[k - 1, 7 * ridx + 3 : 7 * ridx + 6]
+                )
+            else:
+                rv = nearest_rotvec_equivalent(rv, start_pose_all[ridx, 3:])
+            actions[k, 7 * ridx + 3 : 7 * ridx + 6] = rv
+            actions[k, 7 * ridx + 6] = start_grip_all[ridx] + a * (
+                target_grip_all[ridx] - start_grip_all[ridx]
+            )
+
+    # 分块下发，便于急停清轨迹（避免队列里堆满未执行 waypoint）
+    chunk = max(2, int(0.4 * float(frequency)))
+    for i0 in range(0, steps, chunk):
+        if poll_abort is not None and poll_abort():
+            emergency_stop(env)
+            return False
+        i1 = min(steps, i0 + chunk)
+        t0 = time.time() + 0.12
+        env.exec_actions(
+            actions=actions[i0:i1],
+            timestamps=t0 + np.arange(i1 - i0, dtype=np.float64) * dt,
+            compensate_latency=False,
+        )
+        wait_s = max(0.0, float((i1 - i0 - 1) * dt) - 0.05)
+        if interruptible_sleep(wait_s, poll_abort=poll_abort):
+            emergency_stop(env)
+            return False
+    return True
 
 
 def move_to_init_pose(
@@ -815,6 +939,317 @@ def save_episode(env: Arx5EnvWithImages, episode_id: int) -> bool:
     return True
 
 
+def leave_drag_stay_pose(env: Arx5EnvWithImages) -> None:
+    """退出零力/拖拽，停留在当前位姿并恢复末端控制（供回放前调用）。"""
+    print("Leaving drag for replay (stay at current pose)...")
+    if hasattr(env, "set_end_control"):
+        try:
+            env.set_end_control()
+        except Exception as exc:  # noqa: BLE001
+            print(f"set_end_control warning: {exc}")
+    if hasattr(env, "restore_gains_after_drag"):
+        try:
+            env.restore_gains_after_drag()
+        except Exception as exc:  # noqa: BLE001
+            print(f"restore_gains_after_drag warning: {exc}")
+
+
+def emergency_stop(env: Arx5EnvWithImages) -> None:
+    """急停：清轨迹并钉在当前实测位姿（set_end_control），两臂一起停。"""
+    print("!!! E-STOP — hold current pose (clear trajectory)")
+    if hasattr(env, "set_end_control"):
+        try:
+            env.set_end_control()
+        except Exception as exc:  # noqa: BLE001
+            print(f"E-STOP set_end_control warning: {exc}")
+    else:
+        try:
+            env.set_to_damping()
+        except Exception as exc:  # noqa: BLE001
+            print(f"E-STOP set_to_damping warning: {exc}")
+
+
+def interruptible_sleep(
+    seconds: float,
+    *,
+    poll_abort=None,
+    dt: float = 0.05,
+) -> bool:
+    """可被 poll_abort 打断的 sleep；返回 True 表示被中止。"""
+    deadline = time.time() + max(0.0, float(seconds))
+    while True:
+        if poll_abort is not None and poll_abort():
+            return True
+        now = time.time()
+        if now >= deadline:
+            return False
+        time.sleep(min(float(dt), deadline - now))
+
+
+def mask_actions_hold_other_arms(
+    env: Arx5EnvWithImages,
+    actions: np.ndarray,
+    robot_indices: list[int] | None,
+) -> np.ndarray:
+    """只动选中的臂；未选中臂整段钉在当前实测 TCP+夹爪。None=双臂。"""
+    out = np.asarray(actions, dtype=np.float64).copy()
+    n_robots = len(env.robots)
+    if robot_indices is None:
+        return out
+    selected = {int(i) for i in robot_indices}
+    states = env.get_robot_state()
+    for ridx in range(n_robots):
+        if ridx in selected:
+            continue
+        pose6 = np.asarray(states[ridx]["ActualTCPPose"], dtype=np.float64).reshape(6)
+        grip = float(states[ridx]["gripper_position"])
+        out[:, 7 * ridx : 7 * ridx + 6] = pose6
+        out[:, 7 * ridx + 6] = grip
+    return out
+
+
+def _format_replay_arms(robot_indices: list[int] | None, n_robots: int) -> str:
+    if robot_indices is None or set(robot_indices) == set(range(n_robots)):
+        return "both"
+    labels = []
+    for i in sorted(robot_indices):
+        side = "L" if i == 0 else ("R" if i == 1 else f"r{i}")
+        labels.append(f"{side}/robot{i}")
+    return ",".join(labels) if labels else "none"
+
+
+def load_episode_actions(
+    env: Arx5EnvWithImages, episode_id: int
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """返回 (actions[T,7R], relative_timestamps[T])；失败返回 None。"""
+    n_episodes = env.replay_buffer.n_episodes
+    if n_episodes <= 0:
+        print("No saved episode to replay.")
+        return None
+    if episode_id < 0 or episode_id >= n_episodes:
+        print(
+            f"Episode {episode_id} does not exist "
+            f"(valid: 0..{n_episodes - 1})."
+        )
+        return None
+
+    n_robots = len(env.robots)
+    sl = env.replay_buffer.get_episode_slice(episode_id)
+    actions = np.asarray(env.replay_buffer.data["action"][sl], dtype=np.float64)
+    if actions.ndim != 2 or actions.shape[0] == 0:
+        print(f"Episode {episode_id} has no action steps.")
+        return None
+    expected_dim = 7 * n_robots
+    if actions.shape[1] != expected_dim:
+        print(
+            f"Episode {episode_id} action dim {actions.shape[1]} "
+            f"!= 7*n_robots={expected_dim}."
+        )
+        return None
+
+    actions = continuize_action_rotvecs(actions, n_robots=n_robots)
+    frequency_fallback = 60.0
+    timestamps = None
+    if "timestamp" in env.replay_buffer.data:
+        timestamps = np.asarray(
+            env.replay_buffer.data["timestamp"][sl], dtype=np.float64
+        )
+    if timestamps is not None and len(timestamps) == len(actions):
+        rel = timestamps - float(timestamps[0])
+        duration = float(rel[-1]) if len(rel) > 1 else 0.0
+        if duration <= 0.0 or not np.isfinite(duration):
+            dt = 1.0 / frequency_fallback
+            rel = np.arange(len(actions), dtype=np.float64) * dt
+    else:
+        dt = 1.0 / frequency_fallback
+        rel = np.arange(len(actions), dtype=np.float64) * dt
+    return actions, rel
+
+
+def _anchor_actions_to_current_pose(
+    env: Arx5EnvWithImages, actions: np.ndarray
+) -> np.ndarray:
+    """把整段 action 的 rotvec 锚到当前 ActualTCPPose，避免起点表示翻转。"""
+    out = np.asarray(actions, dtype=np.float64).copy()
+    n_robots = len(env.robots)
+    states = env.get_robot_state()
+    for ridx in range(n_robots):
+        curr_rv = np.asarray(states[ridx]["ActualTCPPose"][3:6], dtype=np.float64)
+        sl = slice(7 * ridx + 3, 7 * ridx + 6)
+        out[0, sl] = nearest_rotvec_equivalent(out[0, sl], curr_rv)
+        for t in range(1, len(out)):
+            out[t, sl] = nearest_rotvec_equivalent(out[t, sl], out[t - 1, sl])
+    return out
+
+
+def _targets_from_action_row(
+    action_row: np.ndarray, n_robots: int
+) -> list[tuple[np.ndarray, float]]:
+    targets: list[tuple[np.ndarray, float]] = []
+    row = np.asarray(action_row, dtype=np.float64).reshape(-1)
+    for ridx in range(n_robots):
+        pose6 = row[7 * ridx : 7 * ridx + 6].copy()
+        grip = float(row[7 * ridx + 6])
+        targets.append((pose6, grip))
+    return targets
+
+
+def _exec_actions_chunked(
+    env: Arx5EnvWithImages,
+    actions: np.ndarray,
+    rel: np.ndarray,
+    *,
+    poll_abort=None,
+    chunk_s: float = 0.5,
+) -> bool:
+    """按时长分块 schedule，便于急停；返回 False 表示被中止。"""
+    actions = np.asarray(actions, dtype=np.float64)
+    rel = np.asarray(rel, dtype=np.float64)
+    if len(actions) == 0:
+        return True
+    i0 = 0
+    n = len(actions)
+    while i0 < n:
+        if poll_abort is not None and poll_abort():
+            emergency_stop(env)
+            return False
+        t_cut = float(rel[i0]) + float(chunk_s)
+        i1 = i0 + 1
+        while i1 < n and float(rel[i1]) < t_cut:
+            i1 += 1
+        chunk = actions[i0:i1]
+        chunk_rel = rel[i0:i1] - float(rel[i0])
+        t0 = time.time() + 0.15
+        env.exec_actions(
+            actions=chunk,
+            timestamps=t0 + chunk_rel,
+            compensate_latency=False,
+        )
+        wait_s = max(0.0, float(chunk_rel[-1]) - 0.05)
+        if interruptible_sleep(wait_s, poll_abort=poll_abort):
+            emergency_stop(env)
+            return False
+        i0 = i1
+    if interruptible_sleep(0.2, poll_abort=poll_abort):
+        emergency_stop(env)
+        return False
+    return True
+
+
+def replay_saved_episode(
+    env: Arx5EnvWithImages,
+    episode_id: int,
+    *,
+    frequency: float,
+    approach_duration: float = 2.5,
+    robot_indices: list[int] | None = None,
+    poll_abort=None,
+) -> bool:
+    """从 zarr ``action`` Slerp 到起点再分块回放。
+
+    robot_indices: 要动的臂（如 [0]/[1]）；None=双臂。
+    poll_abort: 返回 True 时急停并中止。
+    """
+    loaded = load_episode_actions(env, episode_id)
+    if loaded is None:
+        return False
+    actions, rel = loaded
+    n_robots = len(env.robots)
+    actions = mask_actions_hold_other_arms(env, actions, robot_indices)
+    duration = float(rel[-1]) if len(rel) > 1 else 0.0
+    arms = _format_replay_arms(robot_indices, n_robots)
+
+    print(
+        f"\n>>> Replay episode {episode_id} [{arms}]: "
+        f"{len(actions)} steps, ~{duration:.2f}s "
+        f"(Slerp approach {approach_duration:.1f}s first)"
+    )
+    print("  (X / web E-Stop to abort; do not drag arms)")
+
+    start_targets = _targets_from_action_row(actions[0], n_robots)
+    for ridx, (pose6, grip) in enumerate(start_targets):
+        moving = robot_indices is None or ridx in robot_indices
+        tag = "MOVE" if moving else "HOLD"
+        print(
+            f"  robot{ridx}[{tag}] start "
+            f"xyz=[{pose6[0]:.4f},{pose6[1]:.4f},{pose6[2]:.4f}] "
+            f"rot=[{pose6[3]:.4f},{pose6[4]:.4f},{pose6[5]:.4f}] "
+            f"grip={grip:.4f}"
+        )
+
+    try:
+        ok_approach = move_to_tcp_pose_slerp(
+            env,
+            start_targets,
+            frequency=frequency,
+            duration=float(approach_duration),
+            label=f"replay-ep{episode_id}-start",
+            ensure_end_control=True,
+            poll_abort=poll_abort,
+        )
+        if not ok_approach:
+            print(f"<<< Replay episode {episode_id} aborted during approach.")
+            return False
+        actions = _anchor_actions_to_current_pose(env, actions)
+        actions = mask_actions_hold_other_arms(env, actions, robot_indices)
+        if len(actions) <= 1:
+            print(f"<<< Replay episode {episode_id} done (single frame).")
+            return True
+        play = actions[1:]
+        play_rel = rel[1:] - float(rel[1])
+        ok_play = _exec_actions_chunked(
+            env, play, play_rel, poll_abort=poll_abort, chunk_s=0.5
+        )
+        if not ok_play:
+            print(f"<<< Replay episode {episode_id} aborted (E-STOP).")
+            return False
+    except Exception as exc:  # noqa: BLE001
+        print(f"Replay episode {episode_id} failed: {exc}")
+        return False
+
+    print(f"<<< Replay episode {episode_id} done. Stay at final pose (end-control).")
+    print("Press P for drag, C to record, J=step, R=full, X=E-Stop.\n")
+    return True
+
+
+def replay_step_to_index(
+    env: Arx5EnvWithImages,
+    actions: np.ndarray,
+    step_idx: int,
+    *,
+    frequency: float,
+    step_duration: float = 0.12,
+    robot_indices: list[int] | None = None,
+    poll_abort=None,
+) -> bool:
+    """单步：Slerp 缓动到 ``actions[step_idx]``（可单臂）。"""
+    n_robots = len(env.robots)
+    if step_idx < 0 or step_idx >= len(actions):
+        return False
+    row = mask_actions_hold_other_arms(
+        env, actions[step_idx][None, :], robot_indices
+    )[0].copy()
+    states = env.get_robot_state()
+    for ridx in range(n_robots):
+        curr_rv = np.asarray(states[ridx]["ActualTCPPose"][3:6], dtype=np.float64)
+        sl = slice(7 * ridx + 3, 7 * ridx + 6)
+        row[sl] = nearest_rotvec_equivalent(row[sl], curr_rv)
+    targets = _targets_from_action_row(row, n_robots)
+    try:
+        return move_to_tcp_pose_slerp(
+            env,
+            targets,
+            frequency=frequency,
+            duration=float(step_duration),
+            label=f"replay-step-{step_idx}",
+            ensure_end_control=True,
+            poll_abort=poll_abort,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Replay step {step_idx} failed: {exc}")
+        return False
+
+
 def leave_drag_mode(env: Arx5EnvWithImages) -> None:
     """退出拖拽：恢复末端控制再进阻尼，避免臂悬空在零力模式。"""
     # try:
@@ -899,6 +1334,7 @@ def make_vis_image(
     no_zero_force: bool = False,
     recording: bool = False,
     delete_prompt: str | None = None,
+    prompt_status: str = "DEL",
     n_robots: int = 1,
     camera_latency: list[dict] | None = None,
 ) -> np.ndarray:
@@ -907,17 +1343,17 @@ def make_vis_image(
         status = "REC"
         help_text = "S save | D drop | 2x grip(can1) save | I | Q"
     elif delete_prompt:
-        status = "DEL"
+        status = prompt_status
         help_text = delete_prompt
     elif zero_force_active:
         status = "DRAG"
-        help_text = "C / 2x grip(can1) start | P->init | I | Q"
+        help_text = "C|R|J|0/1/2 arms|X stop|P->init|Q"
     elif no_zero_force:
         status = "READY"
-        help_text = "C start | P zero-force | I pose | Q quit"
+        help_text = "C|R|J|0/1/2 arms|X E-Stop|P|Q"
     else:
         status = "IDLE"
-        help_text = "P zero-force | I pose | E del ep | Q quit"
+        help_text = "P|R|J|0/1/2 arms|X E-Stop|E|Q"
     text = f"{status} Ep:{episode_id}  t={t_elapsed:.1f}s  steps={n_steps}"
     cv2.putText(vis, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
     cv2.putText(
@@ -1585,6 +2021,18 @@ def run_web_hub(
                         except KeyboardInterrupt:
                             print("\nCollect interrupted — back to hub.")
                             _web_log(web_state, "数采被中断（KeyboardInterrupt）")
+                        except RuntimeError as exc:
+                            # 网页「取消连接」属于正常返回 hub，不要当启动失败刷栈
+                            if "用户取消连接" in str(exc):
+                                print("[hub] 用户取消连接 — back to hub.")
+                                _web_log(web_state, "用户取消连接，已返回入口")
+                            else:
+                                collect_err = f"数采启动失败: {exc}"
+                                print(f"[hub] {collect_err}")
+                                _web_log(web_state, collect_err)
+                                import traceback
+
+                                traceback.print_exc()
                         except Exception as exc:  # noqa: BLE001
                             collect_err = f"数采启动失败: {exc}"
                             print(f"[hub] {collect_err}")
@@ -1735,6 +2183,7 @@ def run_collect_session(
     grip_gesture_robot=1,
     grip_gesture_window=1.5,
     no_grip_gesture=False,
+    replay_approach=2.5,
 ) -> None:
     """连接机械臂 + 相机，跑一轮数采会话；Q / 网页 quit 后返回（不退出进程）。
 
@@ -1809,9 +2258,10 @@ def run_collect_session(
     else:
         print("  startup: reset_to_home → optional init → P then C")
     print(
-        "  P=toggle zero-force (again -> init)  "
-        "C=start  S=save  D=drop  E=del  I=pose  Q=quit(no home)"
+        "  P=toggle zero-force  C=start  S=save  D=drop  E=del  "
+        "R=full-replay  J=step  0/1/2=replay-arm(L/R/both)  X=E-Stop  Q=quit"
     )
+    print(f"  replay_approach: {float(replay_approach):.1f}s")
     if no_grip_gesture:
         print("  grip_gesture: OFF")
     else:
@@ -2009,6 +2459,13 @@ def run_collect_session(
                 delete_mode = None  # None | "input" | "confirm"
                 delete_buf = ""
                 delete_target = None
+                replay_mode = None  # None | "input"
+                replay_buf = ""
+                # 单步回放会话：{'episode_id', 'actions', 'idx'}；idx=当前已到位的帧
+                step_replay: dict | None = None
+                # None=双臂；[0]=左；[1]=右
+                replay_arm_sel: list[int] | None = None
+                estop_requested = False
 
                 grip_robot_idx = int(grip_gesture_robot)
                 if grip_robot_idx < 0 or grip_robot_idx >= n_robots:
@@ -2035,10 +2492,247 @@ def run_collect_session(
                 if no_zero_force:
                     print("Direct record mode: press C to start (P optional for drag).")
 
+                def _ensure_end_control_for_replay() -> None:
+                    nonlocal zero_force_active
+                    if zero_force_active:
+                        leave_drag_stay_pose(env)
+                        zero_force_active = False
+                        if grip_detector is not None:
+                            grip_detector.reset()
+
+                def _set_replay_arm(sel: list[int] | None) -> None:
+                    nonlocal replay_arm_sel, step_replay
+                    replay_arm_sel = sel
+                    step_replay = None  # 换臂后重新从起点单步
+                    arms = _format_replay_arms(sel, n_robots)
+                    print(f"Replay arm select: {arms}")
+                    if web_state is not None:
+                        web_state.update(
+                            message=f"回放臂: {arms}",
+                            replay_arm=arms,
+                        )
+
+                def poll_abort() -> bool:
+                    """回放过程中轮询急停（键盘 X / 网页 estop）。"""
+                    nonlocal estop_requested, zero_force_active, step_replay
+                    if estop_requested:
+                        return True
+                    if web_cmds is not None:
+                        for cmd in web_cmds.drain():
+                            if cmd.get("action") == "estop":
+                                estop_requested = True
+                                step_replay = None
+                                zero_force_active = False
+                                return True
+                            if cmd.get("action") == "quit":
+                                estop_requested = True
+                                return True
+                    for key_stroke in drain_keys(key_source):
+                        if key_stroke == KeyCode(char="x"):
+                            estop_requested = True
+                            step_replay = None
+                            zero_force_active = False
+                            return True
+                        if key_stroke == KeyCode(char="q"):
+                            estop_requested = True
+                            return True
+                    return False
+
+                def do_estop() -> None:
+                    nonlocal estop_requested, step_replay, zero_force_active
+                    estop_requested = True
+                    step_replay = None
+                    zero_force_active = False
+                    emergency_stop(env)
+                    if web_state is not None:
+                        web_state.update(
+                            mode="READY" if no_zero_force else "IDLE",
+                            zero_force_active=False,
+                            recording=False,
+                            message="急停：已钉住当前位姿",
+                        )
+
+                def do_replay(episode_id: int | None = None) -> None:
+                    """Exit drag if needed, then full-replay a saved episode (blocking)."""
+                    nonlocal zero_force_active, replay_mode, replay_buf, step_replay
+                    nonlocal estop_requested
+                    n_saved = env.replay_buffer.n_episodes
+                    if n_saved <= 0:
+                        print("No saved episode to replay.")
+                        return
+                    if episode_id is None:
+                        episode_id = n_saved - 1
+                    episode_id = int(episode_id)
+                    if episode_id < 0 or episode_id >= n_saved:
+                        print(
+                            f"Episode {episode_id} does not exist "
+                            f"(valid: 0..{n_saved - 1})."
+                        )
+                        return
+                    replay_mode = None
+                    replay_buf = ""
+                    step_replay = None
+                    estop_requested = False
+                    _ensure_end_control_for_replay()
+                    arms = _format_replay_arms(replay_arm_sel, n_robots)
+                    if web_state is not None:
+                        web_state.update(
+                            mode="REPLAY",
+                            zero_force_active=False,
+                            recording=False,
+                            message=(
+                                f"正在回放 ep{episode_id} [{arms}]…"
+                                "（X 急停）"
+                            ),
+                        )
+                    ok = replay_saved_episode(
+                        env,
+                        episode_id,
+                        frequency=frequency,
+                        approach_duration=float(replay_approach),
+                        robot_indices=replay_arm_sel,
+                        poll_abort=poll_abort,
+                    )
+                    aborted = estop_requested
+                    estop_requested = False
+                    if web_state is not None:
+                        web_state.update(
+                            mode="READY" if no_zero_force else "IDLE",
+                            zero_force_active=False,
+                            recording=False,
+                            n_episodes=int(env.replay_buffer.n_episodes),
+                            message=(
+                                f"回放 ep{episode_id} 急停中止"
+                                if aborted
+                                else (
+                                    f"回放 ep{episode_id} [{arms}] 完成"
+                                    if ok
+                                    else f"回放 ep{episode_id} 失败"
+                                )
+                            ),
+                        )
+
+                def do_step_replay(episode_id: int | None = None) -> None:
+                    """J：首次进入单步会话并到第 0 帧；之后每次前进 1 帧。"""
+                    nonlocal zero_force_active, step_replay, replay_mode, replay_buf
+                    nonlocal estop_requested
+                    replay_mode = None
+                    replay_buf = ""
+                    estop_requested = False
+                    arms = _format_replay_arms(replay_arm_sel, n_robots)
+
+                    if step_replay is None:
+                        n_saved = env.replay_buffer.n_episodes
+                        if n_saved <= 0:
+                            print("No saved episode to step-replay.")
+                            return
+                        if episode_id is None:
+                            episode_id = n_saved - 1
+                        episode_id = int(episode_id)
+                        loaded = load_episode_actions(env, episode_id)
+                        if loaded is None:
+                            return
+                        actions, _rel = loaded
+                        _ensure_end_control_for_replay()
+                        if web_state is not None:
+                            web_state.update(
+                                mode="REPLAY",
+                                zero_force_active=False,
+                                recording=False,
+                                message=(
+                                    f"单步 ep{episode_id}[{arms}] → 起点 "
+                                    f"(0/{len(actions) - 1})"
+                                ),
+                            )
+                        ok = replay_step_to_index(
+                            env,
+                            actions,
+                            0,
+                            frequency=frequency,
+                            step_duration=float(replay_approach),
+                            robot_indices=replay_arm_sel,
+                            poll_abort=poll_abort,
+                        )
+                        if not ok:
+                            if web_state is not None:
+                                web_state.update(
+                                    mode="READY" if no_zero_force else "IDLE",
+                                    message=(
+                                        f"单步 ep{episode_id} "
+                                        + ("急停" if estop_requested else "起点失败")
+                                    ),
+                                )
+                            estop_requested = False
+                            return
+                        step_replay = {
+                            "episode_id": episode_id,
+                            "actions": actions,
+                            "idx": 0,
+                        }
+                        print(
+                            f"Step replay ep{episode_id} [{arms}]: "
+                            f"at 0/{len(actions) - 1}. "
+                            "J=next, Esc=leave, X=E-Stop."
+                        )
+                        if web_state is not None:
+                            web_state.update(
+                                mode="READY" if no_zero_force else "IDLE",
+                                message=(
+                                    f"单步 ep{episode_id}[{arms}]: "
+                                    f"0/{len(actions) - 1} · J下一步"
+                                ),
+                            )
+                        return
+
+                    actions = step_replay["actions"]
+                    eid = int(step_replay["episode_id"])
+                    nxt = int(step_replay["idx"]) + 1
+                    if nxt >= len(actions):
+                        print(
+                            f"Step replay ep{eid} finished "
+                            f"({len(actions)} frames). Press J to restart last ep."
+                        )
+                        step_replay = None
+                        if web_state is not None:
+                            web_state.update(
+                                mode="READY" if no_zero_force else "IDLE",
+                                message=f"单步回放 ep{eid} 结束",
+                            )
+                        return
+
+                    _ensure_end_control_for_replay()
+                    ok = replay_step_to_index(
+                        env,
+                        actions,
+                        nxt,
+                        frequency=frequency,
+                        step_duration=0.12,
+                        robot_indices=replay_arm_sel,
+                        poll_abort=poll_abort,
+                    )
+                    if not ok:
+                        if estop_requested:
+                            step_replay = None
+                            estop_requested = False
+                        return
+                    step_replay["idx"] = nxt
+                    print(
+                        f"Step replay ep{eid} [{arms}]: {nxt}/{len(actions) - 1}"
+                    )
+                    if web_state is not None:
+                        web_state.update(
+                            mode="READY" if no_zero_force else "IDLE",
+                            message=(
+                                f"单步 ep{eid}[{arms}]: "
+                                f"{nxt}/{len(actions) - 1} · J下一步"
+                            ),
+                        )
+
                 def handle_idle_web_cmds() -> tuple[bool, bool]:
                     """Returns (start_episode, should_quit)."""
                     nonlocal zero_force_active, delete_mode, delete_buf, delete_target
                     nonlocal pose_print_enabled, last_pose_print_t
+                    nonlocal replay_mode, replay_buf, step_replay, replay_arm_sel
                     if web_cmds is None:
                         return False, False
                     start = False
@@ -2046,6 +2740,18 @@ def run_collect_session(
                         action = cmd.get("action")
                         if action == "quit":
                             return False, True
+                        if action == "estop":
+                            do_estop()
+                            continue
+                        if action == "set_replay_arm":
+                            which = str(cmd.get("arm", "both")).lower()
+                            if which in ("0", "l", "left", "robot0"):
+                                _set_replay_arm([0])
+                            elif which in ("1", "r", "right", "robot1"):
+                                _set_replay_arm([1])
+                            else:
+                                _set_replay_arm(None)
+                            continue
                         if action == "delete_cancel":
                             print("Delete cancelled.")
                             delete_mode = None
@@ -2112,6 +2818,7 @@ def run_collect_session(
                         elif action == "start":
                             if zero_force_active or no_zero_force:
                                 start = True
+                                step_replay = None
                                 if grip_detector is not None:
                                     grip_detector.reset()
                             else:
@@ -2120,6 +2827,16 @@ def run_collect_session(
                             print("Not recording — nothing to save.")
                         elif action == "drop":
                             print("No active episode to drop.")
+                        elif action == "replay":
+                            eid = cmd.get("episode_id")
+                            do_replay(None if eid is None else int(eid))
+                        elif action == "replay_step":
+                            eid = cmd.get("episode_id")
+                            # 已有单步会话时忽略 episode_id，继续前进
+                            if step_replay is not None:
+                                do_step_replay(None)
+                            else:
+                                do_step_replay(None if eid is None else int(eid))
                     return start, False
 
                 while True:
@@ -2191,7 +2908,39 @@ def run_collect_session(
                                         )
                                 continue
 
+                            if replay_mode == "input":
+                                ch = key_char(key_stroke)
+                                if key_stroke == Key.esc:
+                                    print("Replay cancelled.")
+                                    replay_mode = None
+                                    replay_buf = ""
+                                elif key_stroke == Key.backspace:
+                                    replay_buf = replay_buf[:-1]
+                                elif ch is not None and ch.isdigit():
+                                    replay_buf += ch
+                                elif key_stroke == Key.enter:
+                                    n_saved = env.replay_buffer.n_episodes
+                                    if n_saved <= 0:
+                                        print("No saved episode to replay.")
+                                        replay_mode = None
+                                        replay_buf = ""
+                                    elif not replay_buf.strip():
+                                        do_replay(n_saved - 1)
+                                    else:
+                                        episode_id = parse_episode_id(replay_buf)
+                                        if episode_id is None:
+                                            print("Type an episode ID (digits), or Enter for last.")
+                                        elif episode_id < 0 or episode_id >= n_saved:
+                                            print(
+                                                f"Episode {episode_id} does not exist "
+                                                f"(valid: 0..{n_saved - 1})."
+                                            )
+                                        else:
+                                            do_replay(episode_id)
+                                continue
+
                             if key_stroke == KeyCode(char="p"):
+                                step_replay = None
                                 if not zero_force_active:
                                     env.set_gravity_compensation()
                                     zero_force_active = True
@@ -2219,6 +2968,7 @@ def run_collect_session(
                                     if grip_detector is not None:
                                         grip_detector.reset()
                             if key_stroke == KeyCode(char="c"):
+                                step_replay = None
                                 if zero_force_active or no_zero_force:
                                     start_episode = True
                                     if grip_detector is not None:
@@ -2248,10 +2998,41 @@ def run_collect_session(
                                     delete_mode = "input"
                                     delete_buf = ""
                                     delete_target = None
+                                    replay_mode = None
+                                    replay_buf = ""
                                     print(
                                         f"Delete saved episode: type ID (0..{n_saved - 1}), "
                                         "Enter to confirm, Esc to cancel."
                                     )
+                            if key_stroke == KeyCode(char="r"):
+                                n_saved = env.replay_buffer.n_episodes
+                                if n_saved <= 0:
+                                    print("No saved episode to replay.")
+                                else:
+                                    step_replay = None
+                                    replay_mode = "input"
+                                    replay_buf = ""
+                                    delete_mode = None
+                                    delete_buf = ""
+                                    print(
+                                        f"Full replay: type ID (0..{n_saved - 1}), "
+                                        "Enter alone = last, Esc to cancel."
+                                    )
+                            if key_stroke == KeyCode(char="j"):
+                                do_step_replay(None)
+                            if key_stroke == KeyCode(char="x"):
+                                do_estop()
+                            if key_stroke == KeyCode(char="0"):
+                                _set_replay_arm([0])
+                            if key_stroke == KeyCode(char="1"):
+                                _set_replay_arm([1])
+                            if key_stroke == KeyCode(char="2"):
+                                _set_replay_arm(None)
+                            if key_stroke == Key.esc and step_replay is not None:
+                                print(
+                                    f"Step replay ep{step_replay['episode_id']} cancelled."
+                                )
+                                step_replay = None
                         if start_episode:
                             break
 
@@ -2262,6 +3043,7 @@ def run_collect_session(
                                 grip_detector is not None
                                 and zero_force_active
                                 and delete_mode is None
+                                and replay_mode is None
                             ):
                                 gw = gripper_width_from_obs(obs, grip_robot_idx)
                                 if gw is not None:
@@ -2282,6 +3064,7 @@ def run_collect_session(
                                     last_pose_print_t = now
                             n_saved = env.replay_buffer.n_episodes
                             delete_prompt = None
+                            prompt_status = "DEL"
                             if delete_mode == "input":
                                 delete_prompt = (
                                     f"ID:{delete_buf or '_'}  (0..{max(n_saved - 1, 0)}) "
@@ -2290,6 +3073,21 @@ def run_collect_session(
                             elif delete_mode == "confirm":
                                 delete_prompt = (
                                     f"Delete Ep {delete_target}?  Y=yes N=no"
+                                )
+                            elif replay_mode == "input":
+                                prompt_status = "REP"
+                                delete_prompt = (
+                                    f"Replay:{replay_buf or '(last)'}  "
+                                    f"(0..{max(n_saved - 1, 0)}) Enter=go Esc=cancel"
+                                )
+                            elif step_replay is not None:
+                                prompt_status = "STEP"
+                                _sr = step_replay
+                                _na = len(_sr["actions"])
+                                _arms = _format_replay_arms(replay_arm_sel, n_robots)
+                                delete_prompt = (
+                                    f"Step ep{_sr['episode_id']}[{_arms}]: "
+                                    f"{_sr['idx']}/{_na - 1}  J=next Esc=exit X=stop"
                                 )
                             vis = make_vis_image(
                                 obs,
@@ -2300,6 +3098,7 @@ def run_collect_session(
                                 no_zero_force=no_zero_force,
                                 recording=False,
                                 delete_prompt=delete_prompt,
+                                prompt_status=prompt_status,
                                 n_robots=n_robots,
                                 camera_latency=cam_lat,
                             )
@@ -2395,6 +3194,15 @@ def run_collect_session(
                                         return
                                     elif action in ("start", "drag_toggle"):
                                         print("Still recording — save/drop first.")
+                                    elif action == "estop":
+                                        print("E-STOP during recording — abort episode.")
+                                        abort_episode(env)
+                                        do_estop()
+                                        stop_drop = True
+                                    elif action == "replay":
+                                        print("Still recording — save/drop first, then replay.")
+                                    elif action == "replay_step":
+                                        print("Still recording — save/drop first, then step-replay.")
                                     elif action and action.startswith("delete"):
                                         print(
                                             "Still recording — save/drop first, then delete."
@@ -2418,6 +3226,15 @@ def run_collect_session(
                                         )
                                 elif key_stroke == KeyCode(char="e"):
                                     print("Still recording — save/drop first, then press E.")
+                                elif key_stroke == KeyCode(char="r"):
+                                    print("Still recording — save/drop first, then press R.")
+                                elif key_stroke == KeyCode(char="j"):
+                                    print("Still recording — save/drop first, then press J.")
+                                elif key_stroke == KeyCode(char="x"):
+                                    print("E-STOP during recording — abort episode.")
+                                    abort_episode(env)
+                                    do_estop()
+                                    stop_drop = True
                                 elif key_stroke == KeyCode(char="i"):
                                     pose_print_enabled = not pose_print_enabled
                                     if pose_print_enabled:
@@ -2572,7 +3389,7 @@ def run_collect_session(
                                     print(
                                         f"Episode {episode_id} saved{via} "
                                         f"({n_steps} steps @ {frequency} Hz). "
-                                        "Press E to delete a saved episode."
+                                        "Press R to replay, E to delete."
                                     )
                                 if grip_detector is not None:
                                     grip_detector.reset()
@@ -2610,17 +3427,17 @@ def run_collect_session(
                         print(
                             "Ready for next episode. Press C or double open-close "
                             f"robot{grip_robot_idx} gripper to start, "
-                            "E to delete, or Q to quit.\n"
+                            "R to replay, E to delete, or Q to quit.\n"
                         )
                     elif no_zero_force:
                         print(
                             "Ready for next episode. Press C to start, "
-                            "E to delete a saved episode, or Q to quit.\n"
+                            "R to replay, E to delete, or Q to quit.\n"
                         )
                     else:
                         print(
                             "Ready. Press P for zero-force, "
-                            "E to delete a saved episode, or C to start.\n"
+                            "R to replay, E to delete, or C to start.\n"
                         )
     except Exception as exc:
         _web_log(web_state, f"连接/启动异常: {exc}")
@@ -2833,6 +3650,13 @@ def run_collect_session(
     default=False,
     help="关闭夹爪双开合开始/保存手势",
 )
+@click.option(
+    "--replay_approach",
+    default=2.5,
+    type=float,
+    show_default=True,
+    help="回放前缓动到 episode 起点的时长（秒）",
+)
 def main(
     output,
     robot_ip,
@@ -2874,6 +3698,7 @@ def main(
     grip_gesture_robot,
     grip_gesture_window,
     no_grip_gesture,
+    replay_approach,
 ):
     if viewer_only:
         run_viewer_only(
@@ -2922,6 +3747,7 @@ def main(
         grip_gesture_robot=grip_gesture_robot,
         grip_gesture_window=grip_gesture_window,
         no_grip_gesture=no_grip_gesture,
+        replay_approach=replay_approach,
     )
 
     # --web 默认进 hub；--collect_direct 跳过选择页直连数采
