@@ -142,6 +142,7 @@ class SharedCollectState:
         self.n_robots: int = 1
         self.camera_latency: list[dict] = []
         self.delete_pending: Optional[int] = None
+        self.deleting: bool = False
         self.message: str = ""
         self.frequency: float = 60.0
         self.viewer_only: bool = False
@@ -233,6 +234,7 @@ class SharedCollectState:
                 "n_robots": int(getattr(self, "n_robots", len(robots) or 1)),
                 "camera_latency": list(getattr(self, "camera_latency", []) or []),
                 "delete_pending": self.delete_pending,
+                "deleting": bool(getattr(self, "deleting", False)),
                 "message": self.message,
                 "frequency": self.frequency,
                 "live_n": len(self._live_series),

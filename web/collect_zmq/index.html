@@ -246,6 +246,13 @@
       box-shadow: 0 0 0 1px #3d9cf066;
       animation: modePulse 0.7s ease-in-out infinite;
     }
+    .badge.DELETING {
+      background: #3a1f24;
+      color: #ffb3b8;
+      border-color: var(--danger);
+      box-shadow: 0 0 0 1px #ff5c5c66;
+      animation: modePulse 0.7s ease-in-out infinite;
+    }
     .badge.REPLAY {
       background: #2a1f4a;
       color: #c9b3ff;
@@ -855,6 +862,8 @@
     let viewerOnly = false;
     let hubMode = false;
     let lastRecording = false;
+    let lastReplaying = false;
+    let lastDeleting = false;
     let lastUiMode = "";
     let lastOutputDir = "";
     let defaultOutputDir = "";
@@ -932,7 +941,7 @@
     function setMsg(t) {
       const el = $("msg");
       el.textContent = t || "";
-      const busy = /保存|丢弃|稍候|写盘|回放/.test(t || "");
+      const busy = /保存|丢弃|稍候|写盘|回放|删除/.test(t || "");
       el.classList.toggle("busy", busy);
       if ($("msgView")) {
         $("msgView").textContent = t || "";
@@ -947,6 +956,7 @@
       DRAG: "拖拽中",
       REC: "录制中",
       SAVING: "保存中",
+      DELETING: "删除中",
       REPLAY: "轨迹回放",
       DEL: "删除确认",
       VIEW: "数据管理",
@@ -1251,7 +1261,8 @@
       if ($("nEpisodesView")) $("nEpisodesView").textContent = s.n_episodes ?? 0;
       $("nSteps").textContent = s.n_steps ?? 0;
       $("tElapsed").textContent = (s.t_elapsed ?? 0).toFixed(1) + "s";
-      $("curEp").textContent = s.recording ? (s.episode_id ?? "—") : "—";
+      $("curEp").textContent =
+        s.recording || s.mode === "REPLAY" ? (s.episode_id ?? "—") : "—";
       $("liveN").textContent = s.live_n ?? 0;
       $("poseBox").innerHTML = formatPoseHtml(s);
       if ($("camLagBox")) $("camLagBox").innerHTML = formatCamLagHtml(s);
@@ -1267,8 +1278,9 @@
 
       const rec = !!s.recording;
       const saving = mode === "SAVING";
+      const deleting = mode === "DELETING" || !!s.deleting;
       const replaying = mode === "REPLAY";
-      const busy = saving || replaying;
+      const busy = saving || replaying || deleting;
       const drag = !!s.zero_force_active;
       const nEp = Number(s.n_episodes ?? 0);
       $("btnDrag").textContent = drag ? "P · Exit drag" : "P · Drag";
@@ -1308,6 +1320,29 @@
         $("videoHeading").textContent = "Live preview";
       }
       lastRecording = rec;
+
+      // 删除结束：强制刷新 episode 列表
+      if (lastDeleting && !deleting) {
+        pollStatus(true);
+        setMsg(s.message || "删除完成");
+      }
+      lastDeleting = deleting;
+
+      // 进入回放：自动 Follow LIVE，下方轨迹图随机械臂同步刷新
+      if (replaying && !lastReplaying) {
+        selectedEp = "live";
+        document.querySelectorAll(".ep-list li").forEach((li) => li.classList.remove("active"));
+        $("btnDelete").disabled = true;
+        showLiveStream({ force: true });
+        $("viewerMsg").textContent = "Replay — live trajectory";
+        if ($("videoHeading")) $("videoHeading").textContent = "Live preview · REPLAY";
+        refreshLiveSeries();
+      } else if (replaying && $("videoHeading")) {
+        $("videoHeading").textContent = "Live preview · REPLAY";
+      } else if (!replaying && lastReplaying && $("videoHeading") && !rec) {
+        $("videoHeading").textContent = "Live preview";
+      }
+      lastReplaying = replaying;
     }
 
     function renderEpList(episodes) {
@@ -1891,8 +1926,11 @@
     async function loadFrame(index) {
       const cam = $("liveCam");
       if (!cam) return;
-      // 数采录制中：顶部始终跟实时相机，不被 scrub / episode 静帧抢走
-      if (!viewerOnly && (selectedEp === "live" || !!status.recording)) {
+      // 数采录制 / 回放中：顶部始终跟实时相机，不被 scrub / episode 静帧抢走
+      if (
+        !viewerOnly &&
+        (selectedEp === "live" || !!status.recording || status.mode === "REPLAY")
+      ) {
         showLiveStream();
         return;
       }
@@ -1980,9 +2018,13 @@
     }
 
     async function selectEpisode(id) {
-      // 录制中不允许切走实时相机
-      if (!viewerOnly && status.recording) {
-        setMsg("recording — stay on live camera");
+      // 录制 / 回放中不允许切走实时相机与 LIVE 轨迹
+      if (!viewerOnly && (status.recording || status.mode === "REPLAY")) {
+        setMsg(
+          status.recording
+            ? "recording — stay on live camera"
+            : "replay — stay on LIVE trajectory"
+        );
         followLive();
         return;
       }
@@ -2015,7 +2057,9 @@
         ? "Select an episode to scrub"
         : (status.recording
           ? "Recording — live camera"
-          : "Following LIVE · chart updates while recording");
+          : (status.mode === "REPLAY"
+            ? "Replay — live trajectory"
+            : "Following LIVE · chart updates while recording / replay"));
       if (!viewerOnly) showLiveStream({ force: true });
       await refreshLiveSeries();
     }
@@ -2088,6 +2132,7 @@
           extra.episode_id = Number(selectedEp);
         }
         setModeBadge($("modeBadge"), "REPLAY");
+        followLive();
         setMsg(
           extra.episode_id != null
             ? `正在整段回放 episode ${extra.episode_id}…`
@@ -2107,6 +2152,7 @@
         if (selectedEp !== null && selectedEp !== "live") {
           extra.episode_id = Number(selectedEp);
         }
+        followLive();
         setMsg("单步回放…");
         postCmd("replay_step", extra)
           .then(() => setMsg("单步已执行"))
@@ -2323,6 +2369,10 @@
 
     $("btnDelete").onclick = () => {
       if (selectedEp == null || selectedEp === "live") return;
+      if (status.mode === "DELETING" || status.deleting) {
+        setMsg("正在删除中，请稍候…");
+        return;
+      }
       $("delText").textContent = `Delete saved episode ${selectedEp}? Videos and zarr slice will be removed.`;
       $("delModal").classList.add("show");
     };
@@ -2332,12 +2382,24 @@
     };
     $("delYes").onclick = async () => {
       const id = selectedEp;
+      if (status.mode === "DELETING" || status.deleting) {
+        $("delModal").classList.remove("show");
+        setMsg("正在删除中，请稍候…");
+        return;
+      }
       $("delModal").classList.remove("show");
+      setModeBadge($("modeBadge"), "DELETING");
+      setMsg(`正在删除 episode ${id}…请勿重复操作`);
+      $("btnDelete").disabled = true;
+      ["btnSave", "btnDrop", "btnDrag", "btnStart", "btnReplay", "btnStep"].forEach((bid) => {
+        if ($(bid)) $(bid).disabled = true;
+      });
       try {
         await postCmd("delete_request", { episode_id: id });
         await postCmd("delete_confirm", { episode_id: id });
-        setMsg(`Deleted episode ${id}`);
         selectedEp = null;
+        // 实际完成由 status.mode 离开 DELETING 后轮询刷新
+        setMsg(`删除已开始 ep${id}…完成后自动刷新`);
         pollStatus(true);
       } catch (e) {
         setMsg(e.message);
@@ -2355,9 +2417,12 @@
         if (status.delete_pending != null && !$("delModal").classList.contains("show")) {
           // keyboard-side pending; show modal
         }
-        if (selectedEp === "live" && status.recording) {
+        if (
+          selectedEp === "live" &&
+          (status.recording || status.mode === "REPLAY" || (status.live_n || 0) > 0)
+        ) {
           const now = Date.now();
-          if (now - lastLiveFetch > 500) {
+          if (now - lastLiveFetch > 400) {
             lastLiveFetch = now;
             refreshLiveSeries();
           }

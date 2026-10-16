@@ -53,6 +53,7 @@ import select
 import shutil
 import sys
 import termios
+import threading
 import time
 import tty
 from multiprocessing.managers import SharedMemoryManager
@@ -689,7 +690,10 @@ class GripperDoubleOpenCloseDetector:
     """检测单臂夹爪在短窗内连续两次「开合」（开↔关往返各一次算一合）。
 
     用于拖拽模式下无键盘开始/保存：第二次双开合触发时，
-    ``last_gesture_start_t`` 指向本段双开合第一次半程开始时刻，便于截掉手势。
+    ``last_gesture_start_t`` 指向本段双开合手势起点，便于截掉手势。
+
+    注意：单次开合若拖很久（先开着夹爪干活再关上），起点可能很早；
+    因此 cycle 起点与最终截断都会钳制在 ``window_s`` 量级内，避免误删大段轨迹。
     """
 
     def __init__(
@@ -728,11 +732,19 @@ class GripperDoubleOpenCloseDetector:
         while self._cycle_times and (t - self._cycle_times[0]) > self.window_s:
             self._cycle_times.pop(0)
             self._cycle_start_times.pop(0)
+        # 半程开合拖太久：作废，避免「很早打开、很晚关上」变成超长 cycle
+        if (
+            self._pending_start is not None
+            and (t - float(self._pending_start)) > self.window_s
+        ):
+            self._half = None
+            self._pending_start = None
 
     def update(self, width: float, t: float | None = None) -> bool:
         """喂入当前夹爪开口；若检测到双开合则返回 True。"""
         now = time.time() if t is None else float(t)
         w = float(width)
+        self._expire(now)
 
         if w <= self.close_thresh:
             new_state = "closed"
@@ -761,10 +773,11 @@ class GripperDoubleOpenCloseDetector:
             self._state = new_state
             return False
 
-        # 完成一次开合（往返）
-        cycle_start = (
+        # 完成一次开合（往返）；起点钳制在 window 内，防止拖太久污染截断点
+        raw_start = (
             self._pending_start if self._pending_start is not None else now
         )
+        cycle_start = max(float(raw_start), now - self.window_s)
         self._cycle_times.append(now)
         self._cycle_start_times.append(cycle_start)
         self._half = None
@@ -778,7 +791,9 @@ class GripperDoubleOpenCloseDetector:
             return False
 
         if len(self._cycle_times) >= 2:
-            self.last_gesture_start_t = self._cycle_start_times[-2]
+            # 整段双开合手势起点：第二次触发时往前最多 window_s
+            gesture_start = float(self._cycle_start_times[-2])
+            self.last_gesture_start_t = max(gesture_start, now - self.window_s)
             self._last_trigger_t = now
             self._cycle_times.clear()
             self._cycle_start_times.clear()
@@ -851,6 +866,10 @@ def check_episode_alignment(env) -> None:
         )
 
 
+# 删除互斥：禁止重叠删 zarr（否则半截损坏）；后台线程避免卡住主循环导致掉臂
+_DELETE_LOCK = threading.Lock()
+
+
 def delete_saved_episode(env, episode_id: int) -> bool:
     """删除已写入 zarr 的指定 episode，并重编号后续 videos/{id} 以保持连续。"""
     n_episodes = env.replay_buffer.n_episodes
@@ -887,6 +906,101 @@ def delete_saved_episode(env, episode_id: int) -> bool:
             f"-> {episode_id}..{n_episodes - 2}."
         )
     check_episode_alignment(env)
+    return True
+
+
+def is_delete_busy() -> bool:
+    return _DELETE_LOCK.locked()
+
+
+def schedule_delete_episode(
+    env,
+    episode_id: int,
+    *,
+    web_state=None,
+    hold_robot: bool = False,
+    done_mode: str = "READY",
+) -> bool:
+    """后台删除一条 episode；已有删除在进行时直接拒绝。
+
+    hold_robot=True 时先 set_end_control 钉住位姿，主循环继续跑避免掉臂。
+    """
+    if env is None:
+        if web_state is not None:
+            web_state.update(message="尚未加载数据目录")
+        return False
+    if not _DELETE_LOCK.acquire(blocking=False):
+        msg = "正在删除中，请等当前删除完成后再操作"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+
+    try:
+        n_episodes = int(env.replay_buffer.n_episodes)
+        eid = int(episode_id)
+        if n_episodes <= 0 or eid < 0 or eid >= n_episodes:
+            print(
+                f"Episode {eid} does not exist "
+                f"(valid: 0..{max(n_episodes - 1, 0)})."
+            )
+            if web_state is not None:
+                web_state.update(
+                    message=f"invalid episode_id {eid}",
+                    delete_pending=None,
+                )
+            _DELETE_LOCK.release()
+            return False
+    except Exception as exc:  # noqa: BLE001
+        print(f"Delete pre-check failed: {exc}")
+        if web_state is not None:
+            web_state.update(message=f"delete failed: {exc}", delete_pending=None)
+        _DELETE_LOCK.release()
+        return False
+
+    if web_state is not None:
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            delete_pending=None,
+            message=f"正在删除 ep{eid}…请勿重复操作（写盘中）",
+        )
+
+    def _worker() -> None:
+        ok = False
+        err = ""
+        try:
+            if hold_robot and hasattr(env, "set_end_control"):
+                try:
+                    env.set_end_control()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"delete hold set_end_control warning: {exc}")
+            print(f"Deleting episode {eid} (background)…")
+            ok = bool(delete_saved_episode(env, eid))
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            print(f"Delete episode {eid} failed: {exc}")
+            ok = False
+        finally:
+            try:
+                n_left = int(env.replay_buffer.n_episodes)
+            except Exception:
+                n_left = 0
+            if web_state is not None:
+                web_state.update(
+                    mode=done_mode,
+                    deleting=False,
+                    delete_pending=None,
+                    n_episodes=n_left,
+                    message=(
+                        f"已删除 ep{eid} · 剩余 {n_left}"
+                        if ok
+                        else (f"删除 ep{eid} 失败: {err}" if err else f"删除 ep{eid} 失败")
+                    ),
+                )
+            _DELETE_LOCK.release()
+
+    threading.Thread(target=_worker, name=f"delete-ep{eid}", daemon=True).start()
     return True
 
 
@@ -1101,8 +1215,12 @@ def _exec_actions_chunked(
     *,
     poll_abort=None,
     chunk_s: float = 0.5,
+    on_sample=None,
 ) -> bool:
-    """按时长分块 schedule，便于急停；返回 False 表示被中止。"""
+    """按时长分块 schedule，便于急停；返回 False 表示被中止。
+
+    on_sample(i, action_row, t_rel): 按时间推进回调，用于网页 LIVE 轨迹同步。
+    """
     actions = np.asarray(actions, dtype=np.float64)
     rel = np.asarray(rel, dtype=np.float64)
     if len(actions) == 0:
@@ -1126,9 +1244,27 @@ def _exec_actions_chunked(
             compensate_latency=False,
         )
         wait_s = max(0.0, float(chunk_rel[-1]) - 0.05)
-        if interruptible_sleep(wait_s, poll_abort=poll_abort):
-            emergency_stop(env)
-            return False
+        # 按相对时间推进推送 LIVE 点，与机械臂运动大致同步
+        deadline = time.time() + wait_s
+        next_i = i0
+        wall0 = time.time()
+        while True:
+            if poll_abort is not None and poll_abort():
+                emergency_stop(env)
+                return False
+            now = time.time()
+            elapsed = now - wall0
+            if on_sample is not None:
+                while next_i < i1 and float(chunk_rel[next_i - i0]) <= elapsed + 0.02:
+                    on_sample(next_i, actions[next_i], float(rel[next_i]))
+                    next_i += 1
+            if now >= deadline:
+                break
+            time.sleep(min(0.05, deadline - now))
+        if on_sample is not None:
+            while next_i < i1:
+                on_sample(next_i, actions[next_i], float(rel[next_i]))
+                next_i += 1
         i0 = i1
     if interruptible_sleep(0.2, poll_abort=poll_abort):
         emergency_stop(env)
@@ -1144,11 +1280,13 @@ def replay_saved_episode(
     approach_duration: float = 2.5,
     robot_indices: list[int] | None = None,
     poll_abort=None,
+    web_state=None,
 ) -> bool:
     """从 zarr ``action`` Slerp 到起点再分块回放。
 
     robot_indices: 要动的臂（如 [0]/[1]）；None=双臂。
     poll_abort: 返回 True 时急停并中止。
+    web_state: 若给定，同步推送网页下方 LIVE 轨迹。
     """
     loaded = load_episode_actions(env, episode_id)
     if loaded is None:
@@ -1165,6 +1303,12 @@ def replay_saved_episode(
         f"(Slerp approach {approach_duration:.1f}s first)"
     )
     print("  (X / web E-Stop to abort; do not drag arms)")
+
+    begin_replay_live_series(
+        web_state,
+        episode_id=episode_id,
+        message=f"正在回放 ep{episode_id} [{arms}]…（X 急停）",
+    )
 
     start_targets = _targets_from_action_row(actions[0], n_robots)
     for ridx, (pose6, grip) in enumerate(start_targets):
@@ -1192,17 +1336,73 @@ def replay_saved_episode(
             return False
         actions = _anchor_actions_to_current_pose(env, actions)
         actions = mask_actions_hold_other_arms(env, actions, robot_indices)
+        # 起点写入 LIVE；整段回放再按时间推进
+        append_live_from_action_row(
+            web_state,
+            actions[0],
+            step=0,
+            t_elapsed=float(rel[0]) if len(rel) else 0.0,
+            n_robots=n_robots,
+            force=True,
+        )
+        if web_state is not None:
+            try:
+                from modules.collect_web_ui import publish_pose_from_env
+
+                publish_pose_from_env(web_state, env)
+            except Exception:
+                pass
         if len(actions) <= 1:
             print(f"<<< Replay episode {episode_id} done (single frame).")
             return True
         play = actions[1:]
         play_rel = rel[1:] - float(rel[1])
+        display_t0 = float(rel[1]) if len(rel) > 1 else 0.0
+
+        def _on_sample(i: int, row: np.ndarray, t_rel: float) -> None:
+            step = int(i) + 1  # play 从原 episode 第 1 帧起
+            append_live_from_action_row(
+                web_state,
+                row,
+                step=step,
+                t_elapsed=display_t0 + float(t_rel),
+                n_robots=n_robots,
+            )
+            if web_state is not None and step % 6 == 0:
+                try:
+                    from modules.collect_web_ui import publish_pose_from_env
+
+                    publish_pose_from_env(web_state, env)
+                except Exception:
+                    pass
+
         ok_play = _exec_actions_chunked(
-            env, play, play_rel, poll_abort=poll_abort, chunk_s=0.5
+            env,
+            play,
+            play_rel,
+            poll_abort=poll_abort,
+            chunk_s=0.5,
+            on_sample=_on_sample if web_state is not None else None,
         )
         if not ok_play:
             print(f"<<< Replay episode {episode_id} aborted (E-STOP).")
             return False
+        # 末帧强制写入（降采样可能跳过）
+        append_live_from_action_row(
+            web_state,
+            actions[-1],
+            step=len(actions) - 1,
+            t_elapsed=float(rel[-1]) if len(rel) else 0.0,
+            n_robots=n_robots,
+            force=True,
+        )
+        if web_state is not None:
+            try:
+                from modules.collect_web_ui import publish_pose_from_env
+
+                publish_pose_from_env(web_state, env)
+            except Exception:
+                pass
     except Exception as exc:  # noqa: BLE001
         print(f"Replay episode {episode_id} failed: {exc}")
         return False
@@ -1221,6 +1421,8 @@ def replay_step_to_index(
     step_duration: float = 0.12,
     robot_indices: list[int] | None = None,
     poll_abort=None,
+    web_state=None,
+    t_elapsed: float | None = None,
 ) -> bool:
     """单步：Slerp 缓动到 ``actions[step_idx]``（可单臂）。"""
     n_robots = len(env.robots)
@@ -1236,7 +1438,7 @@ def replay_step_to_index(
         row[sl] = nearest_rotvec_equivalent(row[sl], curr_rv)
     targets = _targets_from_action_row(row, n_robots)
     try:
-        return move_to_tcp_pose_slerp(
+        ok = move_to_tcp_pose_slerp(
             env,
             targets,
             frequency=frequency,
@@ -1245,6 +1447,24 @@ def replay_step_to_index(
             ensure_end_control=True,
             poll_abort=poll_abort,
         )
+        if ok and web_state is not None:
+            if t_elapsed is None:
+                t_elapsed = float(step_idx) / max(float(frequency), 1e-6)
+            append_live_from_action_row(
+                web_state,
+                row,
+                step=int(step_idx),
+                t_elapsed=float(t_elapsed),
+                n_robots=n_robots,
+                force=True,
+            )
+            try:
+                from modules.collect_web_ui import publish_pose_from_env
+
+                publish_pose_from_env(web_state, env)
+            except Exception:
+                pass
+        return ok
     except Exception as exc:  # noqa: BLE001
         print(f"Replay step {step_idx} failed: {exc}")
         return False
@@ -1591,13 +1811,19 @@ def publish_web_frame(
         return
     from modules.collect_web_ui import publish_pose_from_env, vis_rgb_to_jpeg
 
-    mode = _compute_mode(
-        recording=recording,
-        zero_force_active=zero_force_active,
-        no_zero_force=no_zero_force,
-        delete_mode=delete_mode,
-    )
-    publish_pose_from_env(web_state, env)
+    deleting = bool(getattr(web_state, "deleting", False)) or is_delete_busy()
+    if deleting:
+        mode = "DELETING"
+    else:
+        mode = _compute_mode(
+            recording=recording,
+            zero_force_active=zero_force_active,
+            no_zero_force=no_zero_force,
+            delete_mode=delete_mode,
+        )
+    # 删除线程正在改 zarr 时不要读 replay_buffer（避免竞态）
+    if not deleting:
+        publish_pose_from_env(web_state, env)
     jpeg = b""
     # 网页预览：带相机标签 + 延迟叠加的画面
     src = clean_rgb if clean_rgb is not None else vis_rgb
@@ -1606,21 +1832,30 @@ def publish_web_frame(
             jpeg = vis_rgb_to_jpeg(src, quality=75)
         except Exception:
             jpeg = b""
-    web_state.update(
+    payload = dict(
         mode=mode,
+        deleting=deleting,
         zero_force_active=zero_force_active,
         recording=recording,
         no_zero_force=no_zero_force,
         n_steps=int(n_steps),
         t_elapsed=float(t_elapsed),
         episode_id=episode_id,
-        delete_pending=delete_target if delete_mode == "confirm" else None,
+        delete_pending=(
+            None if deleting else (delete_target if delete_mode == "confirm" else None)
+        ),
         frequency=float(frequency),
-        message=message,
         jpeg=jpeg,
-        n_episodes=int(env.replay_buffer.n_episodes),
         camera_latency=list(camera_latency or []),
     )
+    if message:
+        payload["message"] = message
+    if not deleting:
+        try:
+            payload["n_episodes"] = int(env.replay_buffer.n_episodes)
+        except Exception:
+            pass
+    web_state.update(**payload)
 
 
 def append_live_from_obs(
@@ -1665,6 +1900,80 @@ def append_live_from_obs(
         )
     except Exception:
         pass
+
+
+def append_live_from_action_row(
+    web_state,
+    action_row: np.ndarray,
+    *,
+    step: int,
+    t_elapsed: float,
+    n_robots: int = 2,
+    every: int = 3,
+    force: bool = False,
+) -> None:
+    """把回放/单步的 action 行推到网页 LIVE 轨迹图。"""
+    if web_state is None:
+        return
+    if not force and step > 0 and every > 1 and step % every != 0:
+        return
+    try:
+        row = np.asarray(action_row, dtype=np.float64).reshape(-1)
+        labels = ("L", "R", "A2", "A3")
+        robots = []
+        for ridx in range(n_robots):
+            base = 7 * ridx
+            if row.shape[0] < base + 7:
+                break
+            robots.append(
+                {
+                    "label": labels[ridx] if ridx < len(labels) else f"A{ridx}",
+                    "xyz": [float(row[base]), float(row[base + 1]), float(row[base + 2])],
+                    "rot": [
+                        float(row[base + 3]),
+                        float(row[base + 4]),
+                        float(row[base + 5]),
+                    ],
+                    "grip": float(row[base + 6]),
+                }
+            )
+        if not robots:
+            return
+        r0 = robots[0]
+        web_state.append_live_sample(
+            step=int(step),
+            t=float(t_elapsed),
+            xyz=np.asarray(r0["xyz"], dtype=np.float64),
+            rot=np.asarray(r0["rot"], dtype=np.float64),
+            grip=float(r0["grip"]),
+            action=row,
+            robots=robots,
+        )
+        web_state.update(n_steps=int(step) + 1, t_elapsed=float(t_elapsed))
+    except Exception:
+        pass
+
+
+def begin_replay_live_series(
+    web_state,
+    *,
+    episode_id: int,
+    message: str = "",
+) -> None:
+    """回放开始：清空 LIVE 序列并切到 REPLAY，便于网页 Follow LIVE。"""
+    if web_state is None:
+        return
+    if hasattr(web_state, "clear_live_series"):
+        web_state.clear_live_series()
+    web_state.update(
+        mode="REPLAY",
+        recording=False,
+        zero_force_active=False,
+        episode_id=int(episode_id),
+        n_steps=0,
+        t_elapsed=0.0,
+        message=message or f"正在回放 ep{episode_id}…",
+    )
 
 
 class OfflineDatasetEnv:
@@ -1814,9 +2123,17 @@ def run_viewer_only(
                     )
                     continue
                 if action == "delete_cancel":
-                    web_state.update(delete_pending=None, message="delete cancelled")
+                    if is_delete_busy():
+                        web_state.update(message="正在删除中，无法取消")
+                    else:
+                        web_state.update(
+                            delete_pending=None, message="delete cancelled"
+                        )
                     continue
                 if action == "delete_request":
+                    if is_delete_busy():
+                        web_state.update(message="正在删除中，请稍候…")
+                        continue
                     env = web_state.env
                     if env is None:
                         web_state.update(message="尚未加载数据目录")
@@ -1837,15 +2154,12 @@ def run_viewer_only(
                         continue
                     eid = cmd.get("episode_id", web_state.delete_pending)
                     if eid is not None:
-                        ok = delete_saved_episode(env, int(eid))
-                        web_state.update(
-                            delete_pending=None,
-                            n_episodes=int(env.replay_buffer.n_episodes),
-                            message=(
-                                f"deleted ep {eid}"
-                                if ok
-                                else f"delete ep {eid} failed"
-                            ),
+                        schedule_delete_episode(
+                            env,
+                            int(eid),
+                            web_state=web_state,
+                            hold_robot=False,
+                            done_mode="VIEW",
                         )
                     continue
                 if action in ("drag_toggle", "start", "save", "drop"):
@@ -2074,9 +2388,17 @@ def run_web_hub(
                     )
                     continue
                 if action == "delete_cancel":
-                    web_state.update(delete_pending=None, message="delete cancelled")
+                    if is_delete_busy():
+                        web_state.update(message="正在删除中，无法取消")
+                    else:
+                        web_state.update(
+                            delete_pending=None, message="delete cancelled"
+                        )
                     continue
                 if action == "delete_request":
+                    if is_delete_busy():
+                        web_state.update(message="正在删除中，请稍候…")
+                        continue
                     env = web_state.env
                     if env is None:
                         web_state.update(message="尚未加载数据目录")
@@ -2097,16 +2419,20 @@ def run_web_hub(
                         continue
                     eid = cmd.get("episode_id", web_state.delete_pending)
                     if eid is not None:
-                        ok = delete_saved_episode(env, int(eid))
-                        web_state.update(
-                            delete_pending=None,
-                            n_episodes=int(env.replay_buffer.n_episodes),
-                            message=(
-                                f"deleted ep {eid}"
-                                if ok
-                                else f"delete ep {eid} failed"
-                            ),
+                        schedule_delete_episode(
+                            env,
+                            int(eid),
+                            web_state=web_state,
+                            hold_robot=False,
+                            done_mode="VIEW",
                         )
+                    continue
+                if is_delete_busy() and action in (
+                    "load_dataset",
+                    "back_hub",
+                    "enter_collect",
+                ):
+                    web_state.update(message="正在删除中，请稍候…")
                     continue
                 if action in ("drag_toggle", "start", "save", "drop", "enter_collect"):
                     web_state.update(
@@ -2575,16 +2901,6 @@ def run_collect_session(
                     estop_requested = False
                     _ensure_end_control_for_replay()
                     arms = _format_replay_arms(replay_arm_sel, n_robots)
-                    if web_state is not None:
-                        web_state.update(
-                            mode="REPLAY",
-                            zero_force_active=False,
-                            recording=False,
-                            message=(
-                                f"正在回放 ep{episode_id} [{arms}]…"
-                                "（X 急停）"
-                            ),
-                        )
                     ok = replay_saved_episode(
                         env,
                         episode_id,
@@ -2592,6 +2908,7 @@ def run_collect_session(
                         approach_duration=float(replay_approach),
                         robot_indices=replay_arm_sel,
                         poll_abort=poll_abort,
+                        web_state=web_state,
                     )
                     aborted = estop_requested
                     estop_requested = False
@@ -2632,18 +2949,16 @@ def run_collect_session(
                         loaded = load_episode_actions(env, episode_id)
                         if loaded is None:
                             return
-                        actions, _rel = loaded
+                        actions, rel = loaded
                         _ensure_end_control_for_replay()
-                        if web_state is not None:
-                            web_state.update(
-                                mode="REPLAY",
-                                zero_force_active=False,
-                                recording=False,
-                                message=(
-                                    f"单步 ep{episode_id}[{arms}] → 起点 "
-                                    f"(0/{len(actions) - 1})"
-                                ),
-                            )
+                        begin_replay_live_series(
+                            web_state,
+                            episode_id=episode_id,
+                            message=(
+                                f"单步 ep{episode_id}[{arms}] → 起点 "
+                                f"(0/{len(actions) - 1})"
+                            ),
+                        )
                         ok = replay_step_to_index(
                             env,
                             actions,
@@ -2652,6 +2967,8 @@ def run_collect_session(
                             step_duration=float(replay_approach),
                             robot_indices=replay_arm_sel,
                             poll_abort=poll_abort,
+                            web_state=web_state,
+                            t_elapsed=float(rel[0]) if len(rel) else 0.0,
                         )
                         if not ok:
                             if web_state is not None:
@@ -2667,6 +2984,7 @@ def run_collect_session(
                         step_replay = {
                             "episode_id": episode_id,
                             "actions": actions,
+                            "rel": rel,
                             "idx": 0,
                         }
                         print(
@@ -2675,8 +2993,9 @@ def run_collect_session(
                             "J=next, Esc=leave, X=E-Stop."
                         )
                         if web_state is not None:
+                            # 保持 REPLAY：网页继续 Follow LIVE 刷轨迹
                             web_state.update(
-                                mode="READY" if no_zero_force else "IDLE",
+                                mode="REPLAY",
                                 message=(
                                     f"单步 ep{episode_id}[{arms}]: "
                                     f"0/{len(actions) - 1} · J下一步"
@@ -2685,6 +3004,7 @@ def run_collect_session(
                         return
 
                     actions = step_replay["actions"]
+                    rel = step_replay.get("rel")
                     eid = int(step_replay["episode_id"])
                     nxt = int(step_replay["idx"]) + 1
                     if nxt >= len(actions):
@@ -2701,6 +3021,17 @@ def run_collect_session(
                         return
 
                     _ensure_end_control_for_replay()
+                    if web_state is not None:
+                        web_state.update(
+                            mode="REPLAY",
+                            message=(
+                                f"单步 ep{eid}[{arms}]: "
+                                f"{nxt}/{len(actions) - 1}…"
+                            ),
+                        )
+                    t_ep = None
+                    if rel is not None and nxt < len(rel):
+                        t_ep = float(rel[nxt])
                     ok = replay_step_to_index(
                         env,
                         actions,
@@ -2709,6 +3040,8 @@ def run_collect_session(
                         step_duration=0.12,
                         robot_indices=replay_arm_sel,
                         poll_abort=poll_abort,
+                        web_state=web_state,
+                        t_elapsed=t_ep,
                     )
                     if not ok:
                         if estop_requested:
@@ -2721,7 +3054,7 @@ def run_collect_session(
                     )
                     if web_state is not None:
                         web_state.update(
-                            mode="READY" if no_zero_force else "IDLE",
+                            mode="REPLAY",
                             message=(
                                 f"单步 ep{eid}[{arms}]: "
                                 f"{nxt}/{len(actions) - 1} · J下一步"
@@ -2759,14 +3092,48 @@ def run_collect_session(
                             delete_target = None
                             continue
                         if action == "delete_confirm":
+                            if is_delete_busy():
+                                print("Delete already in progress — ignore.")
+                                if web_state is not None:
+                                    web_state.update(
+                                        message="正在删除中，请稍候…"
+                                    )
+                                continue
                             tid = cmd.get("episode_id", delete_target)
                             if tid is not None:
-                                delete_saved_episode(env, int(tid))
+                                # 先退出拖拽并钉住，再后台删，避免主循环卡住掉臂
+                                if zero_force_active:
+                                    leave_drag_stay_pose(env)
+                                    zero_force_active = False
+                                    if grip_detector is not None:
+                                        grip_detector.reset()
+                                elif hasattr(env, "set_end_control"):
+                                    try:
+                                        env.set_end_control()
+                                    except Exception as exc:  # noqa: BLE001
+                                        print(
+                                            f"set_end_control before delete: {exc}"
+                                        )
+                                schedule_delete_episode(
+                                    env,
+                                    int(tid),
+                                    web_state=web_state,
+                                    hold_robot=False,  # 主线程已钉住
+                                    done_mode=(
+                                        "READY" if no_zero_force else "IDLE"
+                                    ),
+                                )
                             delete_mode = None
                             delete_buf = ""
                             delete_target = None
                             continue
                         if action == "delete_request":
+                            if is_delete_busy():
+                                if web_state is not None:
+                                    web_state.update(
+                                        message="正在删除中，请稍候…"
+                                    )
+                                continue
                             n_saved = env.replay_buffer.n_episodes
                             eid = cmd.get("episode_id")
                             if eid is None:
@@ -2782,6 +3149,16 @@ def run_collect_session(
                                     )
                                 else:
                                     print(f"Episode {eid} does not exist.")
+                            continue
+                        if is_delete_busy() and action not in (
+                            "quit",
+                            "estop",
+                            "delete_cancel",
+                        ):
+                            if web_state is not None:
+                                web_state.update(
+                                    message="正在删除中，请稍候…"
+                                )
                             continue
                         if delete_mode == "confirm" and action not in (
                             "delete_confirm",
@@ -2868,7 +3245,32 @@ def run_collect_session(
                             if delete_mode == "confirm":
                                 ch = key_char(key_stroke)
                                 if ch == "y":
-                                    delete_saved_episode(env, delete_target)
+                                    if is_delete_busy():
+                                        print("Delete already in progress.")
+                                    else:
+                                        if zero_force_active:
+                                            leave_drag_stay_pose(env)
+                                            zero_force_active = False
+                                            if grip_detector is not None:
+                                                grip_detector.reset()
+                                        elif hasattr(env, "set_end_control"):
+                                            try:
+                                                env.set_end_control()
+                                            except Exception as exc:  # noqa: BLE001
+                                                print(
+                                                    f"set_end_control before delete: {exc}"
+                                                )
+                                        schedule_delete_episode(
+                                            env,
+                                            int(delete_target),
+                                            web_state=web_state,
+                                            hold_robot=False,  # 主线程已钉住
+                                            done_mode=(
+                                                "READY"
+                                                if no_zero_force
+                                                else "IDLE"
+                                            ),
+                                        )
                                     delete_mode = None
                                     delete_buf = ""
                                     delete_target = None
@@ -2991,19 +3393,23 @@ def run_collect_session(
                                 else:
                                     print("Pose print OFF.")
                             if key_stroke == KeyCode(char="e"):
-                                n_saved = env.replay_buffer.n_episodes
-                                if n_saved <= 0:
-                                    print("No saved episode to delete.")
+                                if is_delete_busy():
+                                    print("Delete already in progress — wait.")
                                 else:
-                                    delete_mode = "input"
-                                    delete_buf = ""
-                                    delete_target = None
-                                    replay_mode = None
-                                    replay_buf = ""
-                                    print(
-                                        f"Delete saved episode: type ID (0..{n_saved - 1}), "
-                                        "Enter to confirm, Esc to cancel."
-                                    )
+                                    n_saved = env.replay_buffer.n_episodes
+                                    if n_saved <= 0:
+                                        print("No saved episode to delete.")
+                                    else:
+                                        delete_mode = "input"
+                                        delete_buf = ""
+                                        delete_target = None
+                                        replay_mode = None
+                                        replay_buf = ""
+                                        print(
+                                            f"Delete saved episode: type ID "
+                                            f"(0..{n_saved - 1}), "
+                                            "Enter to confirm, Esc to cancel."
+                                        )
                             if key_stroke == KeyCode(char="r"):
                                 n_saved = env.replay_buffer.n_episodes
                                 if n_saved <= 0:
@@ -3033,14 +3439,25 @@ def run_collect_session(
                                     f"Step replay ep{step_replay['episode_id']} cancelled."
                                 )
                                 step_replay = None
+                                if web_state is not None:
+                                    web_state.update(
+                                        mode="READY" if no_zero_force else "IDLE",
+                                        message="已退出单步回放",
+                                    )
                         if start_episode:
                             break
 
                         try:
+                            deleting_now = is_delete_busy() or (
+                                web_state is not None
+                                and bool(getattr(web_state, "deleting", False))
+                            )
+                            # 删除在后台线程：主循环继续 get_obs，保持通信，避免掉臂
                             obs = env.get_obs()
                             cam_lat = compute_camera_latency(env, obs)
                             if (
-                                grip_detector is not None
+                                not deleting_now
+                                and grip_detector is not None
                                 and zero_force_active
                                 and delete_mode is None
                                 and replay_mode is None
@@ -3062,10 +3479,20 @@ def run_collect_session(
                                 if now - last_pose_print_t >= pose_print_interval:
                                     print_current_pose(env, tag="live")
                                     last_pose_print_t = now
-                            n_saved = env.replay_buffer.n_episodes
+                            if deleting_now:
+                                n_saved = (
+                                    int(getattr(web_state, "n_episodes", 0))
+                                    if web_state is not None
+                                    else 0
+                                )
+                            else:
+                                n_saved = env.replay_buffer.n_episodes
                             delete_prompt = None
                             prompt_status = "DEL"
-                            if delete_mode == "input":
+                            if deleting_now:
+                                prompt_status = "DEL"
+                                delete_prompt = "Deleting… wait (do not quit)"
+                            elif delete_mode == "input":
                                 delete_prompt = (
                                     f"ID:{delete_buf or '_'}  (0..{max(n_saved - 1, 0)}) "
                                     "Enter=ok Esc=cancel"
@@ -3270,17 +3697,28 @@ def run_collect_session(
                                     if grip_detector.update(gw, obs_t):
                                         grip_save_triggered = True
                                         save_via_grip_gesture = True
-                                        # 略提前切断，避免手势起始抖动进数据集
+                                        # 只裁掉末尾手势窗，绝不超过 window（防误删大段）
                                         cut_t = grip_detector.last_gesture_start_t
                                         if cut_t is None:
                                             cut_t = obs_t
-                                        cut_t = float(cut_t) - 0.05
+                                        max_trim_s = float(
+                                            grip_detector.window_s
+                                        ) + 0.3
+                                        cut_floor = float(obs_t) - max_trim_s
+                                        cut_t = max(float(cut_t), cut_floor) - 0.05
+                                        before = (
+                                            len(env.action_accumulator)
+                                            if env.action_accumulator is not None
+                                            else 0
+                                        )
                                         kept = truncate_episode_before(env, cut_t)
                                         n_steps = kept
+                                        trimmed = max(0, before - kept)
                                         print(
                                             f"Gripper double open-close on "
                                             f"robot{grip_robot_idx} → SAVE "
-                                            f"(trimmed gesture; keep {kept} steps)."
+                                            f"(trim {trimmed} steps / "
+                                            f"≤{max_trim_s:.1f}s; keep {kept})."
                                         )
                                         stop_save = True
                                         if web_state is not None:
