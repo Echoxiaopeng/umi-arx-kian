@@ -31,8 +31,9 @@ class Command(enum.Enum):
     RESTORE_GAINS_AFTER_DRAG = 11
 
 
-# 拖拽夹爪：全程张开回弹 + 跟手；旧硬墙默认关（曾偏猛）。
-# 死区/同号门限防振荡；回弹只朝张开，明确闭合时让开。
+# 拖拽夹爪：轻回弹 + 跟手；旧硬墙默认关（曾偏猛）。
+# 死区/同号门限防振荡；回弹只朝张开。
+# 捏死后静止不再顶开（否则握紧会被力弹开）；闭合跟手略加强。
 DRAG_GRIPPER_WALL_ENABLE = False
 DRAG_GRIPPER_WALL_SOFT_LO = 0.028
 DRAG_GRIPPER_WALL_HARD_LO = 0.016
@@ -41,22 +42,25 @@ DRAG_GRIPPER_WALL_HARD_TAU = 0.95
 DRAG_GRIPPER_WALL_OPEN_FLOOR = 0.35
 DRAG_GRIPPER_WALL_HI = 0.082
 DRAG_GRIPPER_WALL_HI_TAU = 0.25
-# 闭侧回弹（比硬墙温和；夹紧/偏紧/静止都顶开，不只卡死时）
+# 闭侧回弹：仅在「偏紧且仍在动/张开」时轻顶，静止握紧不出力
 DRAG_GRIPPER_REBOUND_ENABLE = True
-DRAG_GRIPPER_REBOUND_LO = 0.032  # m，偏紧即开始回弹
-DRAG_GRIPPER_REBOUND_HARD_LO = 0.015
-DRAG_GRIPPER_REBOUND_TAU = 0.22  # Nm，软段
-DRAG_GRIPPER_REBOUND_HARD_TAU = 0.38  # Nm，夹很紧
-# 跟手：张开偏强，闭合偏弱；死区够大 + 同号才跟，防开合振荡
+DRAG_GRIPPER_REBOUND_LO = 0.024  # m，更深才回弹（原 0.032 太早顶）
+DRAG_GRIPPER_REBOUND_HARD_LO = 0.012
+DRAG_GRIPPER_REBOUND_TAU = 0.10  # Nm，软段（原 0.22）
+DRAG_GRIPPER_REBOUND_HARD_TAU = 0.18  # Nm，夹很紧（原 0.38）
+DRAG_GRIPPER_REBOUND_FLOOR = 0.04  # 软段底力（原 0.12）
+# 跟手：闭合略加强，张开略减弱，减轻「闭合偏硬」
 DRAG_GRIPPER_VEL_EPS = 0.032
-DRAG_GRIPPER_FRICTION_OPEN = 0.20
-DRAG_GRIPPER_FRICTION_CLOSE = 0.05
+DRAG_GRIPPER_FRICTION_OPEN = 0.12
+DRAG_GRIPPER_FRICTION_CLOSE = 0.10
 DRAG_GRIPPER_TORQUE_TO_ACC = 0.05
 DRAG_GRIPPER_ACC_THRESHOLD = 0.02
 DRAG_GRIPPER_TORQUE_MAX = 1.2
 DRAG_GRIPPER_VEL_SIGN_MIN = 4
 DRAG_GRIPPER_STUCK_VEL = 0.02
 DRAG_GRIPPER_STUCK_TAU = 0.55
+# 开口低于此且近似静止 → 视为故意握紧，禁止回弹顶开
+DRAG_GRIPPER_HOLD_CLOSED_LO = 0.020
 # P 键阻尼拖拽：臂 kp=0，kd 相对 set_to_damping 后再乘此系数（越小越轻、越飘）
 # 原 0.1 偏硬；0.03 约再软 3 倍。若仍沉可试 0.015；若发颤/难停再调回 0.05
 DRAG_ARM_KD_SCALE = 0.015
@@ -87,19 +91,19 @@ def _closed_wall_torque(g: float) -> float:
 
 
 def _rebound_open_torque(g: float) -> float:
-    """偏紧区间持续张开回弹（比硬墙温和）。"""
+    """偏紧区间张开回弹（比硬墙温和）；力矩已整体调弱。"""
     if g >= DRAG_GRIPPER_REBOUND_LO:
         return 0.0
     soft = float(DRAG_GRIPPER_REBOUND_TAU)
     hard = float(DRAG_GRIPPER_REBOUND_HARD_TAU)
+    floor = float(DRAG_GRIPPER_REBOUND_FLOOR)
     if g >= DRAG_GRIPPER_REBOUND_HARD_LO:
         span = max(
             DRAG_GRIPPER_REBOUND_LO - DRAG_GRIPPER_REBOUND_HARD_LO, 1e-6
         )
         alpha = (DRAG_GRIPPER_REBOUND_LO - g) / span
         alpha = min(1.0, max(0.0, alpha))
-        # 软段也保留一点底力，静止偏紧时就能顶开
-        return 0.12 + (soft - 0.12) * alpha
+        return floor + (soft - floor) * alpha
     span = max(DRAG_GRIPPER_REBOUND_HARD_LO, 1e-6)
     beta = (DRAG_GRIPPER_REBOUND_HARD_LO - g) / span
     beta = min(1.0, max(0.0, beta))
@@ -134,44 +138,43 @@ def _gripper_assist_torque(
         >= DRAG_GRIPPER_VEL_SIGN_MIN
     )
 
-    # 1) 跟手：同向持续才出力（防噪声振荡）；张开力矩大于闭合
+    # 1) 跟手：同向持续才出力（防噪声振荡）；闭合全程跟手（含偏紧）
     if len(gripper_vel_hist) >= 5 and dt > 0 and (
         clearly_opening or clearly_closing
     ):
-        allow_follow = True
-        if (
-            (DRAG_GRIPPER_WALL_ENABLE or DRAG_GRIPPER_REBOUND_ENABLE)
-            and g is not None
-            and g < DRAG_GRIPPER_REBOUND_LO
-            and clearly_closing
-        ):
-            # 偏紧时不帮你继续捏死，交给回弹顶开
-            allow_follow = False
-        if allow_follow:
-            v = gripper_vel_hist
-            gripper_acc = 0.5 * (v[-1] - v[0]) / (dt * (len(v) - 1)) + 0.5 * (
-                v[-2] - v[2]
-            ) / (dt * (len(v) - 3))
-            if gripper_acc > DRAG_GRIPPER_ACC_THRESHOLD:
-                gripper_acc -= DRAG_GRIPPER_ACC_THRESHOLD
-            elif gripper_acc < -DRAG_GRIPPER_ACC_THRESHOLD:
-                gripper_acc += DRAG_GRIPPER_ACC_THRESHOLD
-            else:
-                gripper_acc = 0.0
-            torque += DRAG_GRIPPER_TORQUE_TO_ACC * float(gripper_acc)
-            if clearly_opening:
-                torque += DRAG_GRIPPER_FRICTION_OPEN
-            else:
-                torque -= DRAG_GRIPPER_FRICTION_CLOSE
+        v = gripper_vel_hist
+        gripper_acc = 0.5 * (v[-1] - v[0]) / (dt * (len(v) - 1)) + 0.5 * (
+            v[-2] - v[2]
+        ) / (dt * (len(v) - 3))
+        if gripper_acc > DRAG_GRIPPER_ACC_THRESHOLD:
+            gripper_acc -= DRAG_GRIPPER_ACC_THRESHOLD
+        elif gripper_acc < -DRAG_GRIPPER_ACC_THRESHOLD:
+            gripper_acc += DRAG_GRIPPER_ACC_THRESHOLD
+        else:
+            gripper_acc = 0.0
+        torque += DRAG_GRIPPER_TORQUE_TO_ACC * float(gripper_acc)
+        if clearly_opening:
+            torque += DRAG_GRIPPER_FRICTION_OPEN
+        else:
+            torque -= DRAG_GRIPPER_FRICTION_CLOSE
 
-    # 2) 回弹：偏紧就持续顶开（静止/微动/张开都出力；仅明确闭合时让开）
-    if DRAG_GRIPPER_REBOUND_ENABLE and g is not None and not clearly_closing:
+    # 2) 回弹：偏紧时轻顶开，但故意握紧（近闭且静止）或明确闭合时不顶
+    holding_closed = (
+        g is not None
+        and g <= DRAG_GRIPPER_HOLD_CLOSED_LO
+        and abs(v_now) < DRAG_GRIPPER_STUCK_VEL
+    )
+    if (
+        DRAG_GRIPPER_REBOUND_ENABLE
+        and g is not None
+        and not clearly_closing
+        and not holding_closed
+    ):
         rb = _rebound_open_torque(g)
         if rb > 0:
             if torque < 0:
                 torque = 0.0
             torque = max(torque, rb)
-            # 已在张开时叠加一点，中间行程也更跟手
             if clearly_opening:
                 torque = max(torque, rb + 0.5 * DRAG_GRIPPER_FRICTION_OPEN)
 
