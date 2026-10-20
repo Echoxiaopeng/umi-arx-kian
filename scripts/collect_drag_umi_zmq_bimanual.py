@@ -8,6 +8,34 @@ ARX5 双臂拖拽采数 — ZMQ + 双腕 GoPro（V4L）+ 中间 D435（pyrealsen
   camera1       中间 D435 RGB + depth（pyrealsense2）
   camera2       右腕 GoPro（V4L / Elgato）
 
+---------------------------------------------------------------------------
+D435 画面预处理（训练 / 推理必须一致）
+---------------------------------------------------------------------------
+作用对象: 仅 camera1（D435 RGB）。GoPro / depth 不做颜色处理。
+写入范围: 预览、zarr 的 camera1_rgb、videos/*/1.mp4 均为调色后画面。
+
+当前默认（可用 CLI 覆盖）:
+  --rs_color_hue_shift     12.0   # 蓝→品红（OpenCV H 单位，0–180）
+  --rs_color_temperature    0.0   # 关闭（不改冷暖）
+  --rs_color_saturation     1.0   # 关闭（不改饱和度）
+  --rs_color_contrast       1.0   # 关闭（不改对比度）
+
+算法（与 peripherals.realsense_camera.grade_bgr_uint8 一致，输入 BGR uint8）:
+  1) BGR → HSV（OpenCV）
+  2) 仅对青蓝波段做加权色相偏移（不拖橙色夹爪）:
+       center, half = 107.0, 28.0
+       w = clip(1 - |H - center| / half, 0, 1)
+       H <- (H + hue_shift * w) mod 180
+  3) HSV → BGR
+  4) temperature / saturation / contrast 仅在非默认时启用（当前默认全关）
+
+推理脚本复用（推荐直接 import，勿手抄）:
+  from peripherals.realsense_camera import grade_bgr_uint8
+  bgr = grade_bgr_uint8(bgr, temperature=0.0, saturation=1.0,
+                        contrast=1.0, hue_shift=12.0)
+  # 若模型吃 RGB: rgb = bgr[..., ::-1]
+---------------------------------------------------------------------------
+
 依赖:
   - 两个已启动的 ZMQ 机械臂服务（eef_link + ee2tcp）
   - pip install pyrealsense2
@@ -33,6 +61,10 @@ ARX5 双臂拖拽采数 — ZMQ + 双腕 GoPro（V4L）+ 中间 D435（pyrealsen
     python scripts/collect_drag_umi_zmq_bimanual.py -o data/collect_bimanual \\
         --rs_serial 123456789012 --no_save_depth --web
 
+    # 关闭 D435 色相校正（存原图）:
+    python scripts/collect_drag_umi_zmq_bimanual.py -o data/collect_bimanual \\
+        --rs_color_hue_shift 0 --web
+
 键盘: 与 collect_drag_umi_zmq.py 相同（P/C/S/D/E/I/Q），另加 R=回放已保存 episode。
 拖拽手势: P 进零力后，连续两次开合 can1（默认 robot1/右臂）夹爪 → 开始采集；
           再连续两次开合 → 保存 episode（手势本身不写入 zarr）。
@@ -40,7 +72,7 @@ ARX5 双臂拖拽采数 — ZMQ + 双腕 GoPro（V4L）+ 中间 D435（pyrealsen
 
 输出:
   action (T, 14)；robot{0,1}_*；camera{0,1,2}_rgb；camera1_depth（uint16 mm）
-  videos/{ep}/0.mp4, 1.mp4(D435 RGB), 2.mp4
+  videos/{ep}/0.mp4, 1.mp4(D435 RGB 已调色), 2.mp4
 
 Author: Kian
 """
@@ -2503,6 +2535,10 @@ def run_collect_session(
     rs_height=480,
     rs_fps=30,
     save_depth=True,
+    rs_color_temperature=0.0,
+    rs_color_saturation=1.0,
+    rs_color_contrast=1.0,
+    rs_color_hue_shift=12.0,
     web_state=None,
     web_cmds=None,
     web_server=None,
@@ -2559,6 +2595,11 @@ def run_collect_session(
     print(
         f"  D435       : serial={rs_serial!r} "
         f"{rs_width}x{rs_height}@{rs_fps} depth={save_depth} -> camera1"
+    )
+    print(
+        f"  D435 grade : temp={rs_color_temperature:.2f} "
+        f"sat={rs_color_saturation:.2f} contrast={rs_color_contrast:.2f} "
+        f"hue={rs_color_hue_shift:.1f}"
     )
     print(f"  save_images: {save_images}")
     print("  frame      : eef_link + ee2tcp (ZMQ)")
@@ -2681,6 +2722,10 @@ def run_collect_session(
                 rs_resolution=(int(rs_width), int(rs_height)),
                 rs_fps=int(rs_fps),
                 enable_depth=bool(save_depth),
+                rs_color_temperature=float(rs_color_temperature),
+                rs_color_saturation=float(rs_color_saturation),
+                rs_color_contrast=float(rs_color_contrast),
+                rs_color_hue_shift=float(rs_color_hue_shift),
             ) as env:
                 key_source = term_keys if key_source_is_term else key_counter
 
@@ -2689,6 +2734,42 @@ def run_collect_session(
                 time.sleep(1.0)
                 wait_t0 = time.monotonic()
                 last_wait_log = 0.0
+                ready_timeout_s = 60.0
+
+                def _ready_status() -> str:
+                    """只读诊断：哪一块还没 ready（不发任何运动指令）。"""
+                    parts = []
+                    try:
+                        cam_ok = bool(env.camera.is_ready)
+                    except Exception as exc:  # noqa: BLE001
+                        cam_ok = False
+                        parts.append(f"camera=?({exc})")
+                    else:
+                        parts.append(f"camera={'OK' if cam_ok else 'WAIT'}")
+                    for i, robot in enumerate(getattr(env, "robots", []) or []):
+                        try:
+                            ok = bool(robot.is_ready)
+                            alive = bool(robot.is_alive()) if hasattr(robot, "is_alive") else True
+                        except Exception as exc:  # noqa: BLE001
+                            parts.append(f"robot{i}=?({exc})")
+                            continue
+                        port = "?"
+                        try:
+                            cfg = env.robots_config[i]
+                            port = str(cfg.get("robot_port", "?"))
+                        except Exception:
+                            pass
+                        if ok:
+                            parts.append(f"robot{i}(:{port})=OK")
+                        elif not alive:
+                            parts.append(f"robot{i}(:{port})=DEAD")
+                        else:
+                            parts.append(
+                                f"robot{i}(:{port})=WAIT"
+                                "(卡在 GET_STATE/启动，不是相机)"
+                            )
+                    return ", ".join(parts)
+
                 while not env.is_ready:
                     if web_cmds is not None:
                         for cmd in web_cmds.drain():
@@ -2696,12 +2777,18 @@ def run_collect_session(
                                 _web_log(web_state, "用户取消连接")
                                 raise RuntimeError("用户取消连接")
                     now = time.monotonic()
+                    if now - wait_t0 >= ready_timeout_s:
+                        detail = _ready_status()
+                        raise RuntimeError(
+                            f"等待 env ready 超时 ({ready_timeout_s:.0f}s): {detail}"
+                        )
                     if now - last_wait_log >= 2.0:
+                        detail = _ready_status()
                         _web_log(
                             web_state,
-                            f"仍在等待 env ready… ({now - wait_t0:.0f}s)"
-                            " — 请确认 ZMQ server / 相机已启动",
+                            f"仍在等待 env ready… ({now - wait_t0:.0f}s) · {detail}",
                         )
+                        print(f"[ready] {detail}", flush=True)
                         last_wait_log = now
                     time.sleep(0.1)
                 check_episode_alignment(env)
@@ -3909,9 +3996,9 @@ def run_collect_session(
 @click.option(
     "--frequency",
     "-f",
-    default=60.0,
+    default=20.0,
     type=float,
-    help="采数频率 Hz（默认 60；对齐用同一 dt）",
+    help="采数频率 Hz（默认 20；对齐用同一 dt）",
 )
 @click.option(
     "--camera_reorder",
@@ -3935,6 +4022,34 @@ def run_collect_session(
     "--save_depth/--no_save_depth",
     default=True,
     help="是否采集并写入 camera1_depth（uint16 mm）",
+)
+@click.option(
+    "--rs_color_temperature",
+    default=0.0,
+    type=float,
+    show_default=True,
+    help="D435 色温（默认 0=关闭；训练/推理勿单边改）",
+)
+@click.option(
+    "--rs_color_saturation",
+    default=1.0,
+    type=float,
+    show_default=True,
+    help="D435 饱和度倍率（默认 1=关闭）",
+)
+@click.option(
+    "--rs_color_contrast",
+    default=1.0,
+    type=float,
+    show_default=True,
+    help="D435 对比度倍率（默认 1=关闭）",
+)
+@click.option(
+    "--rs_color_hue_shift",
+    default=12.0,
+    type=float,
+    show_default=True,
+    help="D435 蓝→品红色相（默认 12；推理须同参；0=原图）",
 )
 @click.option("--camera_obs_horizon", default=2, type=int)
 @click.option("--robot_obs_horizon", default=2, type=int)
@@ -4108,6 +4223,10 @@ def main(
     rs_height,
     rs_fps,
     save_depth,
+    rs_color_temperature,
+    rs_color_saturation,
+    rs_color_contrast,
+    rs_color_hue_shift,
     camera_obs_horizon,
     robot_obs_horizon,
     camera_obs_latency,
@@ -4159,6 +4278,10 @@ def main(
         rs_height=rs_height,
         rs_fps=rs_fps,
         save_depth=save_depth,
+        rs_color_temperature=rs_color_temperature,
+        rs_color_saturation=rs_color_saturation,
+        rs_color_contrast=rs_color_contrast,
+        rs_color_hue_shift=rs_color_hue_shift,
         camera_obs_horizon=camera_obs_horizon,
         robot_obs_horizon=robot_obs_horizon,
         camera_obs_latency=camera_obs_latency,

@@ -41,6 +41,60 @@ def _import_rs():
     return rs
 
 
+def grade_bgr_uint8(
+    bgr: np.ndarray,
+    temperature: float = 0.0,
+    saturation: float = 1.0,
+    contrast: float = 1.0,
+    hue_shift: float = 0.0,
+) -> np.ndarray:
+    """Cheap BGR grade to nudge D435 toward GoPro-like color.
+
+    temperature: [-1, 1], positive = warmer (more R, less B)
+    saturation: 1.0 = unchanged; >1 more vivid
+    contrast: 1.0 = unchanged; >1 punchier midtones
+    hue_shift: OpenCV hue units (0–180). Positive shifts blue→magenta/purple
+        only in the cyan–blue band (does not drag orange grippers).
+        Empirically ~+12 matches GoPro lavender cloth (H≈123) from D435 (H≈107).
+    """
+    t = float(temperature)
+    s = float(saturation)
+    c = float(contrast)
+    h = float(hue_shift)
+    if (
+        abs(t) < 1e-6
+        and abs(s - 1.0) < 1e-6
+        and abs(c - 1.0) < 1e-6
+        and abs(h) < 1e-6
+    ):
+        return bgr
+
+    out = bgr
+    if abs(h) >= 1e-6:
+        hsv = cv2.cvtColor(out, cv2.COLOR_BGR2HSV).astype(np.float32)
+        H = hsv[..., 0]
+        # Weight peaks near D435 cloth blue (~107); fall off outside cyan–blue.
+        # Keep oranges / greens untouched.
+        center, half = 107.0, 28.0
+        w = np.clip(1.0 - np.abs(H - center) / half, 0.0, 1.0)
+        hsv[..., 0] = np.mod(H + h * w, 180.0)
+        out = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+    img = out.astype(np.float32)
+    if abs(t) >= 1e-6:
+        shift = 40.0 * float(np.clip(t, -1.0, 1.0))
+        img[..., 2] += shift  # R
+        img[..., 0] -= shift  # B
+    if abs(s - 1.0) >= 1e-6:
+        gray = (
+            0.114 * img[..., 0] + 0.587 * img[..., 1] + 0.299 * img[..., 2]
+        )[..., None]
+        img = gray + s * (img - gray)
+    if abs(c - 1.0) >= 1e-6:
+        img = (img - 127.5) * c + 127.5
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
 def list_realsense_devices() -> list[dict]:
     """Return [{name, serial}, ...] for devices visible to pyrealsense2."""
     rs = _import_rs()
@@ -104,11 +158,21 @@ class RealSenseCamera(mp.Process):
         vis_transform: Optional[Callable[[Dict], Dict]] = None,
         video_recorder: Optional[VideoRecorder] = None,
         verbose=False,
+        # Default: hue-only blue→magenta (temp/sat/contrast off). Keep train=deploy.
+        color_temperature: float = 0.0,
+        color_saturation: float = 1.0,
+        color_contrast: float = 1.0,
+        color_hue_shift: float = 12.0,
     ):
         super().__init__()
 
         if put_fps is None:
             put_fps = capture_fps
+
+        self.color_temperature = float(color_temperature)
+        self.color_saturation = float(color_saturation)
+        self.color_contrast = float(color_contrast)
+        self.color_hue_shift = float(color_hue_shift)
 
         resolution = tuple(resolution)
         shape = resolution[::-1]  # H, W
@@ -316,6 +380,13 @@ class RealSenseCamera(mp.Process):
                     continue
                 t_recv = time.time()
                 frame = np.asanyarray(color_frame.get_data())
+                frame = grade_bgr_uint8(
+                    frame,
+                    temperature=self.color_temperature,
+                    saturation=self.color_saturation,
+                    contrast=self.color_contrast,
+                    hue_shift=self.color_hue_shift,
+                )
                 depth_img = None
                 if self.enable_depth:
                     depth_frame = frames.get_depth_frame()

@@ -186,6 +186,10 @@ class Arx5EnvBimanualRS(Arx5Env):
         rs_resolution=(640, 480),
         rs_fps: int = 30,
         enable_depth: bool = True,
+        rs_color_temperature: float = 0.0,
+        rs_color_saturation: float = 1.0,
+        rs_color_contrast: float = 1.0,
+        rs_color_hue_shift: float = 12.0,
     ):
         # Intentionally do not call Arx5Env.__init__ (different camera stack).
         output_dir = pathlib.Path(output_dir)
@@ -294,6 +298,11 @@ class Arx5EnvBimanualRS(Arx5Env):
         rs_recorder = VideoRecorder.create_h264(
             fps=int(rs_fps), input_pix_fmt="bgr24"
         )
+        print(
+            f"[Arx5EnvBimanualRS] D435 color grade: "
+            f"temp={rs_color_temperature:.2f} sat={rs_color_saturation:.2f} "
+            f"contrast={rs_color_contrast:.2f} hue={rs_color_hue_shift:.1f}"
+        )
         realsense_camera = RealSenseCamera(
             shm_manager=shm_manager,
             serial_number=rs_serial,
@@ -306,6 +315,10 @@ class Arx5EnvBimanualRS(Arx5Env):
             transform=rs_transform,
             video_recorder=rs_recorder,
             verbose=False,
+            color_temperature=float(rs_color_temperature),
+            color_saturation=float(rs_color_saturation),
+            color_contrast=float(rs_color_contrast),
+            color_hue_shift=float(rs_color_hue_shift),
         )
 
         camera = HybridMultiCamera(

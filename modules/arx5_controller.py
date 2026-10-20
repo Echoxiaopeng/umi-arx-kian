@@ -293,10 +293,26 @@ class Arx5Controller(mp.Process):
             print(f"[Arx5Controller] Controller process terminated at {self.pid}")
 
     def start_wait(self):
-        print(f"[Arx5Controller] Waiting for controller process to be ready")
-        print(f"{self.launch_timeout=}")
+        print(
+            f"[Arx5Controller] Waiting for controller process to be ready "
+            f"({self.robot_ip}:{self.robot_port})",
+            flush=True,
+        )
+        print(f"{self.launch_timeout=}", flush=True)
         self.ready_event.wait(self.launch_timeout)
-        assert self.is_alive()
+        assert self.is_alive(), (
+            f"[Arx5Controller] process died during launch "
+            f"({self.robot_ip}:{self.robot_port})"
+        )
+        if not self.is_ready:
+            print(
+                f"[Arx5Controller] WARNING: launch timeout "
+                f"({self.launch_timeout}s) but not ready yet "
+                f"({self.robot_ip}:{self.robot_port}). "
+                "常见原因: 该端口 ZMQ GET_STATE 卡住 / server 无响应。"
+                "（进程仍活着，外层会继续等）",
+                flush=True,
+            )
 
     def stop_wait(self):
         self.join()
@@ -1084,7 +1100,11 @@ class Arx5Controller(mp.Process):
                 if iter_idx == 0:
                     self.ready_event.set()
                     if self.verbose:
-                        print("[Arx5Controller] Controller process is ready")
+                        print(
+                            "[Arx5Controller] Controller process is ready "
+                            f"({self.robot_ip}:{self.robot_port})",
+                            flush=True,
+                        )
                 iter_idx += 1
                 # if self.verbose:
                 #     print(f"[Arx5Controller] Actual frequency {1/(time.monotonic() - t_now)} Hz")
