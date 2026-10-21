@@ -524,9 +524,12 @@ class Arx5Env:
         if self.action_accumulator is not None:
             self.action_accumulator.put(new_actions, new_timestamps)
 
-    def set_gravity_compensation(self):
+    def set_gravity_compensation(self, wait: bool = True, timeout: float = 5.0):
         for robot in self.robots:
-            robot.set_gravity_compensation()
+            try:
+                robot.set_gravity_compensation(wait=wait, timeout=timeout)
+            except TypeError:
+                robot.set_gravity_compensation()
 
     def set_end_control(self):
         for robot in self.robots:

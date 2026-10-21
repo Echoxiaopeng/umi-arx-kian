@@ -274,10 +274,11 @@ class Arx5Controller(mp.Process):
         self.robot_client: Arx5Client
         # self.robot_joint_port: Arx5Client
         self.reset_success = Value(ctypes.c_bool, False)
-        # 父进程在 set_end_control / restore_gains 后必须等待，否则会抢跑回程
+        # 父进程在 set_end_control / restore_gains / enter-drag 后必须等待，否则会抢跑
         # （日志：Moving to home 插在 gain_alpha_0.10 与 0.15 之间，from 读到 drag 前位姿）
         self.end_control_done = Value(ctypes.c_bool, True)
         self.restore_gains_done = Value(ctypes.c_bool, True)
+        self.gravity_compensation_done = Value(ctypes.c_bool, True)
 
     # ========= launch method ===========
     def start(self, wait=True):
@@ -422,9 +423,18 @@ class Arx5Controller(mp.Process):
             time.sleep(0.1)
 
     
-    def set_gravity_compensation(self):
+    def set_gravity_compensation(self, wait: bool = True, timeout: float = 5.0):
+        """进入拖拽/零力；默认等待控制器真正切完，避免回 init 后立刻调用却未生效。"""
+        self.gravity_compensation_done.value = False
         message = {"cmd": Command.SET_GRAVITY_COMPENSATION.value}
         self.input_queue.put(message)
+        if wait:
+            t0 = time.time()
+            while not self.gravity_compensation_done.value:
+                if time.time() - t0 > timeout:
+                    print("[Arx5Controller] set_gravity_compensation wait timeout")
+                    break
+                time.sleep(0.02)
 
     def set_end_control(self, wait: bool = True, timeout: float = 5.0):
         """退出零力：同步当前位置，升到中等轨迹增益，重建插值器。"""
@@ -804,106 +814,112 @@ class Arx5Controller(mp.Process):
 
                     elif cmd == Command.SET_GRAVITY_COMPENSATION.value:
                         # 优先真零力；ac_one / 普通 zmq_server 不支持时回退到阻尼拖拽
-                        print_drag_diag("enter_drag.before")
-                        entered = False
-                        drag_gripper_vel_hist = [0.0] * 5
                         try:
-                            self.robot_client.set_gravity_compensation(True)
-                            # 真零力路径也要把夹爪位置环清零，否则墙力矩会被 kp 顶住
+                            print_drag_diag("enter_drag.before")
+                            entered = False
+                            drag_gripper_vel_hist = [0.0] * 5
                             try:
-                                g_gc = self.robot_client.get_gain()
-                                g_gc = {
-                                    "kp": np.asarray(g_gc["kp"], dtype=np.float64),
-                                    "kd": np.asarray(g_gc["kd"], dtype=np.float64),
-                                    "gripper_kp": 0.0,
-                                    "gripper_kd": 0.0,
-                                }
-                                self.robot_client.set_gain(g_gc)
-                            except Exception as grip_gain_exc:
-                                print(
-                                    "[Arx5Controller] zero gripper gain after GC "
-                                    f"warning: {grip_gain_exc}"
-                                )
-                            is_gravity_compensation = True
-                            entered = True
-                            print("[Arx5Controller] set_gravity_compensation -> True")
-                        except Exception as e:
-                            print(
-                                "[Arx5Controller] SET_GRAVITY_COMPENSATION unsupported "
-                                f"({e}); falling back to SET_TO_DAMPING drag."
-                            )
-                            try:
-                                saved_gain_before_drag = self.robot_client.get_gain()
+                                self.robot_client.set_gravity_compensation(True)
+                                # 真零力路径也要把夹爪位置环清零，否则墙力矩会被 kp 顶住
                                 try:
-                                    _sync_measured_tcp_gripper(self.robot_client)
+                                    g_gc = self.robot_client.get_gain()
+                                    g_gc = {
+                                        "kp": np.asarray(g_gc["kp"], dtype=np.float64),
+                                        "kd": np.asarray(g_gc["kd"], dtype=np.float64),
+                                        "gripper_kp": 0.0,
+                                        "gripper_kd": 0.0,
+                                    }
+                                    self.robot_client.set_gain(g_gc)
+                                except Exception as grip_gain_exc:
+                                    print(
+                                        "[Arx5Controller] zero gripper gain after GC "
+                                        f"warning: {grip_gain_exc}"
+                                    )
+                                is_gravity_compensation = True
+                                entered = True
+                                print("[Arx5Controller] set_gravity_compensation -> True")
+                            except Exception as e:
+                                print(
+                                    "[Arx5Controller] SET_GRAVITY_COMPENSATION unsupported "
+                                    f"({e}); falling back to SET_TO_DAMPING drag."
+                                )
+                                try:
+                                    saved_gain_before_drag = self.robot_client.get_gain()
+                                    try:
+                                        _sync_measured_tcp_gripper(self.robot_client)
+                                    except Exception as sync_exc:
+                                        print(
+                                            "[Arx5Controller] pre-damping tcp/gripper "
+                                            f"sync warning: {sync_exc}"
+                                        )
+                                    self.robot_client.set_to_damping()
+                                    # 阻尼拖拽：臂 kp=0、kd 缩小；夹爪 kp=0 + 力矩辅助手捏
+                                    gain = self.robot_client.get_gain()
+                                    soft = {
+                                        "kp": np.zeros_like(
+                                            np.asarray(gain["kp"], dtype=np.float64)
+                                        ),
+                                        "kd": (
+                                            np.asarray(gain["kd"], dtype=np.float64)
+                                            * float(DRAG_ARM_KD_SCALE)
+                                        ),
+                                        "gripper_kp": 0.0,
+                                        "gripper_kd": 0.0,
+                                    }
+                                    self.robot_client.set_gain(soft)
+                                    is_gravity_compensation = True  # 停发 TCP，允许拖动
+                                    entered = True
+                                    print_drag_diag(
+                                        "enter_drag.after_damping_soft",
+                                        gain_override=soft,
+                                    )
+                                    print(
+                                        "[Arx5Controller] damping drag ON "
+                                        f"(arm kp=0, kd*={DRAG_ARM_KD_SCALE}; "
+                                        "gripper kp=0 + torque assist). "
+                                        "Squeeze gripper by hand."
+                                    )
+                                except Exception as e2:
+                                    is_gravity_compensation = False
+                                    saved_gain_before_drag = None
+                                    print(
+                                        f"[Arx5Controller] damping drag FAILED: {e2}"
+                                    )
+                            if entered:
+                                try:
+                                    self.robot_client.sync_after_drag()
                                 except Exception as sync_exc:
                                     print(
-                                        "[Arx5Controller] pre-damping tcp/gripper "
-                                        f"sync warning: {sync_exc}"
+                                        "[Arx5Controller] enter-drag sync warning: "
+                                        f"{sync_exc}"
                                     )
-                                self.robot_client.set_to_damping()
-                                # 阻尼拖拽：臂 kp=0、kd 缩小；夹爪 kp=0 + 力矩辅助手捏
-                                gain = self.robot_client.get_gain()
-                                soft = {
-                                    "kp": np.zeros_like(
-                                        np.asarray(gain["kp"], dtype=np.float64)
-                                    ),
-                                    "kd": (
-                                        np.asarray(gain["kd"], dtype=np.float64)
-                                        * float(DRAG_ARM_KD_SCALE)
-                                    ),
-                                    "gripper_kp": 0.0,
-                                    "gripper_kd": 0.0,
-                                }
-                                self.robot_client.set_gain(soft)
-                                is_gravity_compensation = True  # 停发 TCP，允许拖动
-                                entered = True
-                                print_drag_diag(
-                                    "enter_drag.after_damping_soft", gain_override=soft
-                                )
+                                try:
+                                    g_now = self.robot_client.get_gain()
+                                    parts = ["follow"]
+                                    if DRAG_GRIPPER_REBOUND_ENABLE:
+                                        parts.append("rebound")
+                                    if DRAG_GRIPPER_WALL_ENABLE:
+                                        parts.append("wall")
+                                    print(
+                                        "[Arx5Controller] drag gain check: "
+                                        f"gripper_kp={float(g_now['gripper_kp']):.4f} "
+                                        f"gripper_kd={float(g_now['gripper_kd']):.4f} "
+                                        f"assist={'+'.join(parts)} "
+                                        f"open={DRAG_GRIPPER_FRICTION_OPEN} "
+                                        f"close={DRAG_GRIPPER_FRICTION_CLOSE} "
+                                        f"rebound_lo={DRAG_GRIPPER_REBOUND_LO}/"
+                                        f"{DRAG_GRIPPER_REBOUND_TAU}"
+                                    )
+                                except Exception:
+                                    pass
+                            if not entered:
                                 print(
-                                    "[Arx5Controller] damping drag ON "
-                                    f"(arm kp=0, kd*={DRAG_ARM_KD_SCALE}; "
-                                    "gripper kp=0 + torque assist). "
-                                    "Squeeze gripper by hand."
+                                    "  Hint: start zmq_server_gravity_compensation.py, "
+                                    "or collect with --no_zero_force (skip P)."
                                 )
-                            except Exception as e2:
-                                is_gravity_compensation = False
-                                saved_gain_before_drag = None
-                                print(f"[Arx5Controller] damping drag FAILED: {e2}")
-                        if entered:
-                            try:
-                                self.robot_client.sync_after_drag()
-                            except Exception as sync_exc:
-                                print(
-                                    "[Arx5Controller] enter-drag sync warning: "
-                                    f"{sync_exc}"
-                                )
-                            try:
-                                g_now = self.robot_client.get_gain()
-                                parts = ["follow"]
-                                if DRAG_GRIPPER_REBOUND_ENABLE:
-                                    parts.append("rebound")
-                                if DRAG_GRIPPER_WALL_ENABLE:
-                                    parts.append("wall")
-                                print(
-                                    "[Arx5Controller] drag gain check: "
-                                    f"gripper_kp={float(g_now['gripper_kp']):.4f} "
-                                    f"gripper_kd={float(g_now['gripper_kd']):.4f} "
-                                    f"assist={'+'.join(parts)} "
-                                    f"open={DRAG_GRIPPER_FRICTION_OPEN} "
-                                    f"close={DRAG_GRIPPER_FRICTION_CLOSE} "
-                                    f"rebound_lo={DRAG_GRIPPER_REBOUND_LO}/"
-                                    f"{DRAG_GRIPPER_REBOUND_TAU}"
-                                )
-                            except Exception:
-                                pass
-                        if not entered:
-                            print(
-                                "  Hint: start zmq_server_gravity_compensation.py, "
-                                "or collect with --no_zero_force (skip P)."
-                            )
-                        self.waypoint_buffer = []
+                            self.waypoint_buffer = []
+                        finally:
+                            self.gravity_compensation_done.value = True
 
                     elif cmd == Command.SET_END_CONTROL.value:
                         # 日志结论：sync 后先抬 kp 时，臂被猛拉向 home（qd 0.06→3.7）。
@@ -912,6 +928,11 @@ class Arx5Controller(mp.Process):
                         # 且不要在拖拽点拉满 kp；只用中等轨迹增益，满增益延后。
                         try:
                             print_drag_diag("exit_drag.request_received")
+                            # 若此前是真零力，先关 GC，避免回程/再进拖拽时 server 状态脏
+                            try:
+                                self.robot_client.set_gravity_compensation(False)
+                            except Exception:
+                                pass
                             settle_deadline = time.monotonic() + 0.5
                             settled_samples = 0
                             while time.monotonic() < settle_deadline:

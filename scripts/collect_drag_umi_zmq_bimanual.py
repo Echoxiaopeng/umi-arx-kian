@@ -68,6 +68,7 @@ D435 画面预处理（训练 / 推理必须一致）
 键盘: 与 collect_drag_umi_zmq.py 相同（P/C/S/D/E/I/Q），另加 R=回放已保存 episode。
 拖拽手势: P 进零力后，连续两次开合 can1（默认 robot1/右臂）夹爪 → 开始采集；
           再连续两次开合 → 保存 episode（手势本身不写入 zarr）。
+保存后（夹爪手势或键盘 S）: 缓动回 init，再重新进入拖拽模式。
 左右臂共用同一组 --init_delta / --init_gripper_delta（各自相对 home）。
 
 输出:
@@ -1554,6 +1555,18 @@ def leave_zero_force_to_init(
             print(f"restore_gains_after_drag warning: {exc}")
 
 
+def enter_drag_mode(env: Arx5EnvWithImages) -> None:
+    """进入拖拽/零力，并等待控制器真正切完（保存回 init 后自动再进依赖此等待）。"""
+    print("Entering drag mode...")
+    env.set_gravity_compensation()
+    # 伺服模式切换后再给一小段稳定时间
+    time.sleep(0.25)
+    print(
+        "Drag mode ON (gravity if supported, else damping). "
+        "Drag arm freely; squeeze gripper by hand (torque assist)."
+    )
+
+
 def leave_drag_before_quit(
     env: Arx5EnvWithImages,
     *,
@@ -2635,7 +2648,7 @@ def run_collect_session(
         print(
             f"  grip_gesture: robot{int(grip_gesture_robot)} (can1) "
             f"double open-close within {float(grip_gesture_window):.2f}s "
-            "→ start / save (gesture trimmed from zarr)"
+            "→ start / save (trimmed); S/gesture save → init then drag"
         )
     if web:
         print(f"  web        : http://{web_host}:{web_port}/  (no_cv={no_cv})")
@@ -3254,16 +3267,10 @@ def run_collect_session(
                             continue
                         if action == "drag_toggle":
                             if not zero_force_active:
-                                env.set_gravity_compensation()
+                                enter_drag_mode(env)
                                 zero_force_active = True
                                 if grip_detector is not None:
                                     grip_detector.reset()
-                                print(
-                                    "Drag mode ON (gravity if supported, else damping). "
-                                    "Drag arm freely; squeeze gripper by hand "
-                                    "(torque assist)."
-                                )
-                                if grip_detector is not None:
                                     print(
                                         f"Double open-close robot{grip_robot_idx} "
                                         "gripper to START recording "
@@ -3431,15 +3438,13 @@ def run_collect_session(
                             if key_stroke == KeyCode(char="p"):
                                 step_replay = None
                                 if not zero_force_active:
-                                    env.set_gravity_compensation()
+                                    enter_drag_mode(env)
                                     zero_force_active = True
                                     if grip_detector is not None:
                                         grip_detector.reset()
                                     print(
-                                        "Drag mode ON (gravity if supported, else damping). "
-                                        "Drag arm freely; squeeze gripper by hand "
-                                        "(torque assist). Press P again to exit and "
-                                        "return to init, or C to record."
+                                        "Press P again to exit and return to init, "
+                                        "or C to record."
                                     )
                                     if grip_detector is not None:
                                         print(
@@ -3918,23 +3923,74 @@ def run_collect_session(
                                     )
                                 if grip_detector is not None:
                                     grip_detector.reset()
+
+                                # 保存后（S / 夹爪手势 / 超时）: 回 init，再重新进拖拽
+                                if web_state is not None:
+                                    web_state.update(
+                                        mode="SAVING",
+                                        recording=False,
+                                        message=(
+                                            f"已保存 episode {episode_id}，"
+                                            "正在回 init…"
+                                            if ok
+                                            else (
+                                                f"保存 episode {episode_id} 失败，"
+                                                "正在回 init…"
+                                            )
+                                        ),
+                                    )
+                                print(
+                                    "Save done — return to init, then re-enter drag..."
+                                )
+                                leave_zero_force_to_init(
+                                    env,
+                                    init_targets,
+                                    frequency=frequency,
+                                    duration=init_duration,
+                                )
+                                # 与 --no_zero_force 无关：保存回 init 后一律重新进拖拽
+                                # （该 flag 只表示「开录不必先按 P」，不是「保存后不要拖拽」）
+                                zero_force_active = False
+                                time.sleep(0.15)
+                                enter_drag_mode(env)
+                                zero_force_active = True
+                                if grip_detector is not None:
+                                    grip_detector.reset()
+                                print(
+                                    "Returned to init and re-entered drag. "
+                                    f"Double open-close robot{grip_robot_idx} "
+                                    "gripper to START (or press C)."
+                                )
+
                                 if web_state is not None:
                                     web_state.clear_live_series()
                                     web_state.update(
-                                        mode="READY" if no_zero_force else (
-                                            "DRAG" if zero_force_active else "IDLE"
+                                        mode=(
+                                            "DRAG"
+                                            if zero_force_active
+                                            else (
+                                                "READY"
+                                                if no_zero_force
+                                                else "IDLE"
+                                            )
                                         ),
                                         recording=False,
+                                        zero_force_active=bool(zero_force_active),
                                         n_episodes=int(env.replay_buffer.n_episodes),
                                         n_steps=0,
                                         t_elapsed=0.0,
                                         message=(
-                                            f"已保存 episode {episode_id}"
+                                            (
+                                                f"已保存 episode {episode_id}，"
+                                                "已回 init并进入拖拽"
+                                            )
                                             if ok
-                                            else f"保存 episode {episode_id} 失败（无有效帧）"
+                                            else (
+                                                f"保存 episode {episode_id} "
+                                                "失败（无有效帧），已回 init并进入拖拽"
+                                            )
                                         ),
                                     )
-                                # 保存后仍保持零力，可直接再按 C / 双开合 录下一条
                                 break
 
                             precise_wait(t_cycle_end, time_func=time.monotonic)
@@ -3952,11 +4008,6 @@ def run_collect_session(
                         print(
                             "Ready for next episode. Press C or double open-close "
                             f"robot{grip_robot_idx} gripper to start, "
-                            "R to replay, E to delete, or Q to quit.\n"
-                        )
-                    elif no_zero_force:
-                        print(
-                            "Ready for next episode. Press C to start, "
                             "R to replay, E to delete, or Q to quit.\n"
                         )
                     else:
