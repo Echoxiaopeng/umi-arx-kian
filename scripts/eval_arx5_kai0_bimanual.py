@@ -3,27 +3,31 @@
 
 The policy server runs separately from the Kai0 repository. This client:
 
-1. reads left wrist + center D435 + right wrist images;
-2. reads both arms' six joints and gripper widths;
-3. sends the Kai0 observation over websocket;
-4. receives ``[T, 14]`` absolute joint actions;
-5. optionally schedules a guarded prefix on both arms via
-   ``schedule_joint_waypoint`` (timestamped joint waypoints).
+1. on start: ``reset_to_home`` then joint-space init (median episode-0 joints
+   from ``collect_bimanual_10_22``);
+2. reads left wrist + center D435 + right wrist images;
+3. reads both arms' six joints and gripper widths;
+4. sends the Kai0 observation over websocket;
+5. receives ``[T, 14]`` absolute joint actions;
+6. schedules a guarded prefix via ``schedule_joint_waypoint``.
 
+ZMQ servers should start with ``--joint`` (Kai0 is joint throughout).
 Example:
 
+    python python/communication/zmq_server.py X5_umi can0 --port 8765 --joint --no-idle-reset-home --no_cmd_timeout 0
+    python python/communication/zmq_server.py X5_umi can1 --port 8766 --joint --no-idle-reset-home --no_cmd_timeout 0
+
     conda activate umi-arx
-    cd /home/lenovo/kian/umi-arx-kian
-    python scripts/eval_arx5_kai0_bimanual.py \
-      --policy-ip 127.0.0.1 --policy-port 8000 \
-      --robot-ports 8765,8766 --camera-reorder 0,1
+    python scripts/eval_arx5_kai0_bimanual.py \\
+      --policy-ip 127.0.0.1 --policy-port 8000 \\
+      --robot-ports 8765,8766 --camera-reorder 0,1 --no-preview
 
 Controls: C=start execution, S=stop/hold, I=infer once without motion, Q=quit.
-Execution is disabled at startup. Use ``--observe-only`` to permanently disable it.
 """
 
 from __future__ import annotations
 
+import os
 import select
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
@@ -48,6 +52,12 @@ from openpi_client.websocket_client_policy import WebsocketClientPolicy  # noqa:
 
 DEFAULT_PROMPT = "Flatten and fold the cloth."
 ACTION_DIM = 14
+# Median first-frame joints from collect_bimanual_10_22 (91/100 inliers).
+# Order: left q6, left grip, right q6, right grip.
+DEFAULT_INIT_JOINTS = (
+    "0.024986,0.637255,0.694095,-0.620852,0.026380,-0.052849,0.083843,"
+    "0.051690,0.633059,0.692569,-0.632296,0.068475,0.029945,0.067379"
+)
 
 
 class TerminalKeys:
@@ -84,7 +94,13 @@ def parse_pair(text: str, name: str) -> list[int]:
     return values
 
 
-def robot_config(robot_ip: str, ports: list[int], obs_latency: float) -> list[dict]:
+def robot_config(
+    robot_ip: str,
+    ports: list[int],
+    obs_latency: float,
+    *,
+    reset_to_home_on_start: bool,
+) -> list[dict]:
     return [
         {
             "robot_type": "arx5",
@@ -96,11 +112,78 @@ def robot_config(robot_ip: str, ports: list[int], obs_latency: float) -> list[di
             "height_threshold": 0.0,
             "sphere_radius": 0.1,
             "sphere_center": [0, -0.06, -0.185],
-            # Starting this inference client must not move either arm.
-            "reset_to_home_on_start": False,
+            # Home first, then joint-space move to dataset init.
+            "reset_to_home_on_start": bool(reset_to_home_on_start),
         }
         for port in ports
     ]
+
+
+def ease_in_out_quad(t: float) -> float:
+    t *= 2.0
+    if t < 1.0:
+        return 0.5 * t * t
+    t -= 1.0
+    return -0.5 * (t * (t - 2.0) - 1.0)
+
+
+def parse_init_joints(text: str) -> np.ndarray:
+    vals = [float(v) for v in str(text).split(",") if str(v).strip() != ""]
+    if len(vals) != ACTION_DIM:
+        raise click.BadParameter(
+            f"--init-joints needs {ACTION_DIM} values "
+            f"(left q6+grip, right q6+grip), got {len(vals)}"
+        )
+    return np.asarray(vals, dtype=np.float64)
+
+
+def move_to_init_joints(
+    env: Arx5EnvWithImages,
+    target14: np.ndarray,
+    *,
+    frequency: float,
+    duration: float,
+    gripper_min: float,
+    gripper_max: float,
+) -> None:
+    """Interpolate both arms in joint space to dataset init (needs --joint ZMQ)."""
+    target14 = np.asarray(target14, dtype=np.float64).reshape(ACTION_DIM)
+    target14[6] = float(np.clip(target14[6], gripper_min, gripper_max))
+    target14[13] = float(np.clip(target14[13], gripper_min, gripper_max))
+
+    current = measured_state(env).astype(np.float64)
+    print(
+        "Joint init (collect_bimanual_10_22 ep0 median):\n"
+        f"  from {np.array2string(current, precision=4, separator=',')}\n"
+        f"    to {np.array2string(target14, precision=4, separator=',')}"
+    )
+
+    dt = 1.0 / float(frequency)
+    steps = max(2, int(float(duration) * float(frequency)))
+    actions = np.zeros((steps, ACTION_DIM), dtype=np.float64)
+    for k in range(steps):
+        a = ease_in_out_quad(k / (steps - 1))
+        actions[k] = current + a * (target14 - current)
+        actions[k, 6] = float(np.clip(actions[k, 6], gripper_min, gripper_max))
+        actions[k, 13] = float(np.clip(actions[k, 13], gripper_min, gripper_max))
+    timestamps = np.arange(steps, dtype=np.float64) * dt + (time.time() + 0.2)
+    try:
+        command_joint_actions(env, actions, timestamps)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "Joint init failed (needs ZMQ --joint / SET_JOINT_POSITION). "
+            "Restart zmq_server WITH --joint, e.g.\n"
+            "  python python/communication/zmq_server.py X5_umi can0 "
+            "--port 8765 --joint --no-idle-reset-home --no_cmd_timeout 0\n"
+            f"Underlying error: {exc}"
+        ) from exc
+    time.sleep(float(duration) + 0.3)
+    after = measured_state(env).astype(np.float64)
+    err = np.abs(after - target14)
+    print(
+        f"Joint init done. |after-target| max={err.max():.4f} "
+        f"joints_max={err[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]].max():.4f}"
+    )
 
 
 def measured_state(env: Arx5EnvWithImages) -> np.ndarray:
@@ -193,7 +276,9 @@ def hold_current(env: Arx5EnvWithImages) -> None:
         np.asarray([time.time() + 0.05], dtype=np.float64),
     )
 
-def show_preview(obs: dict, status: str) -> None:
+def show_preview(obs: dict, status: str, *, enabled: bool) -> None:
+    if not enabled:
+        return
     views = [
         np.asarray(obs[f"camera{index}_rgb"][-1], dtype=np.uint8)
         for index in (0, 1, 2)
@@ -230,6 +315,32 @@ def show_preview(obs: dict, status: str) -> None:
 @click.option("--robot-obs-latency", default=0.1867, type=float, show_default=True)
 @click.option("--server-timeout", default=600.0, type=float, show_default=True)
 @click.option("--observe-only", is_flag=True, help="Never command either arm.")
+@click.option(
+    "--no-preview",
+    is_flag=True,
+    help="Disable OpenCV window (required over SSH without X11/DISPLAY).",
+)
+@click.option(
+    "--no-init",
+    is_flag=True,
+    help="Skip reset_to_home and joint init (stay at current pose).",
+)
+@click.option(
+    "--init-joints",
+    default=DEFAULT_INIT_JOINTS,
+    show_default=False,
+    help=(
+        "Absolute init joints: left q6,left grip,right q6,right grip. "
+        "Default = median episode-0 from collect_bimanual_10_22."
+    ),
+)
+@click.option(
+    "--init-duration",
+    default=2.5,
+    type=float,
+    show_default=True,
+    help="Joint init move duration (seconds)",
+)
 @click.option("--output", default="data_local/kai0_eval", show_default=True)
 def main(
     policy_ip: str,
@@ -248,6 +359,10 @@ def main(
     robot_obs_latency: float,
     server_timeout: float,
     observe_only: bool,  # noqa: FBT001
+    no_preview: bool,  # noqa: FBT001
+    no_init: bool,  # noqa: FBT001
+    init_joints: str,
+    init_duration: float,
     output: str,
 ) -> None:
     if frequency <= 0 or max_joint_speed <= 0:
@@ -275,10 +390,34 @@ def main(
     dt = 1.0 / frequency
     max_joint_step = max_joint_speed * dt
     executing = False
+    preview_enabled = (not no_preview) and bool(os.environ.get("DISPLAY"))
+    if no_preview:
+        print("Preview disabled (--no-preview)")
+    elif not preview_enabled:
+        print(
+            "Preview disabled: DISPLAY is unset (SSH/headless). "
+            "Use a local desktop, export DISPLAY, or pass --no-preview."
+        )
+
+    init_q14 = None if no_init else parse_init_joints(init_joints)
+    do_home = not no_init
+    if no_init:
+        print("Init skipped (--no-init): arms stay at current pose")
+    else:
+        print(
+            f"Startup init: joint reset_to_home + joint init "
+            f"({init_duration:.1f}s) from collect_bimanual_10_22 ep0 median"
+        )
+        print("NOTE: ZMQ must be --joint (joint-space home + SET_JOINT_*).")
 
     with SharedMemoryManager() as shm_manager, Arx5EnvWithImages(
         output_dir=output_path,
-        robots_config=robot_config(robot_ip, ports, robot_obs_latency),
+        robots_config=robot_config(
+            robot_ip,
+            ports,
+            robot_obs_latency,
+            reset_to_home_on_start=do_home,
+        ),
         frequency=frequency,
         obs_image_resolution=(224, 224),
         max_obs_buffer_size=120,
@@ -297,6 +436,17 @@ def main(
         while not env.is_ready:
             time.sleep(0.1)
         print("Environment ready")
+
+        if init_q14 is not None:
+            time.sleep(0.5)  # let joint reset_to_home settle
+            move_to_init_joints(
+                env,
+                init_q14,
+                frequency=frequency,
+                duration=float(init_duration),
+                gripper_min=gripper_min,
+                gripper_max=gripper_max,
+            )
 
         try:
             while True:
@@ -324,6 +474,7 @@ def main(
                     "EXECUTING  S:stop Q:quit"
                     if executing
                     else "HOLD  C:start I:infer Q:quit",
+                    enabled=preview_enabled,
                 )
                 if not executing and not requested_infer:
                     time.sleep(0.02)
@@ -372,7 +523,8 @@ def main(
                 hold_current(env)
             except Exception as exc:  # noqa: BLE001
                 print(f"Final hold warning: {exc}")
-            cv2.destroyAllWindows()
+            if preview_enabled:
+                cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

@@ -639,9 +639,15 @@ class Arx5Controller(mp.Process):
                         self.robot_client.set_tcp_pose(pose_cmd, gripper_cmd)
                     except Exception as e:
                         # ZMQ: consecutive EE pose L2 must be < 0.1；
-                        # 或尚未 RESET_TO_HOME。单次失败不应打死控制器进程。
+                        # 尚未 RESET_TO_HOME；或服务器是 --joint（无 SET_EE_POSE）。
+                        # 单次失败不应打死控制器进程。
                         msg = str(e)
-                        if "RESET_TO_HOME" in msg:
+                        if (
+                            "RESET_TO_HOME" in msg
+                            or "--joint" in msg
+                            or "SET_EE_POSE" in msg
+                            or "cartesian server" in msg
+                        ):
                             allow_ee_pose = False
                         if time.monotonic() - _ee_pose_fail_t > 1.0:
                             _ee_pose_fail_t = time.monotonic()
