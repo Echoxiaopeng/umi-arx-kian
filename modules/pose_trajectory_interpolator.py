@@ -208,3 +208,152 @@ class PoseTrajectoryInterpolator:
         if is_single:
             pose = pose[0]
         return pose
+
+
+class JointTrajectoryInterpolator:
+    """Linear interpolator for joint (+ gripper) waypoints with schedule_waypoint semantics."""
+
+    def __init__(self, times: np.ndarray, joints: np.ndarray):
+        assert len(times) >= 1
+        assert len(joints) == len(times)
+        if not isinstance(times, np.ndarray):
+            times = np.array(times)
+        if not isinstance(joints, np.ndarray):
+            joints = np.array(joints)
+        joints = np.asarray(joints, dtype=np.float64)
+        if joints.ndim == 1:
+            joints = joints.reshape(1, -1)
+        assert joints.ndim == 2
+
+        if len(times) == 1:
+            self.single_step = True
+            self._times = times
+            self._joints = joints
+            self._dim = joints.shape[1]
+        else:
+            self.single_step = False
+            assert np.all(times[1:] >= times[:-1])
+            self._dim = joints.shape[1]
+            self.joint_interp = si.interp1d(
+                times, joints, axis=0, assume_sorted=True
+            )
+
+    @property
+    def times(self) -> np.ndarray:
+        if self.single_step:
+            return self._times
+        return self.joint_interp.x
+
+    @property
+    def joints(self) -> np.ndarray:
+        if self.single_step:
+            return self._joints
+        return np.asarray(self.joint_interp.y, dtype=np.float64)
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def trim(self, start_t: float, end_t: float) -> "JointTrajectoryInterpolator":
+        assert start_t <= end_t
+        times = self.times
+        should_keep = (start_t < times) & (times < end_t)
+        keep_times = times[should_keep]
+        all_times = np.unique(np.concatenate([[start_t], keep_times, [end_t]]))
+        all_joints = self(all_times)
+        if all_joints.ndim == 1:
+            all_joints = all_joints.reshape(1, -1)
+        return JointTrajectoryInterpolator(times=all_times, joints=all_joints)
+
+    def drive_to_waypoint(
+        self, joint, time, curr_time, max_joint_speed=np.inf
+    ) -> "JointTrajectoryInterpolator":
+        assert max_joint_speed > 0
+        time = max(time, curr_time)
+        curr_joint = np.asarray(self(curr_time), dtype=np.float64).reshape(-1)
+        joint = np.asarray(joint, dtype=np.float64).reshape(-1)
+        assert joint.shape == curr_joint.shape
+        dist = float(np.linalg.norm(joint - curr_joint))
+        duration = max(time - curr_time, dist / max_joint_speed)
+        assert duration >= 0
+        last_waypoint_time = curr_time + duration
+        trimmed_interp = self.trim(curr_time, curr_time)
+        times = np.append(trimmed_interp.times, [last_waypoint_time], axis=0)
+        joints = np.append(trimmed_interp.joints, [joint], axis=0)
+        return JointTrajectoryInterpolator(times, joints)
+
+    def schedule_waypoint(
+        self,
+        joint,
+        time,
+        max_joint_speed=np.inf,
+        curr_time=None,
+        last_waypoint_time=None,
+    ) -> "JointTrajectoryInterpolator":
+        assert max_joint_speed > 0
+        if last_waypoint_time is not None:
+            assert curr_time is not None
+
+        start_time = self.times[0]
+        end_time = self.times[-1]
+        assert start_time <= end_time
+
+        if curr_time is not None:
+            if time <= curr_time:
+                return self
+            start_time = max(curr_time, start_time)
+            if last_waypoint_time is not None:
+                if time <= last_waypoint_time:
+                    end_time = curr_time
+                else:
+                    end_time = max(last_waypoint_time, curr_time)
+            else:
+                end_time = curr_time
+
+        end_time = min(end_time, time)
+        start_time = min(start_time, end_time)
+        assert start_time <= end_time
+        assert end_time <= time
+        if last_waypoint_time is not None:
+            if time <= last_waypoint_time:
+                assert end_time == curr_time
+            else:
+                assert end_time == max(last_waypoint_time, curr_time)
+        if curr_time is not None:
+            assert curr_time <= start_time
+            assert curr_time <= time
+
+        trimmed_interp = self.trim(start_time, end_time)
+        duration = time - end_time
+        end_joint = np.asarray(trimmed_interp(end_time), dtype=np.float64).reshape(-1)
+        joint = np.asarray(joint, dtype=np.float64).reshape(-1)
+        assert joint.shape == end_joint.shape
+        dist = float(np.linalg.norm(joint - end_joint))
+        duration = max(duration, dist / max_joint_speed)
+        assert duration >= 0
+        insert_time = end_time + duration
+        times = np.append(trimmed_interp.times, [insert_time], axis=0)
+        joints = np.append(trimmed_interp.joints, [joint], axis=0)
+        return JointTrajectoryInterpolator(times, joints)
+
+    def __call__(self, t: Union[float, np.ndarray]) -> np.ndarray:
+        is_single = False
+        if isinstance(t, (int, float, numbers.Real)):
+            is_single = True
+            t = np.array([float(t)])
+        elif not isinstance(t, np.ndarray):
+            t = np.asarray(t, dtype=np.float64)
+
+        if self.single_step:
+            joints = np.broadcast_to(self._joints[0], (len(t), self._dim)).copy()
+        else:
+            start_time = self.times[0]
+            end_time = self.times[-1]
+            t = np.clip(t, start_time, end_time)
+            joints = np.asarray(self.joint_interp(t), dtype=np.float64)
+            if joints.ndim == 1:
+                joints = joints.reshape(1, -1)
+
+        if is_single:
+            return joints[0]
+        return joints

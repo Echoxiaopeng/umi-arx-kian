@@ -342,6 +342,9 @@ class Arx5EnvBimanualRS(Arx5Env):
                     robot_port=rc["robot_port"],
                     frequency=200,
                     receive_latency=float(rc.get("robot_obs_latency", 0.0)),
+                    reset_to_home_on_start=bool(
+                        rc.get("reset_to_home_on_start", True)
+                    ),
                     verbose=True,
                 )
             )

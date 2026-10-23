@@ -176,10 +176,19 @@ class Arx5Client:
 
     def get_state(self):
         reply_msg = self.send_recv({"cmd": "GET_STATE", "data": None})
-        assert reply_msg["cmd"] == "GET_STATE"
-        assert isinstance(reply_msg["data"], dict)
+        if reply_msg.get("cmd") != "GET_STATE":
+            raise RuntimeError(
+                f"GET_STATE bad reply from {self.zmq_ip}:{self.zmq_port}: {reply_msg!r}. "
+                "ZMQ REP is often desynced after a crashed client — restart both "
+                "zmq_server processes (--joint), then retry."
+            )
         if reply_msg["data"] == "KeyboardInterrupt" or reply_msg["data"] == "ZMQError":
             return self.latest_state
+        if not isinstance(reply_msg["data"], dict):
+            raise RuntimeError(
+                f"GET_STATE data is not a dict from {self.zmq_ip}:{self.zmq_port}: "
+                f"{reply_msg!r}"
+            )
         state = cast(
             dict[str, Union[npt.NDArray[np.float64], float]], reply_msg["data"]
         )

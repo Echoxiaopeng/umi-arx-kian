@@ -7,7 +7,10 @@ from utils.other_util import precise_wait
 from shared_memory.shared_memory_queue import SharedMemoryQueue, Empty
 from shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
 
-from modules.pose_trajectory_interpolator import PoseTrajectoryInterpolator
+from modules.pose_trajectory_interpolator import (
+    JointTrajectoryInterpolator,
+    PoseTrajectoryInterpolator,
+)
 import time
 from modules.arx5_zmq_client import Arx5Client
 import numpy.typing as npt
@@ -29,6 +32,7 @@ class Command(enum.Enum):
     SET_TO_DAMPING = 9
     SET_END_CONTROL = 10
     RESTORE_GAINS_AFTER_DRAG = 11
+    SCHEDULE_JOINT_WAYPOINT = 12
 
 
 # 拖拽夹爪：轻回弹 + 跟手；旧硬墙默认关（曾偏猛）。
@@ -214,6 +218,7 @@ class Arx5Controller(mp.Process):
         get_max_k: Optional[int] = None,
         verbose: bool = False,
         receive_latency: float = 0.0,
+        reset_to_home_on_start: bool = True,
     ):
         super().__init__(name="Arx5Controller")
         self.robot_ip = robot_ip
@@ -224,7 +229,7 @@ class Arx5Controller(mp.Process):
             "cmd": Command.SERVOL.value,
             "target_pose": np.zeros((6,), dtype=np.float64),
             "gripper_pos": 0.0,
-            # "joint_angles": np.zeros((7,), dtype=np.float64),
+            "joint_angles": np.zeros((7,), dtype=np.float64),
             # "joint_traj": np.zeros((10, 7), dtype=np.float64),  # optional
             # "timestamps": np.zeros((10,), dtype=np.float64),  # optional
             "duration": 0.0,
@@ -269,6 +274,7 @@ class Arx5Controller(mp.Process):
         self.receive_keys = receive_keys
         self.frequency = frequency
         self.receive_latency = receive_latency
+        self.reset_to_home_on_start = bool(reset_to_home_on_start)
 
         # Will be initialized in the subprocess
         self.robot_client: Arx5Client
@@ -379,9 +385,9 @@ class Arx5Controller(mp.Process):
         self, joint_angles: npt.NDArray[np.float64], target_time: float
     ):
         """
-        设置关节角目标 (joint-space control)
-        joint_angles: 7个关节角（弧度）
-        target_time:  目标执行时间（Unix时间戳）
+        设置关节角目标 (joint-space control)。
+        joint_angles: 6 关节 + 夹爪，shape=(7,)
+        target_time:  Unix 墙钟时间戳；控制器内插值到该时刻。
         """
         assert self.is_alive()
         joint_angles = np.asarray(joint_angles, dtype=np.float64)
@@ -389,6 +395,25 @@ class Arx5Controller(mp.Process):
 
         message = {
             "cmd": Command.SET_JOINT_TARGET.value,
+            "joint_angles": joint_angles,
+            "target_time": float(target_time),
+        }
+        self.input_queue.put(message)
+
+    def schedule_joint_waypoint(
+        self, joint_angles: npt.NDArray[np.float64], target_time: float
+    ):
+        """
+        关节空间等价于 schedule_waypoint：按 target_time 插入路点并插值执行。
+        joint_angles: 6 关节 + 夹爪，shape=(7,)
+        target_time:  Unix 墙钟时间戳
+        """
+        assert self.is_alive()
+        joint_angles = np.asarray(joint_angles, dtype=np.float64)
+        assert joint_angles.shape == (7,), f"Expected 7 joint angles, got {joint_angles.shape}"
+
+        message = {
+            "cmd": Command.SCHEDULE_JOINT_WAYPOINT.value,
             "joint_angles": joint_angles,
             "target_time": float(target_time),
         }
@@ -469,7 +494,10 @@ class Arx5Controller(mp.Process):
     # ========= main loop in process ============
     def run(self):
         self.robot_client = Arx5Client(self.robot_ip, self.robot_port)
-        self.robot_client.reset_to_home()
+        if self.reset_to_home_on_start:
+            self.robot_client.reset_to_home()
+        else:
+            self.robot_client.get_state()
         # self.robot_joint_client = Arx5Client(self.robot_ip, self.robot_joint_port)
         # self.robot_joint_client.reset_to_home()
         # self.robot_client.set_gain()
@@ -491,8 +519,15 @@ class Arx5Controller(mp.Process):
             self.robot_client.get_state()
             curr_pose = self.robot_client.tcp_pose
             curr_gripper_pos = self.robot_client.gripper_pos
+            curr_joint = np.concatenate(
+                [
+                    np.asarray(self.robot_client.joint_pos, dtype=np.float64).reshape(6),
+                    [float(self.robot_client.gripper_pos)],
+                ]
+            )
             curr_t = time.monotonic()
             last_waypoint_time = curr_t
+            last_joint_waypoint_time = curr_t
             pose_interp = PoseTrajectoryInterpolator(
                 times=np.array([curr_t]), poses=np.array([curr_pose])
             )
@@ -500,13 +535,53 @@ class Arx5Controller(mp.Process):
                 times=np.array([curr_t]),
                 poses=np.array([[curr_gripper_pos, 0, 0, 0, 0, 0]]),
             )
+            joint_interp = JointTrajectoryInterpolator(
+                times=np.array([curr_t]), joints=np.array([curr_joint])
+            )
 
             t_start = time.monotonic()
             iter_idx = 0
             keep_running = True
             is_gravity_compensation = False
+            joint_control_active = False
+            # ZMQ rejects set_tcp_pose until RESET_TO_HOME. If we skipped home on
+            # start, stay passive (get_state only) until home or joint control.
+            allow_ee_pose = bool(self.reset_to_home_on_start)
             saved_gain_before_drag = None
             drag_gripper_vel_hist: list[float] = [0.0] * 5
+            _ee_pose_fail_t = 0.0
+            _joint_pose_fail_t = 0.0
+
+            def _seed_joint_interp_from_state():
+                nonlocal joint_interp, last_joint_waypoint_time
+                self.robot_client.get_state()
+                q = np.concatenate(
+                    [
+                        np.asarray(self.robot_client.joint_pos, dtype=np.float64).reshape(
+                            6
+                        ),
+                        [float(self.robot_client.gripper_pos)],
+                    ]
+                )
+                t_seed = time.monotonic()
+                joint_interp = JointTrajectoryInterpolator(
+                    times=np.array([t_seed]), joints=np.array([q])
+                )
+                last_joint_waypoint_time = t_seed
+
+            def _schedule_joint_waypoint_cmd(joint_angles, target_time_wall: float):
+                nonlocal joint_interp, last_joint_waypoint_time, joint_control_active
+                target_time = time.monotonic() - time.time() + float(target_time_wall)
+                if not joint_control_active:
+                    _seed_joint_interp_from_state()
+                joint_interp = joint_interp.schedule_waypoint(
+                    joint=joint_angles,
+                    time=target_time,
+                    curr_time=t_now,
+                    last_waypoint_time=last_joint_waypoint_time,
+                )
+                last_joint_waypoint_time = target_time
+                joint_control_active = True
 
             def print_drag_diag(tag: str, gain_override=None) -> None:
                 """只读诊断：不发送位姿、模式或增益命令。"""
@@ -541,20 +616,47 @@ class Arx5Controller(mp.Process):
                 t_now = time.monotonic()
                 # 零力/阻尼拖拽：不下发插值器 TCP（否则把臂拉回目标）。
                 # 夹爪：kp=0 + 力矩前馈，尽量让手捏跟动（非键盘）。
-                if not is_gravity_compensation:
+                if joint_control_active and not is_gravity_compensation:
+                    try:
+                        joint_cmd = np.asarray(joint_interp(t_now), dtype=np.float64)
+                        self.robot_client.set_joint_position(joint_cmd)
+                    except Exception as e:
+                        if time.monotonic() - _joint_pose_fail_t > 1.0:
+                            _joint_pose_fail_t = time.monotonic()
+                            print(f"[Arx5Controller] set_joint_position failed: {e}")
+                        try:
+                            self.robot_client.get_state()
+                        except Exception:
+                            pass
+                elif (
+                    allow_ee_pose
+                    and not is_gravity_compensation
+                    and not joint_control_active
+                ):
                     pose_cmd = pose_interp(t_now)
                     gripper_cmd = float(gripper_pos_interp(t_now)[0])
                     try:
                         self.robot_client.set_tcp_pose(pose_cmd, gripper_cmd)
                     except Exception as e:
                         # ZMQ: consecutive EE pose L2 must be < 0.1；
-                        # 单次失败不应打死控制器进程。
-                        print(f"[Arx5Controller] set_tcp_pose failed: {e}")
+                        # 或尚未 RESET_TO_HOME。单次失败不应打死控制器进程。
+                        msg = str(e)
+                        if "RESET_TO_HOME" in msg:
+                            allow_ee_pose = False
+                        if time.monotonic() - _ee_pose_fail_t > 1.0:
+                            _ee_pose_fail_t = time.monotonic()
+                            print(f"[Arx5Controller] set_tcp_pose failed: {e}")
                         try:
                             self.robot_client.get_state()
                         except Exception:
                             pass
-                else:
+                elif not is_gravity_compensation and not joint_control_active:
+                    # Passive hold: read state only (no EE / joint commands yet).
+                    try:
+                        self.robot_client.get_state()
+                    except Exception:
+                        pass
+                elif is_gravity_compensation:
                     # 只读状态 + 谨慎的夹爪力矩辅助；禁止 set_tcp_pose（会让臂掉）
                     self.robot_client.get_state()
                     try:
@@ -614,6 +716,8 @@ class Arx5Controller(mp.Process):
                         keep_running = False
                         break
                     elif cmd == Command.SERVOL.value:
+                        joint_control_active = False
+                        allow_ee_pose = True
                         target_pose = command["target_pose"]
                         duration = float(command["duration"])
                         curr_time = t_now + dt
@@ -634,6 +738,8 @@ class Arx5Controller(mp.Process):
                                 f"[Arx5Controller] New pose target: {target_pose} duration {duration:.3f}s"
                             )
                     elif cmd == Command.SCHEDULE_WAYPOINT.value:
+                        joint_control_active = False
+                        allow_ee_pose = True
                         target_pose = command["target_pose"]
                         target_time = float(command["target_time"])
                         target_time = time.monotonic() - time.time() + target_time
@@ -655,6 +761,8 @@ class Arx5Controller(mp.Process):
                         self.robot_client.reset_to_home()
                         self.robot_client.get_state()
                         is_gravity_compensation = False
+                        joint_control_active = False
+                        allow_ee_pose = True
 
                         self.ring_buffer.clear()
                         state = dict()
@@ -678,6 +786,7 @@ class Arx5Controller(mp.Process):
                             times=np.array([curr_t]),
                             poses=np.array([[curr_gripper_pos, 0, 0, 0, 0, 0]]),
                         )
+                        _seed_joint_interp_from_state()
                         self.reset_success.value = True
                         gain = self.robot_client.get_gain()
                         gain["kp"] = np.array([300, 300, 400, 80, 50, 30])
@@ -777,23 +886,44 @@ class Arx5Controller(mp.Process):
                         # clear buffer
                         self.waypoint_buffer = []
                     elif cmd == Command.SET_JOINT_TARGET.value:
-                        # 新增：处理关节空间命令
                         joint_angles = command.get("joint_angles", None)
                         target_time = float(command.get("target_time", time.time()))
-
                         if joint_angles is None:
-                            print("[Arx5Controller] Warning: missing joint_angles field in SET_JOINT_TARGET")
+                            print(
+                                "[Arx5Controller] Warning: missing joint_angles "
+                                "field in SET_JOINT_TARGET"
+                            )
                             continue
-
                         try:
-                            # 调用底层客户端接口
-                            self.robot_joint_client.set_joint_position(joint_angles)
+                            _schedule_joint_waypoint_cmd(joint_angles, target_time)
                             if self.verbose:
-                                print(f"[Arx5Controller] set_joint_target -> {joint_angles}")
-                        except AttributeError:
-                            print("[Arx5Controller] Error: robot_joint_client has no set_joint_position() method!")
+                                print(
+                                    f"[Arx5Controller] set_joint_target -> {joint_angles} "
+                                    f"@ {target_time:.3f}"
+                                )
                         except Exception as e:
                             print(f"[Arx5Controller] Exception in set_joint_target: {e}")
+                    elif cmd == Command.SCHEDULE_JOINT_WAYPOINT.value:
+                        joint_angles = command.get("joint_angles", None)
+                        target_time = float(command.get("target_time", time.time()))
+                        if joint_angles is None:
+                            print(
+                                "[Arx5Controller] Warning: missing joint_angles "
+                                "field in SCHEDULE_JOINT_WAYPOINT"
+                            )
+                            continue
+                        try:
+                            _schedule_joint_waypoint_cmd(joint_angles, target_time)
+                            if self.verbose:
+                                print(
+                                    "[Arx5Controller] schedule_joint_waypoint -> "
+                                    f"{joint_angles} @ {target_time:.3f}"
+                                )
+                        except Exception as e:
+                            print(
+                                "[Arx5Controller] Exception in "
+                                f"schedule_joint_waypoint: {e}"
+                            )
                     elif cmd == Command.SET_JOINT_TRAJECTORY.value:
                         joint_traj = command.get("joint_traj", None)
                         timestamps = command.get("timestamps", None)
