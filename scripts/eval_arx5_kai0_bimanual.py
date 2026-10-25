@@ -11,16 +11,24 @@ The policy server runs separately from the Kai0 repository. This client:
 5. receives ``[T, 14]`` absolute joint actions;
 6. schedules a guarded prefix via ``schedule_joint_waypoint``.
 
+With ``--rtc``, overlaps inference with execution and sends
+``prev_action_chunk`` / ``inference_delay`` / ``execute_horizon`` so the
+server (``serve_kai0_policy.py --rtc``) can run Pi0RTC guidance.
+
 ZMQ servers should start with ``--joint`` (Kai0 is joint throughout).
 Example:
 
     python python/communication/zmq_server.py X5_umi can0 --port 8765 --joint --no-idle-reset-home --no_cmd_timeout 0
     python python/communication/zmq_server.py X5_umi can1 --port 8766 --joint --no-idle-reset-home --no_cmd_timeout 0
 
+    # Kai0 server with RTC:
+    #   uv run scripts/serve_kai0_policy.py --checkpoint <jax_ckpt> --rtc --port 8000
+
     conda activate umi-arx
     python scripts/eval_arx5_kai0_bimanual.py \\
       --policy-ip 127.0.0.1 --policy-port 8000 \\
-      --robot-ports 8765,8766 --camera-reorder 0,1 --no-preview
+      --robot-ports 8765,8766 --camera-reorder 0,1 --no-preview \\
+      --rtc --steps-per-inference 8
 
 Controls: C=start execution, S=stop/hold, I=infer once without motion, Q=quit.
 """
@@ -49,6 +57,9 @@ if CLIENT_SRC.is_dir():
 
 from modules.arx5_env_with_images_bimanual_rs import Arx5EnvWithImages  # noqa: E402
 from openpi_client.websocket_client_policy import WebsocketClientPolicy  # noqa: E402
+from utils.kai0_rtc import JointRTCInferenceWorker  # noqa: E402
+from utils.kai0_rtc import build_joint_chunk  # noqa: E402
+from utils.kai0_rtc import estimate_delay_steps  # noqa: E402
 
 DEFAULT_PROMPT = "Flatten and fold the cloth."
 ACTION_DIM = 14
@@ -211,6 +222,28 @@ def policy_observation(obs: dict, state: np.ndarray, prompt: str) -> dict:
     }
 
 
+def rtc_policy_observation(
+    obs: dict,
+    state: np.ndarray,
+    prompt: str,
+    *,
+    prev_action_chunk: np.ndarray | None,
+    inference_delay: int,
+    execute_horizon: int,
+    max_guidance_weight: float,
+    enable_rtc: bool = True,
+) -> dict:
+    """Kai0 obs plus RTC fields for Pi0RTC serve."""
+    payload = policy_observation(obs, state, prompt)
+    payload["enable_rtc"] = bool(enable_rtc)
+    payload["inference_delay"] = int(inference_delay)
+    payload["execute_horizon"] = int(execute_horizon)
+    payload["max_guidance_weight"] = float(max_guidance_weight)
+    if prev_action_chunk is not None:
+        payload["prev_action_chunk"] = np.asarray(prev_action_chunk, dtype=np.float32)
+    return payload
+
+
 def guarded_chunk(
     actions: np.ndarray,
     current: np.ndarray,
@@ -276,6 +309,7 @@ def hold_current(env: Arx5EnvWithImages) -> None:
         np.asarray([time.time() + 0.05], dtype=np.float64),
     )
 
+
 def show_preview(obs: dict, status: str, *, enabled: bool) -> None:
     if not enabled:
         return
@@ -296,6 +330,334 @@ def show_preview(obs: dict, status: str, *, enabled: bool) -> None:
     )
     cv2.imshow("Kai0 ARX5 bimanual", canvas[..., ::-1])
     cv2.pollKey()
+
+
+def run_open_loop(
+    *,
+    env: Arx5EnvWithImages,
+    policy: WebsocketClientPolicy,
+    keys: TerminalKeys,
+    prompt: str,
+    frequency: float,
+    steps_per_inference: int,
+    max_joint_step: float,
+    gripper_min: float,
+    gripper_max: float,
+    observe_only: bool,
+    preview_enabled: bool,
+) -> None:
+    """Original blocking infer → execute chunk → wait loop."""
+    dt = 1.0 / frequency
+    executing = False
+    while True:
+        obs = env.get_obs()
+        requested_infer = False
+        for key in keys.read():
+            if key == "q":
+                hold_current(env)
+                return
+            if key == "s":
+                executing = False
+                hold_current(env)
+                print("Policy stopped; holding measured joints")
+            elif key == "c":
+                if observe_only:
+                    print("Ignoring C: --observe-only")
+                else:
+                    executing = True
+                    print("Policy execution started")
+            elif key == "i":
+                requested_infer = True
+
+        show_preview(
+            obs,
+            "EXECUTING  S:stop Q:quit"
+            if executing
+            else "HOLD  C:start I:infer Q:quit",
+            enabled=preview_enabled,
+        )
+        if not executing and not requested_infer:
+            time.sleep(0.02)
+            continue
+
+        current = measured_state(env)
+        started = time.monotonic()
+        result = policy.infer(policy_observation(obs, current, prompt))
+        latency = time.monotonic() - started
+        actions = guarded_chunk(
+            result["actions"],
+            current,
+            count=steps_per_inference,
+            max_joint_step=max_joint_step,
+            gripper_min=gripper_min,
+            gripper_max=gripper_max,
+        )
+        print(
+            f"inference={latency:.3f}s actions={np.asarray(result['actions']).shape} "
+            f"execute={executing} first={np.round(actions[0], 3)}"
+        )
+        if not executing:
+            continue
+
+        command_start_time = time.time() + 0.05
+        action_timestamps = (
+            np.arange(len(actions), dtype=np.float64) * dt + command_start_time
+        )
+        command_joint_actions(env, actions, action_timestamps)
+
+        deadline = float(action_timestamps[-1])
+        while time.time() < deadline:
+            for key in keys.read():
+                if key in {"s", "q"}:
+                    executing = False
+                    hold_current(env)
+                    if key == "q":
+                        return
+                    break
+            if not executing:
+                break
+            time.sleep(0.01)
+
+
+def run_rtc(
+    *,
+    env: Arx5EnvWithImages,
+    policy: WebsocketClientPolicy,
+    keys: TerminalKeys,
+    prompt: str,
+    frequency: float,
+    steps_per_inference: int,
+    max_joint_step: float,
+    gripper_min: float,
+    gripper_max: float,
+    observe_only: bool,
+    preview_enabled: bool,
+    rtc_s_min: int,
+    rtc_delay_buffer_size: int,
+    rtc_max_guidance_weight: float,
+) -> None:
+    """Overlapping RTC loop: execute while next infer runs with prev_chunk guidance."""
+    dt = 1.0 / frequency
+    executing = False
+    worker: JointRTCInferenceWorker | None = None
+    current_chunk = None
+    cursor = 0
+
+    def _get_obs_bundle() -> dict:
+        obs = env.get_obs()
+        state = measured_state(env)
+        return {"obs": obs, "state": state}
+
+    def _rtc_infer_fn(
+        *,
+        obs_bundle: dict,
+        rtc_prev_chunk: np.ndarray,
+        rtc_inference_delay: int,
+        rtc_execution_horizon: int,
+    ) -> tuple[np.ndarray, float]:
+        started = time.monotonic()
+        payload = rtc_policy_observation(
+            obs_bundle["obs"],
+            obs_bundle["state"],
+            prompt,
+            prev_action_chunk=rtc_prev_chunk,
+            inference_delay=rtc_inference_delay,
+            execute_horizon=rtc_execution_horizon,
+            max_guidance_weight=rtc_max_guidance_weight,
+            enable_rtc=True,
+        )
+        result = policy.infer(payload)
+        latency = time.monotonic() - started
+        actions = np.asarray(result["actions"], dtype=np.float32)
+        return actions, latency
+
+    def _stop_worker() -> None:
+        nonlocal worker, current_chunk, cursor
+        if worker is not None:
+            worker.close(wait=True, timeout_s=5.0)
+            worker = None
+        current_chunk = None
+        cursor = 0
+
+    def _seed_and_start() -> None:
+        """Warmup + first RTC chunk; create worker."""
+        nonlocal worker, current_chunk, cursor
+        _stop_worker()
+        obs = env.get_obs()
+        state = measured_state(env)
+        # First call without prev to learn action_horizon, then seed like kai0 ARX.
+        started = time.monotonic()
+        warm = policy.infer(policy_observation(obs, state, prompt))
+        warm_latency = time.monotonic() - started
+        raw = np.asarray(warm["actions"], dtype=np.float32)
+        action_horizon = int(raw.shape[0])
+        seed_prev = np.tile(state.astype(np.float32)[None, :], (action_horizon, 1))
+        started = time.monotonic()
+        result = policy.infer(
+            rtc_policy_observation(
+                obs,
+                state,
+                prompt,
+                prev_action_chunk=seed_prev,
+                inference_delay=0,
+                execute_horizon=min(steps_per_inference, action_horizon),
+                max_guidance_weight=rtc_max_guidance_weight,
+                enable_rtc=True,
+            )
+        )
+        latency = time.monotonic() - started
+        raw = np.asarray(result["actions"], dtype=np.float32)
+        current_chunk = build_joint_chunk(raw)
+        cursor = 0
+        init_delay = max(
+            1, estimate_delay_steps(max(latency, warm_latency), frequency)
+        )
+        worker = JointRTCInferenceWorker(
+            _rtc_infer_fn,
+            frequency=frequency,
+            s_min=min(rtc_s_min, steps_per_inference),
+            delay_buffer_size=rtc_delay_buffer_size,
+            initial_delay_steps=init_delay,
+            action_dim=ACTION_DIM,
+            action_horizon=action_horizon,
+        )
+        print(
+            f"[RTC] initial chunk H={current_chunk.horizon} "
+            f"(model_H={action_horizon}) latency={latency:.3f}s "
+            f"delay~{init_delay} s_min={worker.s_min}"
+        )
+
+    try:
+        while True:
+            obs = env.get_obs()
+            requested_infer = False
+            for key in keys.read():
+                if key == "q":
+                    _stop_worker()
+                    hold_current(env)
+                    return
+                if key == "s":
+                    executing = False
+                    _stop_worker()
+                    hold_current(env)
+                    print("Policy stopped; holding measured joints")
+                elif key == "c":
+                    if observe_only:
+                        print("Ignoring C: --observe-only")
+                    else:
+                        executing = True
+                        print("Policy execution started (RTC)")
+                        _seed_and_start()
+                elif key == "i":
+                    requested_infer = True
+
+            show_preview(
+                obs,
+                "RTC EXEC  S:stop Q:quit"
+                if executing
+                else "HOLD  C:start I:infer Q:quit",
+                enabled=preview_enabled,
+            )
+
+            if requested_infer and not executing:
+                state = measured_state(env)
+                started = time.monotonic()
+                result = policy.infer(
+                    rtc_policy_observation(
+                        obs,
+                        state,
+                        prompt,
+                        prev_action_chunk=np.tile(
+                            state.astype(np.float32)[None, :], (50, 1)
+                        ),
+                        inference_delay=0,
+                        execute_horizon=steps_per_inference,
+                        max_guidance_weight=rtc_max_guidance_weight,
+                        enable_rtc=True,
+                    )
+                )
+                latency = time.monotonic() - started
+                actions = guarded_chunk(
+                    result["actions"],
+                    state,
+                    count=min(8, steps_per_inference),
+                    max_joint_step=max_joint_step,
+                    gripper_min=gripper_min,
+                    gripper_max=gripper_max,
+                )
+                print(
+                    f"[RTC][infer-only] latency={latency:.3f}s "
+                    f"actions={np.asarray(result['actions']).shape} "
+                    f"first={np.round(actions[0], 3)}"
+                )
+                continue
+
+            if not executing:
+                time.sleep(0.02)
+                continue
+
+            if worker is None or current_chunk is None:
+                _seed_and_start()
+                continue
+
+            polled = worker.poll()
+            if polled is not None:
+                current_chunk, observed_delay, s_used = polled
+                cursor = 0
+                print(
+                    f"[RTC] swapped chunk: delay={observed_delay} s={s_used} "
+                    f"remaining={current_chunk.horizon} "
+                    f"latency={worker.last_latency_s:.3f}s"
+                )
+
+            if cursor >= current_chunk.horizon:
+                print("[RTC] exhausted chunk; forcing replan")
+                worker.maybe_start(
+                    executed_since_chunk=max(cursor, worker.s_min),
+                    current_chunk=current_chunk,
+                    get_obs_bundle=_get_obs_bundle,
+                )
+                time.sleep(0.01)
+                continue
+
+            live_state = measured_state(env)
+            step_actions = guarded_chunk(
+                current_chunk.actions[cursor : cursor + 1],
+                live_state,
+                count=1,
+                max_joint_step=max_joint_step,
+                gripper_min=gripper_min,
+                gripper_max=gripper_max,
+            )
+            target_time = time.time() + 0.05
+            command_joint_actions(
+                env,
+                step_actions,
+                np.asarray([target_time], dtype=np.float64),
+            )
+            cursor += 1
+            worker.maybe_start(
+                executed_since_chunk=cursor,
+                current_chunk=current_chunk,
+                get_obs_bundle=_get_obs_bundle,
+            )
+
+            deadline = target_time + 0.5 * dt
+            while time.time() < deadline:
+                for key in keys.read():
+                    if key in {"s", "q"}:
+                        executing = False
+                        _stop_worker()
+                        hold_current(env)
+                        if key == "q":
+                            return
+                        print("Policy stopped; holding measured joints")
+                        break
+                if not executing:
+                    break
+                time.sleep(0.005)
+    finally:
+        _stop_worker()
 
 
 @click.command()
@@ -341,6 +703,25 @@ def show_preview(obs: dict, status: str, *, enabled: bool) -> None:
     show_default=True,
     help="Joint init move duration (seconds)",
 )
+@click.option(
+    "--rtc/--no-rtc",
+    default=False,
+    show_default=True,
+    help="Overlapping RTC with prev_action_chunk (server must use --rtc).",
+)
+@click.option("--rtc-s-min", default=8, type=click.IntRange(1, 32), show_default=True)
+@click.option(
+    "--rtc-delay-buffer-size",
+    default=8,
+    type=click.IntRange(1, 64),
+    show_default=True,
+)
+@click.option(
+    "--rtc-max-guidance-weight",
+    default=0.5,
+    type=float,
+    show_default=True,
+)
 @click.option("--output", default="data_local/kai0_eval", show_default=True)
 def main(
     policy_ip: str,
@@ -363,12 +744,18 @@ def main(
     no_init: bool,  # noqa: FBT001
     init_joints: str,
     init_duration: float,
+    rtc: bool,  # noqa: FBT001
+    rtc_s_min: int,
+    rtc_delay_buffer_size: int,
+    rtc_max_guidance_weight: float,
     output: str,
 ) -> None:
     if frequency <= 0 or max_joint_speed <= 0:
         raise click.BadParameter("frequency and max-joint-speed must be positive")
     if not 0 <= gripper_min < gripper_max:
         raise click.BadParameter("invalid gripper range")
+    if rtc_max_guidance_weight <= 0:
+        raise click.BadParameter("--rtc-max-guidance-weight must be positive")
 
     ports = parse_pair(robot_ports, "--robot-ports")
     camera_order = parse_pair(camera_reorder, "--camera-reorder")
@@ -382,14 +769,25 @@ def main(
         ping_timeout=server_timeout,
         close_timeout=server_timeout,
     )
-    print(f"Policy connected; metadata={policy.get_server_metadata()}")
+    metadata = policy.get_server_metadata()
+    print(f"Policy connected; metadata={metadata}")
+    if rtc:
+        if not metadata.get("supports_rtc"):
+            raise click.ClickException(
+                "Client --rtc requires server metadata supports_rtc=true. "
+                "Restart Kai0 with: uv run scripts/serve_kai0_policy.py "
+                "--checkpoint <jax_ckpt> --rtc --port 8000"
+            )
+        print(
+            f"[RTC] enabled: s_min={rtc_s_min}, delay_buf={rtc_delay_buffer_size}, "
+            f"max_gw={rtc_max_guidance_weight}, steps_per_inference={steps_per_inference}"
+        )
     print("Controls: C=start execution, S=stop/hold, I=infer once, Q=quit")
     if observe_only:
         print("OBSERVE ONLY: motor commands are permanently disabled")
 
     dt = 1.0 / frequency
     max_joint_step = max_joint_speed * dt
-    executing = False
     preview_enabled = (not no_preview) and bool(os.environ.get("DISPLAY"))
     if no_preview:
         print("Preview disabled (--no-preview)")
@@ -449,75 +847,28 @@ def main(
             )
 
         try:
-            while True:
-                obs = env.get_obs()
-                requested_infer = False
-                for key in keys.read():
-                    if key == "q":
-                        hold_current(env)
-                        return
-                    if key == "s":
-                        executing = False
-                        hold_current(env)
-                        print("Policy stopped; holding measured joints")
-                    elif key == "c":
-                        if observe_only:
-                            print("Ignoring C: --observe-only")
-                        else:
-                            executing = True
-                            print("Policy execution started")
-                    elif key == "i":
-                        requested_infer = True
-
-                show_preview(
-                    obs,
-                    "EXECUTING  S:stop Q:quit"
-                    if executing
-                    else "HOLD  C:start I:infer Q:quit",
-                    enabled=preview_enabled,
+            common = dict(
+                env=env,
+                policy=policy,
+                keys=keys,
+                prompt=prompt,
+                frequency=frequency,
+                steps_per_inference=steps_per_inference,
+                max_joint_step=max_joint_step,
+                gripper_min=gripper_min,
+                gripper_max=gripper_max,
+                observe_only=observe_only,
+                preview_enabled=preview_enabled,
+            )
+            if rtc:
+                run_rtc(
+                    **common,
+                    rtc_s_min=rtc_s_min,
+                    rtc_delay_buffer_size=rtc_delay_buffer_size,
+                    rtc_max_guidance_weight=rtc_max_guidance_weight,
                 )
-                if not executing and not requested_infer:
-                    time.sleep(0.02)
-                    continue
-
-                current = measured_state(env)
-                started = time.monotonic()
-                result = policy.infer(policy_observation(obs, current, prompt))
-                latency = time.monotonic() - started
-                actions = guarded_chunk(
-                    result["actions"],
-                    current,
-                    count=steps_per_inference,
-                    max_joint_step=max_joint_step,
-                    gripper_min=gripper_min,
-                    gripper_max=gripper_max,
-                )
-                print(
-                    f"inference={latency:.3f}s actions={np.asarray(result['actions']).shape} "
-                    f"execute={executing} first={np.round(actions[0], 3)}"
-                )
-                if not executing:
-                    continue
-
-                command_start_time = time.time() + 0.05
-                action_timestamps = (
-                    np.arange(len(actions), dtype=np.float64) * dt + command_start_time
-                )
-                command_joint_actions(env, actions, action_timestamps)
-
-                # Wait out the scheduled chunk while polling stop/quit.
-                deadline = float(action_timestamps[-1])
-                while time.time() < deadline:
-                    for key in keys.read():
-                        if key in {"s", "q"}:
-                            executing = False
-                            hold_current(env)
-                            if key == "q":
-                                return
-                            break
-                    if not executing:
-                        break
-                    time.sleep(0.01)
+            else:
+                run_open_loop(**common)
         finally:
             try:
                 hold_current(env)
