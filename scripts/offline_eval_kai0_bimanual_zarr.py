@@ -72,26 +72,39 @@ def joint_horizon(data, start: int, horizon: int, stride: int) -> np.ndarray | N
     return np.stack(rows, axis=0)
 
 
-def sample_indices(ends: np.ndarray, num_samples: int, horizon: int, stride: int) -> list[int]:
+def sample_indices(
+    ends: np.ndarray,
+    num_samples: int,
+    horizon: int,
+    stride: int,
+    *,
+    all_frames: bool = False,
+) -> list[int]:
     starts = np.concatenate([[0], ends[:-1]])
     candidates: list[int] = []
     for start, end in zip(starts, ends, strict=True):
-        usable = end - ((horizon - 1) * stride + 1)
+        # Need room for a full action horizon inside the episode.
+        usable = int(end - ((horizon - 1) * stride + 1))
         if usable <= start:
             continue
-        # Keep away from episode edges.
-        lo = int(start + 30)
-        hi = int(usable - 5)
-        if hi <= lo:
-            continue
-        candidates.extend(range(lo, hi, max(1, (hi - lo) // max(1, num_samples))))
+        if all_frames:
+            lo, hi = int(start), usable
+            step = 1
+        else:
+            # Keep away from episode edges for sparse sampling.
+            lo = int(start + 30)
+            hi = int(usable - 5)
+            if hi <= lo:
+                continue
+            step = max(1, (hi - lo) // max(1, num_samples))
+        candidates.extend(range(lo, hi, step))
     if not candidates:
         raise click.ClickException("No valid sample indices in dataset")
+    if all_frames or len(candidates) <= num_samples:
+        return candidates
     rng = np.random.default_rng(0)
-    if len(candidates) > num_samples:
-        chosen = rng.choice(candidates, size=num_samples, replace=False)
-        return sorted(int(x) for x in chosen)
-    return candidates
+    chosen = rng.choice(candidates, size=num_samples, replace=False)
+    return sorted(int(x) for x in chosen)
 
 
 def summarize(pred: np.ndarray, gt: np.ndarray) -> dict:
@@ -131,6 +144,12 @@ def summarize(pred: np.ndarray, gt: np.ndarray) -> dict:
 @click.option("--prompt", default=DEFAULT_PROMPT, show_default=True)
 @click.option("--num-samples", default=24, type=int, show_default=True)
 @click.option(
+    "--all-frames",
+    is_flag=True,
+    default=False,
+    help="Evaluate every frame that can fit a full action horizon (ignores --num-samples).",
+)
+@click.option(
     "--horizon",
     default=50,
     type=int,
@@ -157,6 +176,7 @@ def main(
     policy_port: int,
     prompt: str,
     num_samples: int,
+    all_frames: bool,
     horizon: int,
     stride: int,
     server_timeout: float,
@@ -168,10 +188,19 @@ def main(
     root = zarr.open(str(zarr_path), mode="r")
     data = root["data"]
     ends = np.asarray(root["meta"]["episode_ends"][:], dtype=np.int64)
-    indices = sample_indices(ends, num_samples=num_samples, horizon=horizon, stride=stride)
+    indices = sample_indices(
+        ends,
+        num_samples=num_samples,
+        horizon=horizon,
+        stride=stride,
+        all_frames=all_frames,
+    )
 
     print(f"Dataset {zarr_path}")
-    print(f"  episodes={len(ends)} frames={int(ends[-1])} samples={len(indices)}")
+    print(
+        f"  episodes={len(ends)} frames={int(ends[-1])} samples={len(indices)}"
+        f"{' (all usable frames)' if all_frames else ''}"
+    )
     print(f"  GT horizon built from joints with stride={stride} (~{60/stride:.1f} Hz)")
     print(f"Connecting ws://{policy_ip}:{policy_port}")
     client = WebsocketClientPolicy(
@@ -213,22 +242,28 @@ def main(
         preds.append(pred)
         gts.append(gt)
         latencies.append(latency)
-        per_sample.append(
-            {
-                "index": int(index),
-                "latency_s": latency,
-                "mae": mae,
-                "state": state.tolist(),
-                "pred0": pred[0].tolist(),
-                "gt0": gt[0].tolist(),
-            }
-        )
-        print(
-            f"[{sample_id+1:02d}/{len(indices)}] t={index} "
-            f"latency={latency:.3f}s mae={mae:.4f} "
-            f"pred0_grip=({pred[0,6]:.3f},{pred[0,13]:.3f}) "
-            f"gt0_grip=({gt[0,6]:.3f},{gt[0,13]:.3f})"
-        )
+        entry = {
+            "index": int(index),
+            "latency_s": latency,
+            "mae": mae,
+        }
+        if not all_frames:
+            entry.update(
+                {
+                    "state": state.tolist(),
+                    "pred0": pred[0].tolist(),
+                    "gt0": gt[0].tolist(),
+                }
+            )
+        per_sample.append(entry)
+        log_every = 100 if all_frames else 1
+        if (sample_id + 1) % log_every == 0 or sample_id == 0 or sample_id + 1 == len(indices):
+            print(
+                f"[{sample_id+1}/{len(indices)}] t={index} "
+                f"latency={latency:.3f}s mae={mae:.4f} "
+                f"pred0_grip=({pred[0,6]:.3f},{pred[0,13]:.3f}) "
+                f"gt0_grip=({gt[0,6]:.3f},{gt[0,13]:.3f})"
+            )
 
     pred_arr = np.stack(preds, axis=0)
     gt_arr = np.stack(gts, axis=0)
@@ -236,6 +271,7 @@ def main(
     stats.update(
         {
             "num_samples": int(pred_arr.shape[0]),
+            "all_frames": bool(all_frames),
             "horizon": horizon,
             "stride": stride,
             "prompt": prompt,
