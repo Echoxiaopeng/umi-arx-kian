@@ -148,10 +148,12 @@ def main(
     delay = estimate_delay_steps(lat1, frequency)
     s = max(delay, s_min)
     chunk = build_joint_chunk(a1)
-    leftover = leftover_absolute(chunk, start_index=cursor, horizon=H)
+    leftover, real_len = leftover_absolute(chunk, start_index=cursor, horizon=H)
+    s = min(s, max(delay + 1, real_len))
     print(
         f"[3] RTC replan leftover cursor={cursor} delay={delay} "
-        f"exec_h={s} leftover_finite={bool(np.all(np.isfinite(leftover)))}..."
+        f"exec_h={s} real_len={real_len} "
+        f"leftover_finite={bool(np.all(np.isfinite(leftover)))}..."
     )
     # Slightly nudge state as if the arm moved along the chunk.
     state2 = a1[min(cursor, len(a1) - 1)].astype(np.float32)

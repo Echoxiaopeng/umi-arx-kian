@@ -22,6 +22,21 @@ def estimate_delay_steps(latency_s: float, frequency: float, *, floor: int = 1) 
     return max(int(floor), int(np.ceil(float(latency_s) * float(frequency))))
 
 
+def round_up_to_batch(steps: int, batch: int) -> int:
+    """Round ``steps`` up to a multiple of ``batch`` (batch<=1 => no-op)."""
+    steps = max(1, int(steps))
+    batch = int(batch)
+    if batch <= 1:
+        return steps
+    return ((steps + batch - 1) // batch) * batch
+
+
+# Delay is aligned to at most this many steps. Using steps_per_inference (e.g. 32)
+# as the align quantum would inflate delay≈3 → 32, leave only ~18 actions after
+# trim, then deadlock because s_min/delay > remaining horizon.
+DEFAULT_MAX_DELAY_ALIGN = 8
+
+
 @dataclass
 class JointRTCChunk:
     """One absolute-joint action chunk from the policy."""
@@ -39,19 +54,29 @@ def leftover_absolute(
     *,
     start_index: int,
     horizon: int,
-) -> np.ndarray:
-    """Unexecuted absolute-joint suffix, zero-padded to ``horizon``."""
+) -> tuple[np.ndarray, int]:
+    """Unexecuted absolute-joint suffix, padded to ``horizon``.
+
+    Returns ``(padded, real_len)``. Tail padding repeats the last real action
+    (never zeros): kai0's Pi0RTC clamps ``execute_horizon`` to
+    ``prev.shape[1]`` *before* padding, but a client-side zero-pad to full H
+    makes the server think the whole horizon is valid and guides toward 0 —
+    which yanks the arms at every swap when ``s_min`` is large.
+    """
     actions = np.asarray(chunk.actions, dtype=np.float32)
     if actions.ndim != 2 or actions.shape[0] == 0:
         dim = int(actions.shape[1]) if actions.ndim == 2 and actions.shape[1] else 14
-        return np.zeros((horizon, dim), dtype=np.float32)
+        return np.zeros((horizon, dim), dtype=np.float32), 0
     dim = int(actions.shape[1])
     leftover = actions[max(0, int(start_index)) :]
+    real_len = int(len(leftover))
     out = np.zeros((horizon, dim), dtype=np.float32)
-    n = min(len(leftover), horizon)
+    n = min(real_len, horizon)
     if n > 0:
         out[:n] = leftover[:n]
-    return out
+        if n < horizon:
+            out[n:] = leftover[n - 1]
+    return out, real_len
 
 
 def build_joint_chunk(actions: np.ndarray) -> JointRTCChunk:
@@ -59,6 +84,62 @@ def build_joint_chunk(actions: np.ndarray) -> JointRTCChunk:
     if arr.ndim != 2:
         raise ValueError(f"Expected actions [T, D], got {arr.shape}")
     return JointRTCChunk(actions=arr, created_monotonic=time.monotonic())
+
+
+def stitch_chunk_to_state(
+    chunk: JointRTCChunk,
+    last_commanded: np.ndarray | None,
+    *,
+    blend_steps: int = 16,
+    prev_velocity: np.ndarray | None = None,
+) -> JointRTCChunk:
+    """Temporal blend a new chunk onto the last commanded joints (kai0-style).
+
+    Builds a C0 anchor at ``last``, optionally C1-coasts with ``prev_velocity``,
+    then **drops** the duplicate ``actions[0] == last`` so the first scheduled
+    waypoint continues motion (avoids a one-step dq=0 hitch at every swap).
+
+    Without ``prev_velocity``, uses a position-only linear fade (C0).
+    """
+    if last_commanded is None or chunk.horizon == 0:
+        return chunk
+    last = np.asarray(last_commanded, dtype=np.float32).reshape(-1)
+    actions = np.asarray(chunk.actions, dtype=np.float32).copy()
+    if last.shape != actions.shape[1:]:
+        return chunk
+    n = min(max(1, int(blend_steps)), len(actions))
+    if n == 1:
+        actions[0] = last
+        return JointRTCChunk(actions=actions, created_monotonic=chunk.created_monotonic)
+
+    vel = None
+    if prev_velocity is not None:
+        vel = np.asarray(prev_velocity, dtype=np.float32).reshape(-1)
+        if vel.shape != last.shape:
+            vel = None
+
+    if vel is None:
+        # C0 only: fade from last pose toward the new chunk.
+        w_old = np.linspace(1.0, 0.0, n, dtype=np.float32)
+        for i in range(n):
+            actions[i] = w_old[i] * last + (1.0 - w_old[i]) * actions[i]
+        actions[0] = last
+    else:
+        # C1: coast with incoming velocity, smoothstep into the new chunk.
+        # t=0 → fully coast (pos=last, step≈vel); t=1 → fully new.
+        for i in range(n):
+            t = float(i) / float(n - 1)
+            w_new = t * t * (3.0 - 2.0 * t)  # smoothstep
+            coast = last + float(i) * vel
+            actions[i] = (1.0 - w_new) * coast + w_new * actions[i]
+        actions[0] = last  # exact C0; step0→1 ≈ vel when blend is long
+
+    # Drop the duplicate start pose (== last). Re-scheduling it yields a one-step
+    # dq=0 hitch (fast→stop→go) at every swap; the next waypoint already carries C1.
+    if len(actions) >= 2 and float(np.max(np.abs(actions[0] - last))) < 1e-5:
+        actions = actions[1:]
+
+    return JointRTCChunk(actions=actions, created_monotonic=chunk.created_monotonic)
 
 
 class JointRTCInferenceWorker:
@@ -74,19 +155,60 @@ class JointRTCInferenceWorker:
         initial_delay_steps: int = 4,
         action_dim: int = 14,
         action_horizon: int = 50,
+        schedule_batch_size: int = 1,
+        max_delay_align: int = DEFAULT_MAX_DELAY_ALIGN,
+        soft_min: int = 20,
     ) -> None:
         self._infer_fn = infer_fn
         self.frequency = float(frequency)
         self.s_min = int(s_min)
+        self.soft_min = max(0, int(soft_min))
         self.action_dim = int(action_dim)
         self.action_horizon = int(action_horizon)
+        self.schedule_batch_size = max(1, int(schedule_batch_size))
+        # Align delay to min(batch, max_delay_align), never to a huge batch like 32.
+        self.delay_align = max(
+            1, min(int(self.schedule_batch_size), int(max_delay_align))
+        )
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kai0-rtc")
         self._future: Future | None = None
         self._closed = False
-        self._delay_buf: deque[int] = deque(
-            [int(initial_delay_steps)], maxlen=int(delay_buffer_size)
+        init_d = min(
+            round_up_to_batch(int(initial_delay_steps), self.delay_align),
+            self.delay_align,
         )
+        self._delay_buf: deque[int] = deque([init_d], maxlen=int(delay_buffer_size))
         self.last_latency_s: float = float(initial_delay_steps) / self.frequency
+        # Set while an infer is in flight / awaiting commit_end before swap.
+        self._pending_start_executed: int | None = None
+        self._pending_delay: int | None = None
+        # Completed infer held until cursor reaches start+delay (do not early-swap).
+        self._ready_result: tuple | None = None
+
+    def capped_delay(self) -> int:
+        """Latency delay, rounded up to delay_align but never above delay_align max quantum."""
+        d = round_up_to_batch(self.delay_estimate, self.delay_align)
+        # Hard cap: keep enough of the 50-step chunk after trim.
+        cap = min(self.delay_align, max(1, self.action_horizon // 3))
+        return min(d, cap)
+
+    def plan_horizons(self, chunk_horizon: int) -> tuple[int, int, int]:
+        """Return ``(delay, switch_s, infer_start_cursor)``.
+
+        Open-loop-like cadence: swap after ``switch_s ≈ s_min`` steps (capped so
+        ``switch_s + 0 <= H`` via ``switch_s <= H - d``). Infer starts at
+        ``switch_s - d`` so the delay prefix fits and leftover is as long as
+        possible for soft weights ``[d, exec_h)`` where ``exec_h = leftover``.
+
+        Do **not** cap to ``(H+d)//2`` — that forced ~25-step chunks and made
+        boundaries more frequent (felt worse than open-loop).
+        """
+        d = self.capped_delay()
+        h = max(1, int(chunk_horizon))
+        # commit_end = start + d = switch_s, need switch_s <= h
+        switch_s = min(max(d, self.s_min), max(d, h - d))
+        start_trigger = max(0, int(switch_s) - int(d))
+        return int(d), int(switch_s), int(start_trigger)
 
     def close(self, *, wait: bool = True, timeout_s: float = 30.0) -> bool:
         """Stop accepting jobs. Returns True if no in-flight infer remains."""
@@ -107,6 +229,9 @@ class JointRTCInferenceWorker:
         elif future is not None and not future.done():
             still_running = True
         self._future = None
+        self._pending_start_executed = None
+        self._pending_delay = None
+        self._ready_result = None
         self._executor.shutdown(wait=wait and not still_running, cancel_futures=True)
         return not still_running
 
@@ -118,55 +243,116 @@ class JointRTCInferenceWorker:
     def busy(self) -> bool:
         return self._future is not None and not self._future.done()
 
+    @property
+    def awaiting_swap(self) -> bool:
+        """Infer finished (or in flight) but delay prefix not yet fully executed."""
+        return self.commit_end is not None
+
+    @property
+    def commit_end(self) -> int | None:
+        """Max old-chunk index to execute before applying the new chunk."""
+        if self._pending_start_executed is None or self._pending_delay is None:
+            return None
+        return int(self._pending_start_executed) + int(self._pending_delay)
+
     def maybe_start(
         self,
         *,
         executed_since_chunk: int,
         current_chunk: JointRTCChunk,
         get_obs_bundle: Callable[[], dict],
+        force: bool = False,
     ) -> None:
-        if self._closed or self.busy:
+        if self._closed or self.busy or self._ready_result is not None:
             return
-        s = max(self.delay_estimate, self.s_min)
-        if executed_since_chunk < s:
+        if self.commit_end is not None and not force:
+            # Still draining the previous infer's delay prefix.
             return
-        d = self.delay_estimate
+        horizon = int(current_chunk.horizon)
+        d, switch_s, start_trigger = self.plan_horizons(horizon)
+        if not force and executed_since_chunk < start_trigger:
+            return
+        start_executed = int(executed_since_chunk)
+        d_pending = int(d)
+        # commit_end = start + d should equal switch_s when started on time.
+        if start_executed + d_pending > horizon:
+            d_pending = max(0, horizon - start_executed)
         obs_bundle = get_obs_bundle()
-        # Pad to full model action_horizon (not trimmed chunk length).
-        leftover = leftover_absolute(
+        leftover, real_len = leftover_absolute(
             current_chunk,
             start_index=executed_since_chunk,
             horizon=self.action_horizon,
         )
+        # Guidance horizon: soft is [d, exec_h). Real leftover alone is often
+        # short (soft ≈ H - switch_s ≈ 8–10). Extend into the hold-last pad so
+        # the server keeps guiding toward the old end pose for soft_min steps.
+        soft_min = int(getattr(self, "soft_min", 20))
+        exec_h = max(d_pending, real_len if real_len > 0 else d_pending)
+        exec_h = min(
+            self.action_horizon,
+            max(exec_h, d_pending + max(0, soft_min)),
+        )
+        if force:
+            exec_h = max(d_pending, min(exec_h, max(1, int(executed_since_chunk))))
+        s = exec_h
         started = time.monotonic()
+        self._pending_start_executed = start_executed
+        self._pending_delay = d_pending
 
         def _job():
             actions, latency = self._infer_fn(
                 obs_bundle=obs_bundle,
                 rtc_prev_chunk=leftover,
-                rtc_inference_delay=d,
+                rtc_inference_delay=d_pending,
                 rtc_execution_horizon=s,
             )
-            return actions, latency, started, s, d
+            return actions, latency, started, s, d_pending, start_executed
 
         self._future = self._executor.submit(_job)
 
-    def poll(self) -> tuple[JointRTCChunk, int, int] | None:
-        """Return (new_chunk, observed_delay_steps, execution_horizon) when ready."""
-        if self._future is None or not self._future.done():
+    def poll(
+        self, executed_since_chunk: int | None = None
+    ) -> tuple[JointRTCChunk, int, int] | None:
+        """Return (new_chunk, trim_steps, execution_horizon) when ready to swap.
+
+        Holds the completed infer until ``executed_since_chunk >= start + delay``
+        so we do not apply a new chunk before the RTC-committed prefix runs.
+        """
+        if self._future is not None and self._future.done():
+            self._ready_result = self._future.result()
+            self._future = None
+
+        if self._ready_result is None:
             return None
-        actions, latency, _started, s, _d_est = self._future.result()
-        self._future = None
+
+        actions, latency, _started, s, d_est, start_executed = self._ready_result
+        commit = int(start_executed) + int(d_est)
+        if executed_since_chunk is not None and int(executed_since_chunk) < commit:
+            # Infer done early; keep holding until delay prefix is executed.
+            return None
+
+        self._ready_result = None
+        self._pending_start_executed = None
+        self._pending_delay = None
+
         observed_delay = estimate_delay_steps(latency, self.frequency)
-        self._delay_buf.append(observed_delay)
+        steps_during = 0
+        if executed_since_chunk is not None:
+            steps_during = max(0, int(executed_since_chunk) - int(start_executed))
+        trim = max(observed_delay, steps_during, int(d_est))
+        trim = round_up_to_batch(trim, self.delay_align)
+        cap = min(self.delay_align, max(1, self.action_horizon // 3))
+        trim = min(trim, cap)
+        self._delay_buf.append(trim)
         self.last_latency_s = float(latency)
+
         chunk = build_joint_chunk(actions)
         n = chunk.horizon
         if n == 0:
-            return chunk, observed_delay, s
-        start_index = min(max(0, observed_delay), n - 1)
+            return chunk, trim, s
+        start_index = min(max(0, trim), n - 1)
         trimmed = JointRTCChunk(
             actions=chunk.actions[start_index:],
             created_monotonic=chunk.created_monotonic,
         )
-        return trimmed, observed_delay, s
+        return trimmed, trim, s

@@ -25,16 +25,23 @@ Example:
     #   uv run scripts/serve_kai0_policy.py --checkpoint <jax_ckpt> --rtc --port 8000
 
     conda activate umi-arx
-    python scripts/eval_arx5_kai0_bimanual.py \\
-      --policy-ip 127.0.0.1 --policy-port 8000 \\
-      --robot-ports 8765,8766 --camera-reorder 0,1 --no-preview \\
-      --rtc --steps-per-inference 8
+    python scripts/eval_arx5_kai0_bimanual.py \
+      --policy-ip 127.0.0.1 --policy-port 8000 \
+      --robot-ports 8765,8766 --camera-reorder 0,1 --no-preview \
+      --steps-per-inference 32
+
+    python scripts/eval_arx5_kai0_bimanual.py \
+      --policy-ip 127.0.0.1 --policy-port 8000 \
+      --robot-ports 8765,8766 --camera-reorder 0,1 --no-preview \
+      --rtc --frequency 20 --steps-per-inference 8
 
 Controls: C=start execution, S=stop/hold, I=infer once without motion, Q=quit.
 """
 
 from __future__ import annotations
 
+import atexit
+from datetime import datetime, timezone
 import os
 import select
 from multiprocessing.managers import SharedMemoryManager
@@ -49,6 +56,7 @@ import cv2
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_RUN_LOG = ROOT / "data_local" / "kai0_eval" / "last_run.log"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 CLIENT_SRC = ROOT / "packages" / "openpi-client" / "src"
@@ -57,18 +65,177 @@ if CLIENT_SRC.is_dir():
 
 from modules.arx5_env_with_images_bimanual_rs import Arx5EnvWithImages  # noqa: E402
 from openpi_client.websocket_client_policy import WebsocketClientPolicy  # noqa: E402
+from utils.kai0_rtc import JointRTCChunk  # noqa: E402
 from utils.kai0_rtc import JointRTCInferenceWorker  # noqa: E402
 from utils.kai0_rtc import build_joint_chunk  # noqa: E402
 from utils.kai0_rtc import estimate_delay_steps  # noqa: E402
+from utils.kai0_rtc import stitch_chunk_to_state  # noqa: E402
 
 DEFAULT_PROMPT = "Flatten and fold the cloth."
 ACTION_DIM = 14
+# Client C1 blend length. Longer than soft(~10) so catch-up after swap is gradual.
+RTC_BLEND_STEPS = 24
+# Request at least this many soft-guidance steps (extends into hold-last pad).
+RTC_SOFT_MIN = 20
+
+
+def _max_abs(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.max(np.abs(np.asarray(a) - np.asarray(b))))
+
+
+def _fmt14(x: np.ndarray, *, prec: int = 3) -> str:
+    arr = np.asarray(x, dtype=np.float64).reshape(-1)
+    if arr.size < ACTION_DIM:
+        return np.array2string(arr, precision=prec, suppress_small=True)
+    # left q0-2 + grip | right q0-2 + grip (compact boundary view)
+    return (
+        f"L[{arr[0]:.{prec}f},{arr[1]:.{prec}f},{arr[2]:.{prec}f}|g{arr[6]:.{prec}f}] "
+        f"R[{arr[7]:.{prec}f},{arr[8]:.{prec}f},{arr[9]:.{prec}f}|g{arr[13]:.{prec}f}]"
+    )
+
+
+def _chunk_step_stats(actions: np.ndarray, n: int = 8) -> str:
+    """Max |Δq| over first n successive steps (joints only, both arms)."""
+    a = np.asarray(actions, dtype=np.float64)
+    if len(a) < 2:
+        return "n/a"
+    m = min(int(n), len(a) - 1)
+    deltas = []
+    for i in range(m):
+        d = a[i + 1] - a[i]
+        deltas.append(max(float(np.max(np.abs(d[0:6]))), float(np.max(np.abs(d[7:13])))))
+    arr = np.asarray(deltas)
+    return f"p50={np.median(arr):.4f} max={arr.max():.4f} sat@0.04={(arr >= 0.039).mean()*100:.0f}%"
+
+
+def _log_rtc_swap(
+    *,
+    tag: str,
+    swap_at: int,
+    trim_steps: int,
+    s_used: int,
+    raw_chunk: JointRTCChunk,
+    stitched: JointRTCChunk,
+    last_commanded: np.ndarray | None,
+    latency_s: float,
+    swap_index: int,
+    wall_dt_s: float | None,
+    max_joint_step: float,
+) -> None:
+    soft = max(0, int(s_used) - int(trim_steps))
+    last = (
+        np.asarray(last_commanded, dtype=np.float64)
+        if last_commanded is not None
+        else None
+    )
+    raw0 = raw_chunk.actions[0] if raw_chunk.horizon else None
+    st0 = stitched.actions[0] if stitched.horizon else None
+    jump_raw = _max_abs(raw0, last) if raw0 is not None and last is not None else float("nan")
+    jump_st = _max_abs(st0, last) if st0 is not None and last is not None else float("nan")
+    # Direction change: compare pre-swap velocity proxy vs first post-stitch step.
+    step1 = (
+        _max_abs(stitched.actions[1], stitched.actions[0])
+        if stitched.horizon >= 2
+        else float("nan")
+    )
+    wall = f" dt_swap={wall_dt_s:.3f}s" if wall_dt_s is not None else ""
+    print(
+        f"[RTC] {tag} #{swap_index}: cursor={swap_at} trim={trim_steps} "
+        f"s={s_used} soft={soft} H={stitched.horizon} lat={latency_s:.3f}s{wall}"
+    )
+    print(
+        f"[RTC]   jump_raw0={jump_raw:.4f} jump_stitch0={jump_st:.4f} "
+        f"step1={step1:.4f} (limit={max_joint_step:.4f}) "
+        f"raw_steps[{_chunk_step_stats(raw_chunk.actions)}] "
+        f"st_steps[{_chunk_step_stats(stitched.actions)}]"
+    )
+    if last is not None and st0 is not None:
+        print(f"[RTC]   last={_fmt14(last)}")
+        print(f"[RTC]   raw0={_fmt14(raw0)}")
+        print(f"[RTC]   st0 ={_fmt14(st0)}")
+
+
+def _log_rtc_infer_start(
+    *,
+    cursor: int,
+    chunk_h: int,
+    delay: int,
+    switch_s: int,
+    start_trigger: int,
+    commit_end: int | None,
+    leftover: int,
+    max_gw: float,
+    state: np.ndarray | None,
+) -> None:
+    soft = max(0, leftover - delay)  # after hard mask, leftover soft capacity
+    print(
+        f"[RTC] infer start: cursor={cursor}/{chunk_h} "
+        f"trigger={start_trigger} switch_s={switch_s} "
+        f"delay={delay} commit_end={commit_end} "
+        f"leftover={leftover} soft_cap={soft} max_gw={max_gw}"
+    )
+    if state is not None:
+        print(f"[RTC]   proprio={_fmt14(state)}")
 # Median first-frame joints from collect_bimanual_10_22 (91/100 inliers).
 # Order: left q6, left grip, right q6, right grip.
 DEFAULT_INIT_JOINTS = (
     "0.024986,0.637255,0.694095,-0.620852,0.026380,-0.052849,0.083843,"
     "0.051690,0.633059,0.692569,-0.632296,0.068475,0.029945,0.067379"
 )
+
+
+class _TeeIO:
+    """Mirror writes to the terminal and a log file (line-buffered)."""
+
+    def __init__(self, primary, secondary) -> None:
+        self._primary = primary
+        self._secondary = secondary
+
+    def write(self, data):
+        self._primary.write(data)
+        self._secondary.write(data)
+        self._primary.flush()
+        self._secondary.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        self._primary.flush()
+        self._secondary.flush()
+
+    def isatty(self) -> bool:
+        return self._primary.isatty()
+
+    def fileno(self) -> int:
+        return self._primary.fileno()
+
+    def __getattr__(self, name: str):
+        return getattr(self._primary, name)
+
+
+def install_run_log(log_path: Path) -> Path:
+    """Overwrite ``log_path`` and tee stdout/stderr into it for this process."""
+    log_path = Path(log_path).resolve()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, "w", encoding="utf-8", buffering=1)  # noqa: SIM115
+    real_out, real_err = sys.stdout, sys.stderr
+    sys.stdout = _TeeIO(real_out, log_file)
+    sys.stderr = _TeeIO(real_err, log_file)
+
+    def _restore() -> None:
+        sys.stdout = real_out
+        sys.stderr = real_err
+        try:
+            log_file.flush()
+            log_file.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    atexit.register(_restore)
+    stamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    print(f"[log] writing run log (overwrite) -> {log_path}")
+    print(f"[log] started_at={stamp}")
+    print(f"[log] argv={' '.join(sys.argv)}")
+    return log_path
 
 
 class TerminalKeys:
@@ -442,6 +609,53 @@ def run_rtc(
     worker: JointRTCInferenceWorker | None = None
     current_chunk = None
     cursor = 0
+    schedule_end = 0.0  # wall time of last scheduled waypoint
+    last_commanded: np.ndarray | None = None
+    prev_commanded: np.ndarray | None = None  # for C1 stitch velocity
+    swap_count = 0
+    last_swap_mono: float | None = None
+    batch_sat_count = 0
+    batch_step_count = 0
+
+    def _apply_swap(
+        tag: str,
+        *,
+        swap_at: int,
+        polled: tuple,
+    ) -> None:
+        nonlocal current_chunk, cursor, swap_count, last_swap_mono
+        raw_chunk, trim_steps, s_used = polled
+        prev_vel = None
+        if last_commanded is not None and prev_commanded is not None:
+            prev_vel = (
+                np.asarray(last_commanded, dtype=np.float32)
+                - np.asarray(prev_commanded, dtype=np.float32)
+            )
+        stitched = stitch_chunk_to_state(
+            raw_chunk,
+            last_commanded,
+            blend_steps=RTC_BLEND_STEPS,
+            prev_velocity=prev_vel,
+        )
+        now = time.monotonic()
+        wall_dt = (now - last_swap_mono) if last_swap_mono is not None else None
+        swap_count += 1
+        last_swap_mono = now
+        _log_rtc_swap(
+            tag=tag,
+            swap_at=swap_at,
+            trim_steps=int(trim_steps),
+            s_used=int(s_used),
+            raw_chunk=raw_chunk,
+            stitched=stitched,
+            last_commanded=last_commanded,
+            latency_s=float(worker.last_latency_s) if worker is not None else 0.0,
+            swap_index=swap_count,
+            wall_dt_s=wall_dt,
+            max_joint_step=max_joint_step,
+        )
+        current_chunk = stitched
+        cursor = 0
 
     def _get_obs_bundle() -> dict:
         obs = env.get_obs()
@@ -472,16 +686,32 @@ def run_rtc(
         return actions, latency
 
     def _stop_worker() -> None:
-        nonlocal worker, current_chunk, cursor
+        nonlocal worker, current_chunk, cursor, schedule_end, last_commanded
+        nonlocal prev_commanded
+        nonlocal swap_count, last_swap_mono, batch_sat_count, batch_step_count
         if worker is not None:
+            if batch_step_count > 0:
+                print(
+                    f"[RTC] session stats: swaps={swap_count} "
+                    f"guard_sat={batch_sat_count}/{batch_step_count} "
+                    f"({100.0 * batch_sat_count / batch_step_count:.1f}%)"
+                )
             worker.close(wait=True, timeout_s=5.0)
             worker = None
         current_chunk = None
         cursor = 0
+        schedule_end = 0.0
+        last_commanded = None
+        prev_commanded = None
+        swap_count = 0
+        last_swap_mono = None
+        batch_sat_count = 0
+        batch_step_count = 0
 
     def _seed_and_start() -> None:
         """Warmup + first RTC chunk; create worker."""
-        nonlocal worker, current_chunk, cursor
+        nonlocal worker, current_chunk, cursor, schedule_end, last_commanded
+        nonlocal last_swap_mono
         _stop_worker()
         obs = env.get_obs()
         state = measured_state(env)
@@ -500,7 +730,7 @@ def run_rtc(
                 prompt,
                 prev_action_chunk=seed_prev,
                 inference_delay=0,
-                execute_horizon=min(steps_per_inference, action_horizon),
+                execute_horizon=min(rtc_s_min, action_horizon),
                 max_guidance_weight=rtc_max_guidance_weight,
                 enable_rtc=True,
             )
@@ -512,20 +742,41 @@ def run_rtc(
         init_delay = max(
             1, estimate_delay_steps(max(latency, warm_latency), frequency)
         )
+        # RTC must schedule in small batches (≤ delay_align). A huge
+        # --steps-per-inference (e.g. 50) would dump the whole chunk before
+        # maybe_start, leaving an empty leftover and a jerky first swap.
+        rtc_batch = min(int(steps_per_inference), 8)
         worker = JointRTCInferenceWorker(
             _rtc_infer_fn,
             frequency=frequency,
-            s_min=min(rtc_s_min, steps_per_inference),
+            s_min=rtc_s_min,
             delay_buffer_size=rtc_delay_buffer_size,
             initial_delay_steps=init_delay,
             action_dim=ACTION_DIM,
             action_horizon=action_horizon,
+            schedule_batch_size=rtc_batch,
+            soft_min=RTC_SOFT_MIN,
         )
+        d0, switch0, trig0 = worker.plan_horizons(current_chunk.horizon)
         print(
             f"[RTC] initial chunk H={current_chunk.horizon} "
-            f"(model_H={action_horizon}) latency={latency:.3f}s "
-            f"delay~{init_delay} s_min={worker.s_min}"
+            f"(model_H={action_horizon}) latency={latency:.3f}s warm={warm_latency:.3f}s "
+            f"delay~{worker.capped_delay()} s_min={worker.s_min} max_gw={rtc_max_guidance_weight} "
+            f"schedule_batch={rtc_batch} (cli steps_per_inference={steps_per_inference}) "
+            f"delay_align={worker.delay_align} blend={RTC_BLEND_STEPS} "
+            f"soft_min={RTC_SOFT_MIN} stitch=C1+skip0"
         )
+        print(
+            f"[RTC]   plan: infer_at={trig0} switch_at={switch0} delay={d0} "
+            f"first={_fmt14(raw[0])} steps[{_chunk_step_stats(raw)}]"
+        )
+        print(f"[RTC]   seed_state={_fmt14(state)}")
+        last_swap_mono = time.monotonic()
+        if steps_per_inference > 8:
+            print(
+                f"[RTC] NOTE: clamping schedule batch {steps_per_inference}->8; "
+                "use --steps-per-inference 8 for RTC"
+            )
 
     try:
         while True:
@@ -600,49 +851,149 @@ def run_rtc(
                 _seed_and_start()
                 continue
 
-            polled = worker.poll()
+            polled = worker.poll(executed_since_chunk=cursor)
             if polled is not None:
-                current_chunk, observed_delay, s_used = polled
-                cursor = 0
-                print(
-                    f"[RTC] swapped chunk: delay={observed_delay} s={s_used} "
-                    f"remaining={current_chunk.horizon} "
-                    f"latency={worker.last_latency_s:.3f}s"
-                )
+                _apply_swap("swap", swap_at=cursor, polled=polled)
 
             if cursor >= current_chunk.horizon:
-                print("[RTC] exhausted chunk; forcing replan")
+                if worker.awaiting_swap:
+                    # Chunk ended before commit_end (trimmed shorter than
+                    # start+delay). Release the held infer so we don't freeze.
+                    release_at = max(cursor, worker.commit_end or cursor)
+                    done = worker.poll(executed_since_chunk=release_at)
+                    if done is not None:
+                        _apply_swap("swap(horizon_flush)", swap_at=cursor, polled=done)
+                        continue
+                    time.sleep(0.005)
+                    continue
+                print(
+                    f"[RTC] exhausted chunk H={current_chunk.horizon} "
+                    f"cursor={cursor}; forcing replan"
+                )
                 worker.maybe_start(
-                    executed_since_chunk=max(cursor, worker.s_min),
+                    executed_since_chunk=max(cursor, 1),
                     current_chunk=current_chunk,
                     get_obs_bundle=_get_obs_bundle,
+                    force=True,
                 )
                 time.sleep(0.01)
                 continue
 
-            live_state = measured_state(env)
-            step_actions = guarded_chunk(
-                current_chunk.actions[cursor : cursor + 1],
-                live_state,
-                count=1,
+            # While next infer is pending (in flight or held), only execute the
+            # RTC-committed prefix (start + delay). Early swap before that
+            # prefix runs snaps the arm; poll holds until cursor >= commit_end.
+            if worker.commit_end is not None:
+                if cursor >= worker.commit_end:
+                    while executing and worker.awaiting_swap:
+                        for key in keys.read():
+                            if key in {"s", "q"}:
+                                executing = False
+                                _stop_worker()
+                                hold_current(env)
+                                if key == "q":
+                                    return
+                                print("Policy stopped; holding measured joints")
+                                break
+                        if not executing:
+                            break
+                        done = worker.poll(executed_since_chunk=cursor)
+                        if done is not None:
+                            _apply_swap("swap(commit_end)", swap_at=cursor, polled=done)
+                            break
+                        time.sleep(0.005)
+                    continue
+                remaining_commit = worker.commit_end - cursor
+            else:
+                # Infer at switch_s - delay; execute through switch_s before swap.
+                _d, _switch_s, s_trigger = worker.plan_horizons(current_chunk.horizon)
+                if cursor < s_trigger:
+                    remaining_commit = s_trigger - cursor
+                else:
+                    remaining_commit = worker.delay_align
+
+            remaining = current_chunk.horizon - cursor
+            schedule_batch = min(steps_per_inference, worker.delay_align)
+            n = min(schedule_batch, remaining, remaining_commit)
+            if n <= 0:
+                time.sleep(0.005)
+                continue
+            # Continuity anchor: last commanded pose (not measured), so swap
+            # does not yank toward lagged encoder readings.
+            anchor = (
+                last_commanded
+                if last_commanded is not None
+                else measured_state(env)
+            )
+            raw_batch = np.asarray(
+                current_chunk.actions[cursor : cursor + n], dtype=np.float64
+            )
+            batch_actions = guarded_chunk(
+                raw_batch,
+                anchor,
+                count=n,
                 max_joint_step=max_joint_step,
                 gripper_min=gripper_min,
                 gripper_max=gripper_max,
             )
-            target_time = time.time() + 0.05
-            command_joint_actions(
-                env,
-                step_actions,
-                np.asarray([target_time], dtype=np.float64),
+            # Guard saturation + tracking vs raw policy (diagnose jerk source).
+            prev = np.asarray(anchor, dtype=np.float64)
+            for i in range(len(batch_actions)):
+                batch_step_count += 1
+                d_cmd = batch_actions[i] - prev
+                joint_max = max(
+                    float(np.max(np.abs(d_cmd[0:6]))),
+                    float(np.max(np.abs(d_cmd[7:13]))),
+                )
+                if joint_max >= max_joint_step * 0.975:
+                    batch_sat_count += 1
+                prev = batch_actions[i]
+            raw_vs_guard = float(
+                np.max(np.abs(raw_batch[: len(batch_actions)] - batch_actions))
             )
-            cursor += 1
+            if raw_vs_guard > max_joint_step * 0.5 or cursor == 0 or (cursor % 16 == 0):
+                meas = measured_state(env)
+                track = _max_abs(meas, anchor) if last_commanded is not None else float("nan")
+                print(
+                    f"[RTC] sched cursor={cursor}->{cursor+n}/{current_chunk.horizon} "
+                    f"n={n} raw_vs_guard={raw_vs_guard:.4f} "
+                    f"track_err={track:.4f} "
+                    f"sat_cum={batch_sat_count}/{batch_step_count}"
+                )
+
+            t0 = max(time.time() + 0.05, schedule_end)
+            action_timestamps = (
+                np.arange(len(batch_actions), dtype=np.float64) * dt + t0
+            )
+            command_joint_actions(env, batch_actions, action_timestamps)
+            schedule_end = float(action_timestamps[-1])
+            # Keep last two commanded poses for C1 velocity at the next swap.
+            if len(batch_actions) >= 2:
+                prev_commanded = np.asarray(batch_actions[-2], dtype=np.float64)
+            elif last_commanded is not None:
+                prev_commanded = np.asarray(last_commanded, dtype=np.float64)
+            last_commanded = np.asarray(batch_actions[-1], dtype=np.float64)
+            cursor += n
+            started = worker.busy or worker.awaiting_swap
             worker.maybe_start(
                 executed_since_chunk=cursor,
                 current_chunk=current_chunk,
                 get_obs_bundle=_get_obs_bundle,
             )
+            if not started and (worker.busy or worker.awaiting_swap):
+                _d, _switch_s, _st = worker.plan_horizons(current_chunk.horizon)
+                _log_rtc_infer_start(
+                    cursor=cursor,
+                    chunk_h=current_chunk.horizon,
+                    delay=_d,
+                    switch_s=_switch_s,
+                    start_trigger=_st,
+                    commit_end=worker.commit_end,
+                    leftover=current_chunk.horizon - cursor,
+                    max_gw=rtc_max_guidance_weight,
+                    state=last_commanded,
+                )
 
-            deadline = target_time + 0.5 * dt
+            deadline = schedule_end
             while time.time() < deadline:
                 for key in keys.read():
                     if key in {"s", "q"}:
@@ -670,7 +1021,7 @@ def run_rtc(
 @click.option("--prompt", default=DEFAULT_PROMPT, show_default=True)
 @click.option("--frequency", default=20.0, type=float, show_default=True)
 @click.option("--steps-per-inference", default=8, type=click.IntRange(1, 50), show_default=True)
-@click.option("--max-joint-speed", default=0.8, type=float, show_default=True, help="rad/s")
+@click.option("--max-joint-speed", default=1.5, type=float, show_default=True, help="rad/s")
 @click.option("--gripper-min", default=0.0, type=float, show_default=True)
 @click.option("--gripper-max", default=0.085, type=float, show_default=True)
 @click.option("--camera-obs-latency", default=0.17, type=float, show_default=True)
@@ -709,20 +1060,37 @@ def run_rtc(
     show_default=True,
     help="Overlapping RTC with prev_action_chunk (server must use --rtc).",
 )
-@click.option("--rtc-s-min", default=8, type=click.IntRange(1, 32), show_default=True)
+@click.option(
+    "--rtc-s-min",
+    default=8,
+    type=click.IntRange(1, 48),
+    show_default=True,
+    help=(
+        "Steps before swapping to the next chunk. Infer starts at s-delay. "
+        "NOTE: soft length ≈ H-s_min after trim — raising s_min swaps less often "
+        "but shortens server soft-guidance; client C1 blend + soft_min pad compensate."
+    ),
+)
 @click.option(
     "--rtc-delay-buffer-size",
-    default=8,
+    default=16,
     type=click.IntRange(1, 64),
     show_default=True,
 )
 @click.option(
     "--rtc-max-guidance-weight",
-    default=0.5,
+    default=2,
     type=float,
     show_default=True,
+    help="RTC server soft-guidance weight (kai0 default 0.5). Raise carefully.",
 )
 @click.option("--output", default="data_local/kai0_eval", show_default=True)
+@click.option(
+    "--log-file",
+    default=str(DEFAULT_RUN_LOG),
+    show_default=True,
+    help="Overwrite this file each run with teed stdout/stderr (for post-run debug).",
+)
 def main(
     policy_ip: str,
     policy_port: int,
@@ -749,6 +1117,7 @@ def main(
     rtc_delay_buffer_size: int,
     rtc_max_guidance_weight: float,
     output: str,
+    log_file: str,
 ) -> None:
     if frequency <= 0 or max_joint_speed <= 0:
         raise click.BadParameter("frequency and max-joint-speed must be positive")
@@ -756,6 +1125,11 @@ def main(
         raise click.BadParameter("invalid gripper range")
     if rtc_max_guidance_weight <= 0:
         raise click.BadParameter("--rtc-max-guidance-weight must be positive")
+
+    log_path = Path(log_file)
+    if not log_path.is_absolute():
+        log_path = ROOT / log_path
+    install_run_log(log_path)
 
     ports = parse_pair(robot_ports, "--robot-ports")
     camera_order = parse_pair(camera_reorder, "--camera-reorder")
