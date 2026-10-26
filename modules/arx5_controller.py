@@ -70,10 +70,54 @@ DRAG_GRIPPER_HOLD_CLOSED_LO = 0.020
 DRAG_ARM_KD_SCALE = 0.015
 
 
+def _looks_like_joint_server_error(exc: BaseException) -> bool:
+    msg = str(exc)
+    return (
+        "--joint" in msg
+        or "SET_EE_POSE" in msg
+        or "cartesian server" in msg
+        or "EVAN_SYNC_AFTER_DRAG" in msg
+    )
+
+
+def _measured_joint7(robot_client: Arx5Client) -> np.ndarray:
+    robot_client.get_state()
+    return np.concatenate(
+        [
+            np.asarray(robot_client.joint_pos, dtype=np.float64).reshape(6),
+            [float(robot_client.gripper_pos)],
+        ]
+    )
+
+
 def _sync_measured_tcp_gripper(robot_client: Arx5Client) -> None:
     """把 EE/TCP 与夹爪指令钉在实测值，避免进拖拽后仍追旧 setpoint。"""
     robot_client.get_state()
     robot_client.set_tcp_pose(robot_client.tcp_pose, robot_client.gripper_pos)
+
+
+def _pin_measured_setpoint(robot_client: Arx5Client) -> str:
+    """Pin controller setpoint to measured pose.
+
+    Prefer cartesian ``sync_after_drag`` / TCP pin (UMI collect path). On
+    ``--joint`` Kai0 servers those fail; fall back to ``SET_JOINT_POSITION``.
+    Returns which path was used: ``cartesian_sync`` | ``tcp`` | ``joint``.
+    """
+    robot_client.get_state()
+    try:
+        robot_client.sync_after_drag()
+        return "cartesian_sync"
+    except Exception as sync_exc:
+        if not _looks_like_joint_server_error(sync_exc):
+            try:
+                _sync_measured_tcp_gripper(robot_client)
+                return "tcp"
+            except Exception as tcp_exc:
+                if not _looks_like_joint_server_error(tcp_exc):
+                    raise
+        q7 = _measured_joint7(robot_client)
+        robot_client.set_joint_position(q7)
+        return "joint"
 
 
 def _closed_wall_torque(g: float) -> float:
@@ -551,6 +595,8 @@ class Arx5Controller(mp.Process):
             drag_gripper_vel_hist: list[float] = [0.0] * 5
             _ee_pose_fail_t = 0.0
             _joint_pose_fail_t = 0.0
+            # --joint servers historically lack SET_GRIPPER_TORQUE; skip after 1 fail.
+            drag_grip_tau_disabled = False
 
             def _seed_joint_interp_from_state():
                 nonlocal joint_interp, last_joint_waypoint_time
@@ -679,18 +725,30 @@ class Arx5Controller(mp.Process):
                         drag_gripper_vel_hist, dt, gripper_pos=gpos
                     )
                     # 每拍下发（含 0），避免上次辅助力矩残留继续推夹爪
-                    try:
-                        self.robot_client.set_gripper_torque(assist_tau)
-                    except Exception as grip_tau_exc:
-                        # 偶发失败不应打死环；但完全静默会导致「以为在辅助其实没下发」
-                        if not hasattr(self, "_grip_tau_fail_t"):
-                            self._grip_tau_fail_t = 0.0
-                        if time.monotonic() - float(self._grip_tau_fail_t) > 1.0:
-                            self._grip_tau_fail_t = time.monotonic()
-                            print(
-                                "[Arx5Controller] set_gripper_torque failed: "
-                                f"{grip_tau_exc} (gpos={gpos}, tau={assist_tau:.3f})"
-                            )
+                    if not drag_grip_tau_disabled:
+                        try:
+                            self.robot_client.set_gripper_torque(assist_tau)
+                        except Exception as grip_tau_exc:
+                            if _looks_like_joint_server_error(grip_tau_exc):
+                                drag_grip_tau_disabled = True
+                                print(
+                                    "[Arx5Controller] set_gripper_torque unsupported "
+                                    "on this ZMQ server (--joint); "
+                                    "drag will use hand squeeze without torque assist"
+                                )
+                            else:
+                                if not hasattr(self, "_grip_tau_fail_t"):
+                                    self._grip_tau_fail_t = 0.0
+                                if (
+                                    time.monotonic() - float(self._grip_tau_fail_t)
+                                    > 1.0
+                                ):
+                                    self._grip_tau_fail_t = time.monotonic()
+                                    print(
+                                        "[Arx5Controller] set_gripper_torque failed: "
+                                        f"{grip_tau_exc} "
+                                        f"(gpos={gpos}, tau={assist_tau:.3f})"
+                                    )
 
                 state = dict()
                 for key, func_name in self.receive_keys:
@@ -982,11 +1040,15 @@ class Arx5Controller(mp.Process):
                                 try:
                                     saved_gain_before_drag = self.robot_client.get_gain()
                                     try:
-                                        _sync_measured_tcp_gripper(self.robot_client)
+                                        pin = _pin_measured_setpoint(self.robot_client)
+                                        print(
+                                            "[Arx5Controller] pre-damping pin via "
+                                            f"{pin}"
+                                        )
                                     except Exception as sync_exc:
                                         print(
-                                            "[Arx5Controller] pre-damping tcp/gripper "
-                                            f"sync warning: {sync_exc}"
+                                            "[Arx5Controller] pre-damping pin "
+                                            f"warning: {sync_exc}"
                                         )
                                     self.robot_client.set_to_damping()
                                     # 阻尼拖拽：臂 kp=0、kd 缩小；夹爪 kp=0 + 力矩辅助手捏
@@ -1022,13 +1084,22 @@ class Arx5Controller(mp.Process):
                                         f"[Arx5Controller] damping drag FAILED: {e2}"
                                     )
                             if entered:
+                                # Stop stale joint traj; drag loop must not resume it.
+                                joint_control_active = False
                                 try:
-                                    self.robot_client.sync_after_drag()
+                                    pin = _pin_measured_setpoint(self.robot_client)
+                                    print(
+                                        f"[Arx5Controller] enter-drag pin via {pin}"
+                                    )
                                 except Exception as sync_exc:
                                     print(
-                                        "[Arx5Controller] enter-drag sync warning: "
+                                        "[Arx5Controller] enter-drag pin warning: "
                                         f"{sync_exc}"
                                     )
+                                try:
+                                    _seed_joint_interp_from_state()
+                                except Exception:
+                                    pass
                                 try:
                                     g_now = self.robot_client.get_gain()
                                     parts = ["follow"]
@@ -1119,7 +1190,8 @@ class Arx5Controller(mp.Process):
                                 hard_gkp = float(hard["gripper_kp"])
                                 hard_gkd = float(hard["gripper_kd"])
 
-                                # 更细前几级；每级都是 set_gain 后立刻 sync（顺序很关键）
+                                # 更细前几级；每级都是 set_gain 后立刻 pin（顺序很关键）
+                                exit_pin_mode = None
                                 for alpha in (0.03, 0.06, 0.10, 0.15, 0.20, track_alpha):
                                     blended = {
                                         "kp": (1.0 - alpha) * soft_kp + alpha * hard_kp,
@@ -1131,11 +1203,13 @@ class Arx5Controller(mp.Process):
                                     }
                                     self.robot_client.set_gain(blended)
                                     try:
-                                        self.robot_client.sync_after_drag()
+                                        exit_pin_mode = _pin_measured_setpoint(
+                                            self.robot_client
+                                        )
                                     except Exception as e_sync:
                                         print(
-                                            "[Arx5Controller] sync_after_drag after "
-                                            f"set_gain failed: {e_sync}"
+                                            "[Arx5Controller] pin after set_gain "
+                                            f"failed: {e_sync}"
                                         )
                                     print_drag_diag(
                                         f"exit_drag.gain_alpha_{alpha:.2f}",
@@ -1145,16 +1219,21 @@ class Arx5Controller(mp.Process):
                                 print(
                                     "[Arx5Controller] exit drag: track gain "
                                     f"~{track_alpha:.0%} (full gain deferred)"
+                                    + (
+                                        f", pin={exit_pin_mode}"
+                                        if exit_pin_mode is not None
+                                        else ""
+                                    )
                                 )
                             except Exception as e_gain:
                                 print(f"[Arx5Controller] restore gain warning: {e_gain}")
                                 try:
-                                    self.robot_client.sync_after_drag()
+                                    _pin_measured_setpoint(self.robot_client)
                                 except Exception:
                                     pass
 
                             try:
-                                self.robot_client.sync_after_drag()
+                                _pin_measured_setpoint(self.robot_client)
                             except Exception:
                                 pass
                             self.robot_client.get_state()
@@ -1169,6 +1248,16 @@ class Arx5Controller(mp.Process):
                                 times=np.array([curr_t]),
                                 poses=np.array([[curr_gripper_pos, 0, 0, 0, 0, 0]]),
                             )
+                            # Seed joint interp but keep inactive while gains ramp in
+                            # RESTORE_GAINS: otherwise pin + active hold fight → shake.
+                            try:
+                                _seed_joint_interp_from_state()
+                            except Exception as seed_exc:
+                                print(
+                                    "[Arx5Controller] exit-drag joint seed warning: "
+                                    f"{seed_exc}"
+                                )
+                            joint_control_active = False
                             state = dict()
                             for key, func_name in self.receive_keys:
                                 state[key] = getattr(self.robot_client, func_name)
@@ -1185,11 +1274,13 @@ class Arx5Controller(mp.Process):
                     elif cmd == Command.RESTORE_GAINS_AFTER_DRAG.value:
                         try:
                             print_drag_diag("restore_full_gain.before")
+                            # Avoid dual command streams (interp hold + pin) at rising kp.
+                            joint_control_active = False
                             if saved_gain_before_drag is not None:
                                 try:
-                                    # 到达目标后再拉满；先 sync 再 set_gain，随后立刻再 sync
+                                    # 到达目标后再拉满；先 pin 再 set_gain，随后立刻再 pin
                                     try:
-                                        self.robot_client.sync_after_drag()
+                                        _pin_measured_setpoint(self.robot_client)
                                     except Exception:
                                         pass
                                     soft = self.robot_client.get_gain()
@@ -1215,19 +1306,34 @@ class Arx5Controller(mp.Process):
                                         }
                                         self.robot_client.set_gain(blended)
                                         try:
-                                            self.robot_client.sync_after_drag()
-                                        except Exception:
-                                            # 已在目标附近时，用当前 TCP 钉住即可
-                                            self.robot_client.get_state()
-                                            self.robot_client.set_tcp_pose(
-                                                self.robot_client.tcp_pose,
-                                                self.robot_client.gripper_pos,
+                                            pin = _pin_measured_setpoint(
+                                                self.robot_client
+                                            )
+                                            if alpha >= 0.99:
+                                                print(
+                                                    "[Arx5Controller] full-gain pin "
+                                                    f"via {pin}"
+                                                )
+                                        except Exception as pin_exc:
+                                            print(
+                                                "[Arx5Controller] full-gain pin "
+                                                f"warning: {pin_exc}"
                                             )
                                         print_drag_diag(
                                             f"restore_full_gain.alpha_{alpha:.1f}",
                                             gain_override=blended,
                                         )
                                         time.sleep(0.10)
+                                    # One clean hold after gains are full.
+                                    try:
+                                        _seed_joint_interp_from_state()
+                                        joint_control_active = True
+                                    except Exception as seed_exc:
+                                        print(
+                                            "[Arx5Controller] post-restore joint seed "
+                                            f"warning: {seed_exc}"
+                                        )
+                                        joint_control_active = False
                                     print(
                                         "[Arx5Controller] full gain restored after arrive"
                                     )
@@ -1239,6 +1345,11 @@ class Arx5Controller(mp.Process):
                                 saved_gain_before_drag = None
                             else:
                                 print("[Arx5Controller] no saved gain to restore")
+                                try:
+                                    _seed_joint_interp_from_state()
+                                    joint_control_active = True
+                                except Exception:
+                                    joint_control_active = False
                             print_drag_diag("restore_full_gain.after")
                         finally:
                             self.restore_gains_done.value = True

@@ -15,6 +15,10 @@ With ``--rtc``, overlaps inference with execution and sends
 ``prev_action_chunk`` / ``inference_delay`` / ``execute_horizon`` so the
 server (``serve_kai0_policy.py --rtc``) can run Pi0RTC guidance.
 
+With ``--dagger``, policy rollout can be interrupted for gravity-comp drag
+teleop; episodes are saved as UMI ``replay_buffer.zarr`` (TCP action schema,
+same as ``collect_drag_umi_zmq_bimanual.py``) plus an intervention sidecar.
+
 ZMQ servers should start with ``--joint`` (Kai0 is joint throughout).
 Example:
 
@@ -33,9 +37,19 @@ Example:
     python scripts/eval_arx5_kai0_bimanual.py \
       --policy-ip 127.0.0.1 --policy-port 8000 \
       --robot-ports 8765,8766 --camera-reorder 0,1 --no-preview \
-      --rtc --frequency 20 --steps-per-inference 8
+      --rtc --frequency 20 --steps-per-inference 8 \
+      --rtc-max-guidance-weight 0.5
 
-Controls: C=start execution, S=stop/hold, I=infer once without motion, Q=quit.
+    # DAgger (policy + drag intervention, UMI zarr):
+    python scripts/eval_arx5_kai0_bimanual.py \
+      --policy-ip 127.0.0.1 --policy-port 8000 \
+      --robot-ports 8765,8766 --camera-reorder 0,1 --no-preview \
+      --dagger --output data_local/kai0_dagger \
+      --steps-per-inference 32
+
+Controls (default): C=start execution, S=stop/hold, I=infer once without motion, Q=quit.
+Controls (--dagger): C=start episode+policy, D=drag intervene, R=resume policy,
+  S=save episode, B=abort episode, Q=quit.
 """
 
 from __future__ import annotations
@@ -65,11 +79,17 @@ if CLIENT_SRC.is_dir():
 
 from modules.arx5_env_with_images_bimanual_rs import Arx5EnvWithImages  # noqa: E402
 from openpi_client.websocket_client_policy import WebsocketClientPolicy  # noqa: E402
+from utils.kai0_dagger_drag import abort_episode  # noqa: E402
+from utils.kai0_dagger_drag import enter_drag_mode  # noqa: E402
+from utils.kai0_dagger_drag import leave_drag_stay_pose  # noqa: E402
+from utils.kai0_dagger_drag import record_pose_action  # noqa: E402
+from utils.kai0_dagger_drag import save_intervention_sidecar  # noqa: E402
 from utils.kai0_rtc import JointRTCChunk  # noqa: E402
 from utils.kai0_rtc import JointRTCInferenceWorker  # noqa: E402
 from utils.kai0_rtc import build_joint_chunk  # noqa: E402
 from utils.kai0_rtc import estimate_delay_steps  # noqa: E402
 from utils.kai0_rtc import stitch_chunk_to_state  # noqa: E402
+from utils.other_util import precise_wait  # noqa: E402
 
 DEFAULT_PROMPT = "Flatten and fold the cloth."
 ACTION_DIM = 14
@@ -1011,6 +1031,650 @@ def run_rtc(
         _stop_worker()
 
 
+def _sync_intervention_labels(
+    env: Arx5EnvWithImages,
+    labels: list[int],
+    flag: int,
+) -> None:
+    """Grow labels to match action_accumulator grid after a record put."""
+    if env.action_accumulator is None:
+        return
+    n = len(env.action_accumulator)
+    while len(labels) < n:
+        labels.append(int(flag))
+
+
+def run_dagger(
+    *,
+    env: Arx5EnvWithImages,
+    policy: WebsocketClientPolicy,
+    keys: TerminalKeys,
+    prompt: str,
+    frequency: float,
+    steps_per_inference: int,
+    max_joint_step: float,
+    gripper_min: float,
+    gripper_max: float,
+    observe_only: bool,
+    preview_enabled: bool,
+    output_dir: Path,
+    use_rtc: bool,
+    rtc_s_min: int,
+    rtc_delay_buffer_size: int,
+    rtc_max_guidance_weight: float,
+) -> None:
+    """Policy-in-the-loop DAgger with gravity-comp drag and UMI zarr episodes."""
+    dt = 1.0 / frequency
+    recording = False
+    drag_mode = False
+    executing = False
+    intervention_labels: list[int] = []
+    last_rotvecs: list[np.ndarray | None] = [None, None]
+    # Open-loop chunk bookkeeping
+    ol_actions: np.ndarray | None = None
+    ol_schedule_end = 0.0
+    # After R: soft-start so first chunks don't dump a long jerking traj.
+    resume_soft_batches_left = 0
+    # RTC bookkeeping
+    worker: JointRTCInferenceWorker | None = None
+    current_chunk = None
+    cursor = 0
+    schedule_end = 0.0
+    last_commanded: np.ndarray | None = None
+    prev_commanded: np.ndarray | None = None
+
+    def _record_tick(obs: dict) -> None:
+        if not recording:
+            return
+        record_pose_action(env, obs, last_rotvecs=last_rotvecs)
+        _sync_intervention_labels(env, intervention_labels, 1 if drag_mode else 0)
+
+    def _stop_rtc() -> None:
+        nonlocal worker, current_chunk, cursor, schedule_end
+        nonlocal last_commanded, prev_commanded
+        if worker is not None:
+            worker.close(wait=True, timeout_s=5.0)
+            worker = None
+        current_chunk = None
+        cursor = 0
+        schedule_end = 0.0
+        last_commanded = None
+        prev_commanded = None
+
+    def _clear_ol_chunk() -> None:
+        nonlocal ol_actions, ol_schedule_end
+        ol_actions = None
+        ol_schedule_end = 0.0
+
+    def _stop_policy_motion() -> None:
+        _stop_rtc()
+        _clear_ol_chunk()
+        try:
+            hold_current(env)
+        except Exception as exc:  # noqa: BLE001
+            print(f"hold_current warning: {exc}")
+
+    def _get_obs_bundle() -> dict:
+        obs = env.get_obs()
+        state = measured_state(env)
+        return {"obs": obs, "state": state}
+
+    def _rtc_infer_fn(
+        *,
+        obs_bundle: dict,
+        rtc_prev_chunk: np.ndarray,
+        rtc_inference_delay: int,
+        rtc_execution_horizon: int,
+    ) -> tuple[np.ndarray, float]:
+        started = time.monotonic()
+        payload = rtc_policy_observation(
+            obs_bundle["obs"],
+            obs_bundle["state"],
+            prompt,
+            prev_action_chunk=rtc_prev_chunk,
+            inference_delay=rtc_inference_delay,
+            execute_horizon=rtc_execution_horizon,
+            max_guidance_weight=rtc_max_guidance_weight,
+            enable_rtc=True,
+        )
+        result = policy.infer(payload)
+        latency = time.monotonic() - started
+        return np.asarray(result["actions"], dtype=np.float32), latency
+
+    def _seed_rtc(*, resume_blend: bool = False) -> None:
+        nonlocal worker, current_chunk, cursor, schedule_end
+        nonlocal last_commanded, prev_commanded
+        _stop_rtc()
+        obs = env.get_obs()
+        state = measured_state(env)
+        started = time.monotonic()
+        warm = policy.infer(policy_observation(obs, state, prompt))
+        warm_latency = time.monotonic() - started
+        raw = np.asarray(warm["actions"], dtype=np.float32)
+        action_horizon = int(raw.shape[0])
+        seed_prev = np.tile(state.astype(np.float32)[None, :], (action_horizon, 1))
+        started = time.monotonic()
+        result = policy.infer(
+            rtc_policy_observation(
+                obs,
+                state,
+                prompt,
+                prev_action_chunk=seed_prev,
+                inference_delay=0,
+                execute_horizon=min(rtc_s_min, action_horizon),
+                max_guidance_weight=rtc_max_guidance_weight,
+                enable_rtc=True,
+            )
+        )
+        latency = time.monotonic() - started
+        raw = np.asarray(result["actions"], dtype=np.float32)
+        raw_chunk = build_joint_chunk(raw)
+        # Match plain run_rtc on C: raw chunk. Only stitch hard after drag (R).
+        if resume_blend:
+            # Re-measure after infer latency — arms can settle/drift under full
+            # gain while we waited; stitching to a stale pre-infer pose jerks.
+            try:
+                hold_current(env)
+            except Exception as exc:  # noqa: BLE001
+                print(f"post-infer hold warning: {exc}")
+            state = measured_state(env)
+            blend = RTC_BLEND_STEPS * 2
+            current_chunk = stitch_chunk_to_state(
+                raw_chunk,
+                state,
+                blend_steps=blend,
+                prev_velocity=None,
+                keep_anchor=True,  # from rest: first cmd must be hold, not skip0
+            )
+            # Explicit short hold prefix so leave-drag settle isn't the first
+            # motion the servo sees from the policy stream.
+            hold_n = max(2, min(4, int(round(0.15 * frequency))))
+            hold_rows = np.tile(
+                np.asarray(state, dtype=np.float32)[None, :], (hold_n, 1)
+            )
+            current_chunk = JointRTCChunk(
+                actions=np.concatenate(
+                    [hold_rows, np.asarray(current_chunk.actions, dtype=np.float32)],
+                    axis=0,
+                ),
+                created_monotonic=current_chunk.created_monotonic,
+            )
+            last_commanded = np.asarray(state, dtype=np.float64).copy()
+            jump_l = float(
+                np.max(np.abs(raw[0, 0:6] - state[0:6]))
+            ) if len(raw) else 0.0
+            jump_r = float(
+                np.max(np.abs(raw[0, 7:13] - state[7:13]))
+            ) if len(raw) else 0.0
+            print(
+                f"[DAgger/RTC] resume stitch keep_anchor hold_n={hold_n} "
+                f"raw0_jump L={jump_l:.4f} R={jump_r:.4f}"
+            )
+        else:
+            blend = 0
+            current_chunk = raw_chunk
+            last_commanded = None
+        cursor = 0
+        schedule_end = 0.0
+        prev_commanded = None
+        init_delay = max(
+            1, estimate_delay_steps(max(latency, warm_latency), frequency)
+        )
+        rtc_batch = min(int(steps_per_inference), 8)
+        worker = JointRTCInferenceWorker(
+            _rtc_infer_fn,
+            frequency=frequency,
+            s_min=rtc_s_min,
+            delay_buffer_size=rtc_delay_buffer_size,
+            initial_delay_steps=init_delay,
+            action_dim=ACTION_DIM,
+            action_horizon=action_horizon,
+            schedule_batch_size=rtc_batch,
+            soft_min=RTC_SOFT_MIN,
+        )
+        print(
+            f"[DAgger/RTC] seeded H={current_chunk.horizon} "
+            f"latency={latency:.3f}s blend={blend} "
+            f"state={_fmt14(state)}"
+        )
+
+    def _start_episode() -> None:
+        nonlocal recording, drag_mode, executing, intervention_labels, last_rotvecs
+        if observe_only:
+            print("Ignoring C: --observe-only")
+            return
+        if recording:
+            if drag_mode:
+                print("Already recording in drag; press R to resume policy")
+            else:
+                executing = True
+                print("Policy execution resumed")
+                if use_rtc:
+                    _seed_rtc()
+                else:
+                    _clear_ol_chunk()
+            return
+        episode_id = env.replay_buffer.n_episodes
+        eval_t_start = time.time() + 0.5
+        env.start_episode(eval_t_start)
+        recording = True
+        drag_mode = False
+        executing = True
+        intervention_labels = []
+        last_rotvecs = [None, None]
+        _clear_ol_chunk()
+        print(f"[DAgger] Episode {episode_id} started (policy)")
+        if use_rtc:
+            _seed_rtc()
+
+    def _enter_drag() -> None:
+        nonlocal drag_mode, executing
+        if not recording:
+            print("Press C to start an episode before intervening")
+            return
+        if drag_mode:
+            print("Already in drag mode")
+            return
+        executing = False
+        _stop_policy_motion()
+        enter_drag_mode(env)
+        drag_mode = True
+        print("[DAgger] Drag intervention ON (R=resume policy, S=save, B=abort)")
+
+    def _resume_policy() -> None:
+        nonlocal drag_mode, executing, resume_soft_batches_left
+        if not recording:
+            print("No active episode")
+            return
+        if not drag_mode:
+            print("Not in drag mode")
+            return
+        leave_drag_stay_pose(env)
+        drag_mode = False
+        # Re-seed from measured joints after GC exit (stale joint_interp risk).
+        try:
+            hold_current(env)
+        except Exception as exc:  # noqa: BLE001
+            print(f"post-drag hold warning: {exc}")
+        # Let full-gain hold settle before dumping a new policy chunk.
+        # Extra settle: right arm often finishes restore_gains last and needs
+        # a beat before the first policy waypoint.
+        time.sleep(0.5)
+        try:
+            hold_current(env)
+        except Exception as exc:  # noqa: BLE001
+            print(f"post-settle hold warning: {exc}")
+        executing = True
+        _clear_ol_chunk()
+        # Soft-start after R (OL and RTC): policy often saturates max_joint_step
+        # from a dragged pose and feels like shaking. Mid-chunk RTC skip0 is
+        # wrong here (standstill) — seed uses keep_anchor + hold prefix.
+        if use_rtc:
+            resume_soft_batches_left = 10
+            _seed_rtc(resume_blend=True)
+        else:
+            resume_soft_batches_left = 4
+        print(
+            "[DAgger] Resumed policy from current pose "
+            f"(soft-start batches={resume_soft_batches_left})"
+        )
+
+    def _save_episode() -> None:
+        nonlocal recording, drag_mode, executing, intervention_labels, last_rotvecs
+        if not recording:
+            print("No active episode to save")
+            return
+        executing = False
+        _stop_rtc()
+        _clear_ol_chunk()
+        if drag_mode:
+            leave_drag_stay_pose(env)
+            drag_mode = False
+        try:
+            hold_current(env)
+        except Exception as exc:  # noqa: BLE001
+            print(f"pre-save hold warning: {exc}")
+
+        n_acc = (
+            len(env.action_accumulator) if env.action_accumulator is not None else 0
+        )
+        labels_arr = np.asarray(intervention_labels[:n_acc], dtype=np.uint8)
+        if n_acc == 0:
+            print("[DAgger] Empty episode; aborting instead of save")
+            abort_episode(env)
+        else:
+            env.end_episode()
+            if env.replay_buffer.n_episodes > 0:
+                ep_id = env.replay_buffer.n_episodes - 1
+                try:
+                    ep = env.replay_buffer.get_episode(ep_id, copy=False)
+                    t_ep = int(len(ep["action"]))
+                    labels_arr = labels_arr[:t_ep]
+                except Exception as exc:  # noqa: BLE001
+                    print(f"intervention align warning: {exc}")
+                save_intervention_sidecar(output_dir, ep_id, labels_arr)
+                print(f"[DAgger] Saved episode {ep_id}")
+            else:
+                print("[DAgger] end_episode wrote nothing")
+
+        recording = False
+        intervention_labels = []
+        last_rotvecs = [None, None]
+
+    def _abort() -> None:
+        nonlocal recording, drag_mode, executing, intervention_labels, last_rotvecs
+        if not recording:
+            print("No active episode to abort")
+            return
+        executing = False
+        _stop_rtc()
+        _clear_ol_chunk()
+        if drag_mode:
+            leave_drag_stay_pose(env)
+            drag_mode = False
+        abort_episode(env)
+        recording = False
+        intervention_labels = []
+        last_rotvecs = [None, None]
+        try:
+            hold_current(env)
+        except Exception as exc:  # noqa: BLE001
+            print(f"post-abort hold warning: {exc}")
+
+    def _status_text() -> str:
+        if not recording:
+            return "IDLE  C:start D:n/a S:n/a Q:quit"
+        if drag_mode:
+            return "DRAG  R:policy S:save B:abort Q:quit"
+        if executing:
+            tag = "RTC" if use_rtc else "OL"
+            return f"POLICY({tag})  D:drag S:save B:abort Q:quit"
+        return "HOLD  C:policy D:drag S:save B:abort Q:quit"
+
+    def _schedule_ol_batch() -> None:
+        nonlocal ol_actions, ol_schedule_end, resume_soft_batches_left
+        obs = env.get_obs()
+        current = measured_state(env)
+        started = time.monotonic()
+        result = policy.infer(policy_observation(obs, current, prompt))
+        latency = time.monotonic() - started
+        soft = resume_soft_batches_left > 0
+        count = min(8, int(steps_per_inference)) if soft else int(steps_per_inference)
+        if soft:
+            soft_scale = 0.15 if resume_soft_batches_left >= 2 else 0.40
+        else:
+            soft_scale = 1.0
+        step_lim = float(max_joint_step) * soft_scale
+        ol_actions = guarded_chunk(
+            result["actions"],
+            current,
+            count=count,
+            max_joint_step=step_lim,
+            gripper_min=gripper_min,
+            gripper_max=gripper_max,
+        )
+        if soft:
+            resume_soft_batches_left -= 1
+        t0 = max(time.time() + 0.05, ol_schedule_end)
+        stamps = np.arange(len(ol_actions), dtype=np.float64) * dt + t0
+        command_joint_actions(env, ol_actions, stamps)
+        ol_schedule_end = float(stamps[-1])
+        soft_tag = " soft" if soft else ""
+        print(
+            f"[DAgger/OL] infer={latency:.3f}s exec={len(ol_actions)}{soft_tag} "
+            f"first={_fmt14(ol_actions[0])}"
+        )
+
+    def _schedule_rtc_batch() -> bool:
+        """Schedule next RTC batch; return False if nothing to do this tick."""
+        nonlocal current_chunk, cursor, schedule_end, last_commanded, prev_commanded
+        nonlocal resume_soft_batches_left
+        if worker is None or current_chunk is None:
+            _seed_rtc()
+            return False
+
+        polled = worker.poll(executed_since_chunk=cursor)
+        if polled is not None:
+            raw_chunk, trim_steps, s_used = polled
+            prev_vel = None
+            if last_commanded is not None and prev_commanded is not None:
+                prev_vel = (
+                    np.asarray(last_commanded, dtype=np.float32)
+                    - np.asarray(prev_commanded, dtype=np.float32)
+                )
+            # Longer blend while soft-starting after drag resume.
+            blend = (
+                RTC_BLEND_STEPS * 2
+                if resume_soft_batches_left > 0
+                else RTC_BLEND_STEPS
+            )
+            stitched = stitch_chunk_to_state(
+                raw_chunk,
+                last_commanded,
+                blend_steps=blend,
+                prev_velocity=prev_vel if resume_soft_batches_left <= 0 else None,
+            )
+            print(
+                f"[DAgger/RTC] swap cursor={cursor} trim={trim_steps} "
+                f"s={s_used} H={stitched.horizon} blend={blend}"
+            )
+            current_chunk = stitched
+            cursor = 0
+
+        if cursor >= current_chunk.horizon:
+            if worker.awaiting_swap:
+                return False
+            worker.maybe_start(
+                executed_since_chunk=max(cursor, 1),
+                current_chunk=current_chunk,
+                get_obs_bundle=_get_obs_bundle,
+                force=True,
+            )
+            return False
+
+        if worker.commit_end is not None:
+            if cursor >= worker.commit_end:
+                # Hold until the pending infer commits, then swap next tick.
+                if worker.awaiting_swap:
+                    done = worker.poll(executed_since_chunk=cursor)
+                    if done is not None:
+                        raw_chunk, trim_steps, s_used = done
+                        prev_vel = None
+                        if (
+                            last_commanded is not None
+                            and prev_commanded is not None
+                        ):
+                            prev_vel = (
+                                np.asarray(last_commanded, dtype=np.float32)
+                                - np.asarray(prev_commanded, dtype=np.float32)
+                            )
+                        blend = (
+                            RTC_BLEND_STEPS * 2
+                            if resume_soft_batches_left > 0
+                            else RTC_BLEND_STEPS
+                        )
+                        current_chunk = stitch_chunk_to_state(
+                            raw_chunk,
+                            last_commanded,
+                            blend_steps=blend,
+                            prev_velocity=(
+                                prev_vel if resume_soft_batches_left <= 0 else None
+                            ),
+                        )
+                        print(
+                            f"[DAgger/RTC] swap(commit_end) trim={trim_steps} "
+                            f"s={s_used} H={current_chunk.horizon}"
+                        )
+                        cursor = 0
+                        return True
+                return False
+            remaining_commit = worker.commit_end - cursor
+        else:
+            _d, _switch_s, s_trigger = worker.plan_horizons(current_chunk.horizon)
+            remaining_commit = (
+                s_trigger - cursor if cursor < s_trigger else worker.delay_align
+            )
+
+        remaining = current_chunk.horizon - cursor
+        soft = resume_soft_batches_left > 0
+        schedule_batch = min(steps_per_inference, worker.delay_align)
+        if soft:
+            schedule_batch = min(schedule_batch, 4)
+        n = min(schedule_batch, remaining, remaining_commit)
+        if n <= 0:
+            return False
+
+        anchor = (
+            last_commanded if last_commanded is not None else measured_state(env)
+        )
+        # Early soft batches after R: very small Δq so a large right-arm
+        # policy jump cannot saturate into a visible shake.
+        if soft:
+            soft_scale = 0.12 if resume_soft_batches_left >= 6 else 0.28
+        else:
+            soft_scale = 1.0
+        step_lim = float(max_joint_step) * soft_scale
+        batch_actions = guarded_chunk(
+            current_chunk.actions[cursor : cursor + n],
+            anchor,
+            count=n,
+            max_joint_step=step_lim,
+            gripper_min=gripper_min,
+            gripper_max=gripper_max,
+        )
+        if soft:
+            resume_soft_batches_left -= 1
+            # Per-arm first-step jump (helps spot right-only shake).
+            d0 = batch_actions[0] - np.asarray(anchor, dtype=np.float64)
+            jump_l = float(np.max(np.abs(d0[0:6])))
+            jump_r = float(np.max(np.abs(d0[7:13])))
+            print(
+                f"[DAgger/RTC] sched soft n={n} step_lim={step_lim:.4f} "
+                f"left={resume_soft_batches_left} "
+                f"d0 L={jump_l:.4f} R={jump_r:.4f}"
+            )
+        t0 = max(time.time() + 0.05, schedule_end)
+        stamps = np.arange(len(batch_actions), dtype=np.float64) * dt + t0
+        command_joint_actions(env, batch_actions, stamps)
+        schedule_end = float(stamps[-1])
+        if len(batch_actions) >= 2:
+            prev_commanded = np.asarray(batch_actions[-2], dtype=np.float64)
+        elif last_commanded is not None:
+            prev_commanded = np.asarray(last_commanded, dtype=np.float64)
+        last_commanded = np.asarray(batch_actions[-1], dtype=np.float64)
+        cursor += n
+        worker.maybe_start(
+            executed_since_chunk=cursor,
+            current_chunk=current_chunk,
+            get_obs_bundle=_get_obs_bundle,
+        )
+        return True
+
+    def _quit_from_keys() -> None:
+        nonlocal drag_mode, recording
+        if drag_mode:
+            leave_drag_stay_pose(env)
+            drag_mode = False
+        if recording:
+            print("[DAgger] Quit with active episode — aborting")
+            abort_episode(env)
+            recording = False
+        _stop_rtc()
+        try:
+            hold_current(env)
+        except Exception as exc:  # noqa: BLE001
+            print(f"quit hold warning: {exc}")
+
+    def _process_keys(key_list: list[str]) -> str:
+        """Handle keys. Returns '' | 'quit' | 'break' (leave wait/exec path)."""
+        for key in key_list:
+            if key == "q":
+                _quit_from_keys()
+                return "quit"
+            if key == "c":
+                _start_episode()
+            elif key == "d":
+                _enter_drag()
+                return "break"
+            elif key == "r":
+                _resume_policy()
+                return "break"
+            elif key == "s":
+                _save_episode()
+                return "break"
+            elif key == "b":
+                _abort()
+                return "break"
+        return ""
+
+    t_start = time.monotonic()
+    iter_idx = 0
+    print(
+        "[DAgger] ready. C=start episode+policy, D=drag, R=resume, "
+        "S=save, B=abort, Q=quit"
+    )
+    try:
+        while True:
+            t_cycle = t_start + (iter_idx + 1) * dt
+            action = _process_keys(keys.read())
+            if action == "quit":
+                return
+
+            if drag_mode or not executing:
+                obs = env.get_obs()
+                _record_tick(obs)
+                show_preview(obs, _status_text(), enabled=preview_enabled)
+                precise_wait(t_cycle)
+                iter_idx += 1
+                continue
+
+            if use_rtc:
+                # Match plain run_rtc: schedule then wait until schedule_end so
+                # the next batch chains without a wall-clock gap (chunk hitch).
+                _schedule_rtc_batch()
+                deadline = (
+                    float(schedule_end) if schedule_end > 0.0 else time.time() + dt
+                )
+                next_rec = time.time()
+                aborted = False
+                while time.time() < deadline:
+                    action = _process_keys(keys.read())
+                    if action == "quit":
+                        return
+                    if action == "break" or drag_mode or not executing:
+                        aborted = True
+                        break
+                    now = time.time()
+                    if now >= next_rec:
+                        obs = env.get_obs()
+                        _record_tick(obs)
+                        show_preview(
+                            obs, _status_text(), enabled=preview_enabled
+                        )
+                        next_rec = now + dt
+                    time.sleep(0.005)
+                if aborted:
+                    precise_wait(t_cycle)
+                iter_idx += 1
+                continue
+
+            obs = env.get_obs()
+            _record_tick(obs)
+            show_preview(obs, _status_text(), enabled=preview_enabled)
+            now = time.time()
+            if ol_actions is None or ol_schedule_end <= now + dt:
+                _schedule_ol_batch()
+            precise_wait(t_cycle)
+            iter_idx += 1
+    finally:
+        if drag_mode:
+            try:
+                leave_drag_stay_pose(env)
+            except Exception as exc:  # noqa: BLE001
+                print(f"final leave_drag warning: {exc}")
+        _stop_rtc()
+
+
 @click.command()
 @click.option("--policy-ip", default="127.0.0.1", show_default=True)
 @click.option("--policy-port", default=8000, type=int, show_default=True)
@@ -1061,6 +1725,15 @@ def run_rtc(
     help="Overlapping RTC with prev_action_chunk (server must use --rtc).",
 )
 @click.option(
+    "--dagger",
+    is_flag=True,
+    help=(
+        "DAgger mode: C start episode+policy, D gravity-comp drag intervene, "
+        "R resume policy, S save UMI zarr episode, B abort. "
+        "Writes intervention sidecars under {output}/intervention/."
+    ),
+)
+@click.option(
     "--rtc-s-min",
     default=8,
     type=click.IntRange(1, 48),
@@ -1079,7 +1752,7 @@ def run_rtc(
 )
 @click.option(
     "--rtc-max-guidance-weight",
-    default=2,
+    default=0.5,
     type=float,
     show_default=True,
     help="RTC server soft-guidance weight (kai0 default 0.5). Raise carefully.",
@@ -1113,6 +1786,7 @@ def main(
     init_joints: str,
     init_duration: float,
     rtc: bool,  # noqa: FBT001
+    dagger: bool,  # noqa: FBT001
     rtc_s_min: int,
     rtc_delay_buffer_size: int,
     rtc_max_guidance_weight: float,
@@ -1156,9 +1830,17 @@ def main(
             f"[RTC] enabled: s_min={rtc_s_min}, delay_buf={rtc_delay_buffer_size}, "
             f"max_gw={rtc_max_guidance_weight}, steps_per_inference={steps_per_inference}"
         )
-    print("Controls: C=start execution, S=stop/hold, I=infer once, Q=quit")
+    if dagger:
+        print(
+            "Controls (DAgger): C=start episode+policy, D=drag intervene, "
+            "R=resume policy, S=save episode, B=abort, Q=quit"
+        )
+    else:
+        print("Controls: C=start execution, S=stop/hold, I=infer once, Q=quit")
     if observe_only:
         print("OBSERVE ONLY: motor commands are permanently disabled")
+    if dagger and observe_only:
+        raise click.ClickException("--dagger cannot be combined with --observe-only")
 
     dt = 1.0 / frequency
     max_joint_step = max_joint_speed * dt
@@ -1234,7 +1916,20 @@ def main(
                 observe_only=observe_only,
                 preview_enabled=preview_enabled,
             )
-            if rtc:
+            if dagger:
+                print(
+                    f"[DAgger] UMI zarr output -> {output_path} "
+                    f"(rtc={'on' if rtc else 'off'})"
+                )
+                run_dagger(
+                    **common,
+                    output_dir=output_path,
+                    use_rtc=rtc,
+                    rtc_s_min=rtc_s_min,
+                    rtc_delay_buffer_size=rtc_delay_buffer_size,
+                    rtc_max_guidance_weight=rtc_max_guidance_weight,
+                )
+            elif rtc:
                 run_rtc(
                     **common,
                     rtc_s_min=rtc_s_min,

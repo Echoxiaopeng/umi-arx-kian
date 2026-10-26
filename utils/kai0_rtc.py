@@ -92,12 +92,17 @@ def stitch_chunk_to_state(
     *,
     blend_steps: int = 16,
     prev_velocity: np.ndarray | None = None,
+    keep_anchor: bool = False,
 ) -> JointRTCChunk:
     """Temporal blend a new chunk onto the last commanded joints (kai0-style).
 
     Builds a C0 anchor at ``last``, optionally C1-coasts with ``prev_velocity``,
-    then **drops** the duplicate ``actions[0] == last`` so the first scheduled
-    waypoint continues motion (avoids a one-step dq=0 hitch at every swap).
+    then by default **drops** the duplicate ``actions[0] == last`` so the first
+    scheduled waypoint continues motion (avoids a one-step dq=0 hitch at every
+    mid-chunk RTC swap).
+
+    Set ``keep_anchor=True`` when resuming from standstill (e.g. DAgger R after
+    drag): dropping the anchor would turn rest → sudden first step into a jerk.
 
     Without ``prev_velocity``, uses a position-only linear fade (C0).
     """
@@ -136,7 +141,12 @@ def stitch_chunk_to_state(
 
     # Drop the duplicate start pose (== last). Re-scheduling it yields a one-step
     # dq=0 hitch (fast→stop→go) at every swap; the next waypoint already carries C1.
-    if len(actions) >= 2 and float(np.max(np.abs(actions[0] - last))) < 1e-5:
+    # Keep it when starting from rest (drag→policy) so the first command is hold.
+    if (
+        not keep_anchor
+        and len(actions) >= 2
+        and float(np.max(np.abs(actions[0] - last))) < 1e-5
+    ):
         actions = actions[1:]
 
     return JointRTCChunk(actions=actions, created_monotonic=chunk.created_monotonic)
