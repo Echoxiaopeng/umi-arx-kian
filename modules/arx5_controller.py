@@ -71,12 +71,17 @@ DRAG_ARM_KD_SCALE = 0.015
 
 
 def _looks_like_joint_server_error(exc: BaseException) -> bool:
+    """True only when EE cmds are clearly unavailable (--joint server).
+
+    Do NOT match ``EVAN_SYNC_AFTER_DRAG``: an unknown-sync error on a
+    cartesian collect server is not joint-mode, and falling back to
+    ``SET_JOINT_POSITION`` hot-swaps cartesian→joint and bricks spdlog.
+    """
     msg = str(exc)
     return (
         "--joint" in msg
         or "SET_EE_POSE" in msg
         or "cartesian server" in msg
-        or "EVAN_SYNC_AFTER_DRAG" in msg
     )
 
 
@@ -102,19 +107,24 @@ def _pin_measured_setpoint(robot_client: Arx5Client) -> str:
     Prefer cartesian ``sync_after_drag`` / TCP pin (UMI collect path). On
     ``--joint`` Kai0 servers those fail; fall back to ``SET_JOINT_POSITION``.
     Returns which path was used: ``cartesian_sync`` | ``tcp`` | ``joint``.
+
+    Always try TCP before joint: joint fallback on a cartesian server
+    triggers hot-swap and leaves the process dead (spdlog logger held).
     """
     robot_client.get_state()
     try:
         robot_client.sync_after_drag()
         return "cartesian_sync"
     except Exception as sync_exc:
-        if not _looks_like_joint_server_error(sync_exc):
-            try:
-                _sync_measured_tcp_gripper(robot_client)
-                return "tcp"
-            except Exception as tcp_exc:
-                if not _looks_like_joint_server_error(tcp_exc):
-                    raise
+        try:
+            _sync_measured_tcp_gripper(robot_client)
+            return "tcp"
+        except Exception as tcp_exc:
+            if not (
+                _looks_like_joint_server_error(tcp_exc)
+                or _looks_like_joint_server_error(sync_exc)
+            ):
+                raise tcp_exc
         q7 = _measured_joint7(robot_client)
         robot_client.set_joint_position(q7)
         return "joint"
@@ -1324,16 +1334,51 @@ class Arx5Controller(mp.Process):
                                             gain_override=blended,
                                         )
                                         time.sleep(0.10)
-                                    # One clean hold after gains are full.
+                                    # Hold with EE pose after restore.
+                                    # Enabling joint_control here issues
+                                    # SET_JOINT_POSITION every tick; on a
+                                    # cartesian zmq_server that hot-swaps to
+                                    # joint and dies with spdlog "logger
+                                    # already exists" (breaks collect save→
+                                    # re-enter-drag). Kai0 --joint already
+                                    # holds via schedule_joint_waypoint.
+                                    joint_control_active = False
                                     try:
+                                        self.robot_client.get_state()
+                                        curr_pose = self.robot_client.tcp_pose
+                                        curr_gripper_pos = (
+                                            self.robot_client.gripper_pos
+                                        )
+                                        curr_t = time.monotonic()
+                                        last_waypoint_time = curr_t
+                                        pose_interp = PoseTrajectoryInterpolator(
+                                            times=np.array([curr_t]),
+                                            poses=np.array([curr_pose]),
+                                        )
+                                        gripper_pos_interp = (
+                                            PoseTrajectoryInterpolator(
+                                                times=np.array([curr_t]),
+                                                poses=np.array(
+                                                    [
+                                                        [
+                                                            curr_gripper_pos,
+                                                            0,
+                                                            0,
+                                                            0,
+                                                            0,
+                                                            0,
+                                                        ]
+                                                    ]
+                                                ),
+                                            )
+                                        )
+                                        allow_ee_pose = True
                                         _seed_joint_interp_from_state()
-                                        joint_control_active = True
                                     except Exception as seed_exc:
                                         print(
-                                            "[Arx5Controller] post-restore joint seed "
+                                            "[Arx5Controller] post-restore EE hold "
                                             f"warning: {seed_exc}"
                                         )
-                                        joint_control_active = False
                                     print(
                                         "[Arx5Controller] full gain restored after arrive"
                                     )
@@ -1345,11 +1390,27 @@ class Arx5Controller(mp.Process):
                                 saved_gain_before_drag = None
                             else:
                                 print("[Arx5Controller] no saved gain to restore")
+                                joint_control_active = False
                                 try:
+                                    self.robot_client.get_state()
+                                    curr_pose = self.robot_client.tcp_pose
+                                    curr_gripper_pos = self.robot_client.gripper_pos
+                                    curr_t = time.monotonic()
+                                    last_waypoint_time = curr_t
+                                    pose_interp = PoseTrajectoryInterpolator(
+                                        times=np.array([curr_t]),
+                                        poses=np.array([curr_pose]),
+                                    )
+                                    gripper_pos_interp = PoseTrajectoryInterpolator(
+                                        times=np.array([curr_t]),
+                                        poses=np.array(
+                                            [[curr_gripper_pos, 0, 0, 0, 0, 0]]
+                                        ),
+                                    )
+                                    allow_ee_pose = True
                                     _seed_joint_interp_from_state()
-                                    joint_control_active = True
                                 except Exception:
-                                    joint_control_active = False
+                                    pass
                             print_drag_diag("restore_full_gain.after")
                         finally:
                             self.restore_gains_done.value = True

@@ -28,6 +28,16 @@ Example:
     # Kai0 server with RTC:
     #   uv run scripts/serve_kai0_policy.py --checkpoint <jax_ckpt> --rtc --port 8000
 
+# ssh 远程运行方式：
+export DISPLAY=:1
+export XAUTHORITY=/run/user/1000/gdm/Xauthority
+conda activate umi-arx
+python scripts/eval_arx5_kai0_bimanual.py \
+    --policy-ip 127.0.0.1 --policy-port 8000 \
+    --robot-ports 8765,8766 --camera-reorder 0,1 \
+    --steps-per-inference 32
+
+
     conda activate umi-arx
     python scripts/eval_arx5_kai0_bimanual.py \
       --policy-ip 127.0.0.1 --policy-port 8000 \
@@ -1735,7 +1745,7 @@ def run_dagger(
 )
 @click.option(
     "--rtc-s-min",
-    default=8,
+    default=16,
     type=click.IntRange(1, 48),
     show_default=True,
     help=(
