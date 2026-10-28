@@ -60,8 +60,8 @@ def enter_drag_mode(env: Arx5EnvWithImages) -> None:
     env.set_gravity_compensation()
     time.sleep(0.25)
     print(
-        "Drag mode ON (gravity if supported, else damping). "
-        "Drag arms freely; squeeze grippers by hand."
+        "Drag mode ON (true GC if supported, else soft-hold damping). "
+        "Drag arms freely; idle pose is held. Squeeze grippers by hand."
     )
 
 

@@ -1611,8 +1611,8 @@ def enter_drag_mode(env: Arx5EnvWithImages) -> None:
     # 伺服模式切换后再给一小段稳定时间
     time.sleep(0.25)
     print(
-        "Drag mode ON (gravity if supported, else damping). "
-        "Drag arm freely; squeeze gripper by hand (torque assist)."
+        "Drag mode ON (true GC if supported, else soft-hold damping). "
+        "Drag arm freely; idle pose is held. Squeeze gripper by hand (torque assist)."
     )
 
 

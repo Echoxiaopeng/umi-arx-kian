@@ -65,9 +65,17 @@ DRAG_GRIPPER_STUCK_VEL = 0.02
 DRAG_GRIPPER_STUCK_TAU = 0.55
 # 开口低于此且近似静止 → 视为故意握紧，禁止回弹顶开
 DRAG_GRIPPER_HOLD_CLOSED_LO = 0.020
-# P 键阻尼拖拽：臂 kp=0，kd 相对 set_to_damping 后再乘此系数（越小越轻、越飘）
-# 原 0.1 偏硬；0.03 约再软 3 倍。若仍沉可试 0.015；若发颤/难停再调回 0.05
-DRAG_ARM_KD_SCALE = 0.015
+# 阻尼拖拽（无真零力时）：纯 kp=0 + 极小 kd 会立刻垂臂。
+# 用硬增益比例托住重力；仅在「明显是人手在拖」时才让 hold 跟随，
+# 否则重力慢坠也会被当成跟手，hold 跟着掉（日志里 z 从 0.38→-0.01）。
+# kd 相对 set_to_damping 后再乘此系数（越大越不易下坠，拖拽略沉）。
+DRAG_ARM_KD_SCALE = 0.20
+# 相对进入拖拽前硬 kp 的比例；0.06 托不住双臂+相机，约 0.15–0.20 才稳。
+DRAG_ARM_KP_SCALE = 0.18
+# hold 跟随：要够大的速度+误差才跟手；门槛过低会把重力下坠当成拖动。
+DRAG_HOLD_POS_DEADBAND_M = 0.025
+DRAG_HOLD_VEL_THRESH = 0.40  # rad/s, max |qd|
+DRAG_HOLD_JOINT_ERR = 0.10  # rad, L2 of first 6 joints
 
 
 def _looks_like_joint_server_error(exc: BaseException) -> bool:
@@ -105,26 +113,32 @@ def _pin_measured_setpoint(robot_client: Arx5Client) -> str:
     """Pin controller setpoint to measured pose.
 
     Prefer cartesian ``sync_after_drag`` / TCP pin (UMI collect path). On
-    ``--joint`` Kai0 servers those fail; fall back to ``SET_JOINT_POSITION``.
+    ``--joint`` Kai0 servers ``EVAN_SYNC_AFTER_DRAG`` still returns OK (joint
+    pin), so we must probe ``SET_EE_POSE`` before claiming cartesian hold.
     Returns which path was used: ``cartesian_sync`` | ``tcp`` | ``joint``.
 
-    Always try TCP before joint: joint fallback on a cartesian server
-    triggers hot-swap and leaves the process dead (spdlog logger held).
+    Always try TCP before committing to joint: joint cmds on a cartesian
+    server can hot-swap and brick spdlog.
     """
     robot_client.get_state()
+    sync_ok = False
+    sync_exc: BaseException | None = None
     try:
         robot_client.sync_after_drag()
-        return "cartesian_sync"
-    except Exception as sync_exc:
-        try:
-            _sync_measured_tcp_gripper(robot_client)
-            return "tcp"
-        except Exception as tcp_exc:
-            if not (
-                _looks_like_joint_server_error(tcp_exc)
-                or _looks_like_joint_server_error(sync_exc)
-            ):
-                raise tcp_exc
+        sync_ok = True
+    except Exception as exc:  # noqa: BLE001
+        sync_exc = exc
+
+    # Probe EE: joint servers reject this even after a successful sync.
+    try:
+        _sync_measured_tcp_gripper(robot_client)
+        return "cartesian_sync" if sync_ok else "tcp"
+    except Exception as tcp_exc:  # noqa: BLE001
+        jointish = _looks_like_joint_server_error(tcp_exc) or (
+            sync_exc is not None and _looks_like_joint_server_error(sync_exc)
+        )
+        if not jointish:
+            raise tcp_exc
         q7 = _measured_joint7(robot_client)
         robot_client.set_joint_position(q7)
         return "joint"
@@ -602,6 +616,11 @@ class Arx5Controller(mp.Process):
             # start, stay passive (get_state only) until home or joint control.
             allow_ee_pose = bool(self.reset_to_home_on_start)
             saved_gain_before_drag = None
+            # Damping-drag soft hold (None on true GC). Pose/joint target while idle.
+            drag_hold_pose: np.ndarray | None = None
+            drag_hold_gripper: float | None = None
+            drag_hold_joint: np.ndarray | None = None
+            drag_hold_mode: str | None = None  # "tcp" | "joint"
             drag_gripper_vel_hist: list[float] = [0.0] * 5
             _ee_pose_fail_t = 0.0
             _joint_pose_fail_t = 0.0
@@ -719,8 +738,89 @@ class Arx5Controller(mp.Process):
                     except Exception:
                         pass
                 elif is_gravity_compensation:
-                    # 只读状态 + 谨慎的夹爪力矩辅助；禁止 set_tcp_pose（会让臂掉）
+                    # 真零力：只读状态。阻尼拖拽：软 hold（静止钉住、拖动跟随）+ 夹爪力矩。
                     self.robot_client.get_state()
+                    if drag_hold_mode is not None:
+                        try:
+                            qd = np.asarray(
+                                self.robot_client.joint_vel, dtype=np.float64
+                            ).reshape(-1)
+                            moving = (
+                                qd.size > 0
+                                and float(np.max(np.abs(qd)))
+                                >= float(DRAG_HOLD_VEL_THRESH)
+                            )
+                            if drag_hold_mode == "tcp" and drag_hold_pose is not None:
+                                meas = np.asarray(
+                                    self.robot_client.tcp_pose, dtype=np.float64
+                                ).reshape(6)
+                                g_meas = float(self.robot_client.gripper_pos)
+                                pos_err = float(
+                                    np.linalg.norm(meas[:3] - drag_hold_pose[:3])
+                                )
+                                if (
+                                    moving
+                                    and pos_err >= float(DRAG_HOLD_POS_DEADBAND_M)
+                                ):
+                                    drag_hold_pose = meas.copy()
+                                    drag_hold_gripper = g_meas
+                                grip_cmd = (
+                                    float(drag_hold_gripper)
+                                    if drag_hold_gripper is not None
+                                    else g_meas
+                                )
+                                self.robot_client.set_tcp_pose(
+                                    drag_hold_pose, grip_cmd
+                                )
+                            elif (
+                                drag_hold_mode == "joint"
+                                and drag_hold_joint is not None
+                            ):
+                                meas_q = _measured_joint7(self.robot_client)
+                                q_err = float(
+                                    np.linalg.norm(
+                                        meas_q[:6] - drag_hold_joint[:6]
+                                    )
+                                )
+                                # 慢速下坠不更新 hold，否则 soft kp 永远追不上重力。
+                                if moving and q_err >= float(DRAG_HOLD_JOINT_ERR):
+                                    drag_hold_joint = meas_q.copy()
+                                self.robot_client.set_joint_position(
+                                    drag_hold_joint
+                                )
+                        except Exception as hold_exc:
+                            # --joint servers: sync may look cartesian but EE fails.
+                            if (
+                                drag_hold_mode == "tcp"
+                                and _looks_like_joint_server_error(hold_exc)
+                            ):
+                                try:
+                                    drag_hold_joint = _measured_joint7(
+                                        self.robot_client
+                                    )
+                                    drag_hold_mode = "joint"
+                                    drag_hold_pose = None
+                                    drag_hold_gripper = None
+                                    self.robot_client.set_joint_position(
+                                        drag_hold_joint
+                                    )
+                                    print(
+                                        "[Arx5Controller] soft-hold fallback "
+                                        "tcp -> joint (--joint server)"
+                                    )
+                                except Exception as joint_hold_exc:
+                                    if time.monotonic() - _ee_pose_fail_t > 1.0:
+                                        _ee_pose_fail_t = time.monotonic()
+                                        print(
+                                            "[Arx5Controller] drag soft-hold "
+                                            f"joint fallback failed: {joint_hold_exc}"
+                                        )
+                            elif time.monotonic() - _ee_pose_fail_t > 1.0:
+                                _ee_pose_fail_t = time.monotonic()
+                                print(
+                                    "[Arx5Controller] drag soft-hold failed: "
+                                    f"{hold_exc}"
+                                )
                     try:
                         gvel = float(self.robot_client.gripper_vel)
                     except Exception:
@@ -1017,11 +1117,16 @@ class Arx5Controller(mp.Process):
                             print(f"[Arx5Controller] Exception in SET_JOINT_TRAJECTORY: {e}")
 
                     elif cmd == Command.SET_GRAVITY_COMPENSATION.value:
-                        # 优先真零力；ac_one / 普通 zmq_server 不支持时回退到阻尼拖拽
+                        # 优先真零力；ac_one / 普通 zmq_server 不支持时回退到
+                        # 软 hold 阻尼拖拽（少量 kp 抗坠 + 拖动跟手）。
                         try:
                             print_drag_diag("enter_drag.before")
                             entered = False
                             drag_gripper_vel_hist = [0.0] * 5
+                            drag_hold_pose = None
+                            drag_hold_gripper = None
+                            drag_hold_joint = None
+                            drag_hold_mode = None
                             try:
                                 self.robot_client.set_gravity_compensation(True)
                                 # 真零力路径也要把夹爪位置环清零，否则墙力矩会被 kp 顶住
@@ -1045,10 +1150,16 @@ class Arx5Controller(mp.Process):
                             except Exception as e:
                                 print(
                                     "[Arx5Controller] SET_GRAVITY_COMPENSATION unsupported "
-                                    f"({e}); falling back to SET_TO_DAMPING drag."
+                                    f"({e}); falling back to soft-hold damping drag."
                                 )
                                 try:
                                     saved_gain_before_drag = self.robot_client.get_gain()
+                                    hard_kp = np.asarray(
+                                        saved_gain_before_drag["kp"], dtype=np.float64
+                                    )
+                                    hard_kd = np.asarray(
+                                        saved_gain_before_drag["kd"], dtype=np.float64
+                                    )
                                     try:
                                         pin = _pin_measured_setpoint(self.robot_client)
                                         print(
@@ -1056,56 +1167,129 @@ class Arx5Controller(mp.Process):
                                             f"{pin}"
                                         )
                                     except Exception as sync_exc:
+                                        pin = "failed"
                                         print(
                                             "[Arx5Controller] pre-damping pin "
                                             f"warning: {sync_exc}"
                                         )
+                                    self.robot_client.get_state()
+                                    hold_pose = np.asarray(
+                                        self.robot_client.tcp_pose, dtype=np.float64
+                                    ).reshape(6).copy()
+                                    hold_grip = float(self.robot_client.gripper_pos)
+                                    hold_joint = _measured_joint7(self.robot_client)
+
                                     self.robot_client.set_to_damping()
-                                    # 阻尼拖拽：臂 kp=0、kd 缩小；夹爪 kp=0 + 力矩辅助手捏
-                                    gain = self.robot_client.get_gain()
-                                    soft = {
-                                        "kp": np.zeros_like(
-                                            np.asarray(gain["kp"], dtype=np.float64)
-                                        ),
-                                        "kd": (
-                                            np.asarray(gain["kd"], dtype=np.float64)
-                                            * float(DRAG_ARM_KD_SCALE)
-                                        ),
+                                    damp = self.robot_client.get_gain()
+                                    damp_kd = np.asarray(
+                                        damp["kd"], dtype=np.float64
+                                    )
+                                    target_soft = {
+                                        "kp": hard_kp * float(DRAG_ARM_KP_SCALE),
+                                        "kd": damp_kd * float(DRAG_ARM_KD_SCALE),
                                         "gripper_kp": 0.0,
                                         "gripper_kd": 0.0,
                                     }
-                                    self.robot_client.set_gain(soft)
-                                    is_gravity_compensation = True  # 停发 TCP，允许拖动
+                                    # 分级降增益，避免 kp→0 悬崖；每级都钉回切入位姿
+                                    soft = target_soft
+                                    for alpha in (0.35, 0.65, 1.0):
+                                        soft = {
+                                            "kp": (1.0 - alpha) * hard_kp
+                                            + alpha * target_soft["kp"],
+                                            "kd": (1.0 - alpha) * hard_kd
+                                            + alpha * target_soft["kd"],
+                                            "gripper_kp": 0.0,
+                                            "gripper_kd": 0.0,
+                                        }
+                                        self.robot_client.set_gain(soft)
+                                        try:
+                                            if pin == "joint":
+                                                self.robot_client.set_joint_position(
+                                                    hold_joint
+                                                )
+                                            else:
+                                                self.robot_client.set_tcp_pose(
+                                                    hold_pose, hold_grip
+                                                )
+                                        except Exception as hold_pin_exc:
+                                            if (
+                                                pin != "joint"
+                                                and _looks_like_joint_server_error(
+                                                    hold_pin_exc
+                                                )
+                                            ):
+                                                pin = "joint"
+                                                try:
+                                                    self.robot_client.set_joint_position(
+                                                        hold_joint
+                                                    )
+                                                    print(
+                                                        "[Arx5Controller] ramp hold "
+                                                        "switched tcp -> joint"
+                                                    )
+                                                except Exception as joint_pin_exc:
+                                                    print(
+                                                        "[Arx5Controller] ramp hold "
+                                                        f"joint pin warning: {joint_pin_exc}"
+                                                    )
+                                            else:
+                                                print(
+                                                    "[Arx5Controller] ramp hold pin "
+                                                    f"warning: {hold_pin_exc}"
+                                                )
+                                        time.sleep(0.05)
+
+                                    if pin == "joint":
+                                        drag_hold_mode = "joint"
+                                        drag_hold_joint = hold_joint.copy()
+                                        drag_hold_pose = None
+                                        drag_hold_gripper = None
+                                    else:
+                                        drag_hold_mode = "tcp"
+                                        drag_hold_pose = hold_pose.copy()
+                                        drag_hold_gripper = hold_grip
+                                        drag_hold_joint = None
+
+                                    is_gravity_compensation = True
                                     entered = True
                                     print_drag_diag(
                                         "enter_drag.after_damping_soft",
                                         gain_override=soft,
                                     )
                                     print(
-                                        "[Arx5Controller] damping drag ON "
-                                        f"(arm kp=0, kd*={DRAG_ARM_KD_SCALE}; "
+                                        "[Arx5Controller] soft-hold damping drag ON "
+                                        f"(arm kp*={DRAG_ARM_KP_SCALE}, "
+                                        f"kd*={DRAG_ARM_KD_SCALE}; "
+                                        f"hold={drag_hold_mode}; "
                                         "gripper kp=0 + torque assist). "
-                                        "Squeeze gripper by hand."
+                                        "Drag freely; idle pose is held."
                                     )
                                 except Exception as e2:
                                     is_gravity_compensation = False
                                     saved_gain_before_drag = None
+                                    drag_hold_pose = None
+                                    drag_hold_gripper = None
+                                    drag_hold_joint = None
+                                    drag_hold_mode = None
                                     print(
                                         f"[Arx5Controller] damping drag FAILED: {e2}"
                                     )
                             if entered:
                                 # Stop stale joint traj; drag loop must not resume it.
                                 joint_control_active = False
-                                try:
-                                    pin = _pin_measured_setpoint(self.robot_client)
-                                    print(
-                                        f"[Arx5Controller] enter-drag pin via {pin}"
-                                    )
-                                except Exception as sync_exc:
-                                    print(
-                                        "[Arx5Controller] enter-drag pin warning: "
-                                        f"{sync_exc}"
-                                    )
+                                # True-GC: still sync once. Soft-hold: do NOT re-pin
+                                # to a already-sagging pose (would bake in the drop).
+                                if drag_hold_mode is None:
+                                    try:
+                                        pin = _pin_measured_setpoint(self.robot_client)
+                                        print(
+                                            f"[Arx5Controller] enter-drag pin via {pin}"
+                                        )
+                                    except Exception as sync_exc:
+                                        print(
+                                            "[Arx5Controller] enter-drag pin warning: "
+                                            f"{sync_exc}"
+                                        )
                                 try:
                                     _seed_joint_interp_from_state()
                                 except Exception:
@@ -1117,10 +1301,13 @@ class Arx5Controller(mp.Process):
                                         parts.append("rebound")
                                     if DRAG_GRIPPER_WALL_ENABLE:
                                         parts.append("wall")
+                                    if drag_hold_mode is not None:
+                                        parts.append(f"soft_hold:{drag_hold_mode}")
                                     print(
                                         "[Arx5Controller] drag gain check: "
                                         f"gripper_kp={float(g_now['gripper_kp']):.4f} "
                                         f"gripper_kd={float(g_now['gripper_kd']):.4f} "
+                                        f"arm_kp={np.array2string(np.asarray(g_now['kp']), precision=1)} "
                                         f"assist={'+'.join(parts)} "
                                         f"open={DRAG_GRIPPER_FRICTION_OPEN} "
                                         f"close={DRAG_GRIPPER_FRICTION_CLOSE} "
@@ -1145,6 +1332,11 @@ class Arx5Controller(mp.Process):
                         # 且不要在拖拽点拉满 kp；只用中等轨迹增益，满增益延后。
                         try:
                             print_drag_diag("exit_drag.request_received")
+                            # Stop soft-hold tracking before gain ramp / settle.
+                            drag_hold_pose = None
+                            drag_hold_gripper = None
+                            drag_hold_joint = None
+                            drag_hold_mode = None
                             # 若此前是真零力，先关 GC，避免回程/再进拖拽时 server 状态脏
                             try:
                                 self.robot_client.set_gravity_compensation(False)
