@@ -143,6 +143,8 @@ class SharedCollectState:
         self.camera_latency: list[dict] = []
         self.delete_pending: Optional[int] = None
         self.deleting: bool = False
+        # 删除进度：{episode_id, phase, key, key_i, n_keys, frac, message} 或 None
+        self.delete_progress: Optional[dict] = None
         self.message: str = ""
         self.frequency: float = 60.0
         self.viewer_only: bool = False
@@ -235,6 +237,11 @@ class SharedCollectState:
                 "camera_latency": list(getattr(self, "camera_latency", []) or []),
                 "delete_pending": self.delete_pending,
                 "deleting": bool(getattr(self, "deleting", False)),
+                "delete_progress": (
+                    dict(self.delete_progress)
+                    if isinstance(getattr(self, "delete_progress", None), dict)
+                    else None
+                ),
                 "message": self.message,
                 "frequency": self.frequency,
                 "live_n": len(self._live_series),

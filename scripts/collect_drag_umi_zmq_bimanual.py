@@ -903,7 +903,7 @@ def check_episode_alignment(env) -> None:
 _DELETE_LOCK = threading.Lock()
 
 
-def delete_saved_episode(env, episode_id: int) -> bool:
+def delete_saved_episode(env, episode_id: int, progress_cb=None) -> bool:
     """删除已写入 zarr 的指定 episode，并重编号后续 videos/{id} 以保持连续。"""
     n_episodes = env.replay_buffer.n_episodes
     if n_episodes <= 0:
@@ -916,7 +916,26 @@ def delete_saved_episode(env, episode_id: int) -> bool:
         )
         return False
 
-    env.replay_buffer.delete_episode(episode_id)
+    def _cb(info):
+        if progress_cb is not None:
+            progress_cb(info)
+        msg = info.get("message") if isinstance(info, dict) else None
+        if msg:
+            print(msg, flush=True)
+
+    env.replay_buffer.delete_episode(episode_id, progress_cb=_cb)
+
+    if progress_cb is not None:
+        progress_cb(
+            {
+                "phase": "videos",
+                "key": "videos",
+                "key_i": 0,
+                "n_keys": 1,
+                "frac": 0.98,
+                "message": f"删除 ep{episode_id} · 重编号 videos…",
+            }
+        )
 
     video_dir = env.video_dir.joinpath(str(episode_id))
     if video_dir.exists():
@@ -991,12 +1010,41 @@ def schedule_delete_episode(
         _DELETE_LOCK.release()
         return False
 
+    n_left_hint = n_episodes - 1
+    is_tail = eid == n_episodes - 1
+    hint = (
+        "末条截断，通常很快"
+        if is_tail
+        else "需搬移后续相机数据，可能要数分钟，请看进度"
+    )
     if web_state is not None:
         web_state.update(
             mode="DELETING",
             deleting=True,
             delete_pending=None,
-            message=f"正在删除 ep{eid}…请勿重复操作（写盘中）",
+            delete_progress={
+                "episode_id": eid,
+                "phase": "start",
+                "key": "",
+                "key_i": 0,
+                "n_keys": 0,
+                "frac": 0.0,
+                "message": f"正在删除 ep{eid}…（{hint}）",
+            },
+            message=f"正在删除 ep{eid}…（{hint}）",
+        )
+
+    def _on_progress(info: dict) -> None:
+        if web_state is None or not isinstance(info, dict):
+            return
+        payload = dict(info)
+        payload.setdefault("episode_id", eid)
+        msg = str(payload.get("message") or f"正在删除 ep{eid}…")
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            delete_progress=payload,
+            message=msg,
         )
 
     def _worker() -> None:
@@ -1008,8 +1056,8 @@ def schedule_delete_episode(
                     env.set_end_control()
                 except Exception as exc:  # noqa: BLE001
                     print(f"delete hold set_end_control warning: {exc}")
-            print(f"Deleting episode {eid} (background)…")
-            ok = bool(delete_saved_episode(env, eid))
+            print(f"Deleting episode {eid} (background)… {hint}")
+            ok = bool(delete_saved_episode(env, eid, progress_cb=_on_progress))
         except Exception as exc:  # noqa: BLE001
             err = str(exc)
             print(f"Delete episode {eid} failed: {exc}")
@@ -1018,12 +1066,13 @@ def schedule_delete_episode(
             try:
                 n_left = int(env.replay_buffer.n_episodes)
             except Exception:
-                n_left = 0
+                n_left = n_left_hint
             if web_state is not None:
                 web_state.update(
                     mode=done_mode,
                     deleting=False,
                     delete_pending=None,
+                    delete_progress=None,
                     n_episodes=n_left,
                     message=(
                         f"已删除 ep{eid} · 剩余 {n_left}"
@@ -2211,14 +2260,18 @@ def run_viewer_only(
                     web_state.update(
                         message="viewer_only: collect controls disabled"
                     )
-            env = web_state.env
-            web_state.update(
-                mode="VIEW",
-                viewer_only=True,
-                n_episodes=(
-                    int(env.replay_buffer.n_episodes) if env is not None else 0
-                ),
-            )
+            # 删除线程占用 zarr 时不要改 mode / 读 n_episodes（否则进度被冲掉且有竞态）
+            if is_delete_busy() or bool(getattr(web_state, "deleting", False)):
+                web_state.update(mode="DELETING", deleting=True, viewer_only=True)
+            else:
+                env = web_state.env
+                web_state.update(
+                    mode="VIEW",
+                    viewer_only=True,
+                    n_episodes=(
+                        int(env.replay_buffer.n_episodes) if env is not None else 0
+                    ),
+                )
             time.sleep(0.1)
     except KeyboardInterrupt:
         print("\nInterrupted — closing viewer.")
@@ -2488,14 +2541,18 @@ def run_web_hub(
                     continue
 
             if phase == "manage":
-                env = web_state.env
-                web_state.update(
-                    mode="VIEW",
-                    viewer_only=True,
-                    n_episodes=(
-                        int(env.replay_buffer.n_episodes) if env is not None else 0
-                    ),
-                )
+                if is_delete_busy() or bool(getattr(web_state, "deleting", False)):
+                    # 保持 DELETING，让网页能刷到 delete_progress / message
+                    web_state.update(mode="DELETING", deleting=True, viewer_only=True)
+                else:
+                    env = web_state.env
+                    web_state.update(
+                        mode="VIEW",
+                        viewer_only=True,
+                        n_episodes=(
+                            int(env.replay_buffer.n_episodes) if env is not None else 0
+                        ),
+                    )
             elif phase == "hub":
                 # keep HUB mode sticky（CONNECTING 由 enter_collect 同步占用）
                 if getattr(web_state, "mode", None) not in ("HUB", "CONNECTING"):

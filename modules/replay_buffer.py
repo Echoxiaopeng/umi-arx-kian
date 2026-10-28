@@ -580,13 +580,116 @@ class ReplayBuffer:
         else:
             self.episode_ends.resize(len(episode_ends) - 1, refcheck=False)
 
-    def delete_episode(self, idx: int):
-        """删除任意一条 episode（含中间条），并重算后续 episode_ends。"""
+    @staticmethod
+    def _array_nbytes(value) -> int:
+        return int(np.prod(value.shape, dtype=np.int64)) * int(
+            np.dtype(value.dtype).itemsize
+        )
+
+    @staticmethod
+    def _remove_time_slice(
+        value,
+        start: int,
+        end: int,
+        *,
+        expected_n: int,
+        is_zarr: bool,
+        progress_cb=None,
+    ) -> None:
+        """删掉 value[start:end]（axis=0）。按块搬运，避免整表进内存（相机可达数十 GB）。"""
+        start = int(start)
+        end = int(end)
+        n = int(value.shape[0])
+        remove_len = end - start
+        if remove_len <= 0:
+            return
+        target_n = int(expected_n) - remove_len
+        # 上次删除中途崩溃：该 key 已截短，跳过，勿再删一段
+        if n == target_n:
+            if progress_cb is not None:
+                progress_cb(1.0)
+            return
+        if n != int(expected_n):
+            raise ValueError(
+                f"array length {n} != episode n_steps {expected_n} "
+                f"(and != already-deleted {target_n}); refuse partial delete"
+            )
+
+        bytes_per_step = int(np.prod(value.shape[1:], dtype=np.int64)) * int(
+            np.dtype(value.dtype).itemsize
+        )
+        # ~768MB / batch：少往返；相机 float32 约每步 0.6MB → ~1200 步/批
+        batch = max(1, min(8192, (768 * 1024 * 1024) // max(bytes_per_step, 1)))
+        # 尽量对齐 zarr 时间 chunk，减少跨块读写
+        t_chunk = 1
+        try:
+            if getattr(value, "chunks", None):
+                t_chunk = max(1, int(value.chunks[0]))
+        except Exception:
+            t_chunk = 1
+        if t_chunk > 1:
+            batch = max(t_chunk, (batch // t_chunk) * t_chunk)
+
+        src = end
+        dst = start
+        remaining = n - end
+        moved = 0
+        total_move = max(remaining, 1)
+        last_report = -1.0
+        while remaining > 0:
+            take = min(batch, remaining)
+            # 显式 copy，避免 zarr 视图与写入区间重叠时读脏
+            block = np.array(value[src : src + take], copy=True)
+            value[dst : dst + take] = block
+            src += take
+            dst += take
+            remaining -= take
+            moved += take
+            if progress_cb is not None:
+                frac = float(moved) / float(total_move)
+                if frac - last_report >= 0.02 or remaining == 0:
+                    last_report = frac
+                    progress_cb(frac)
+
+        new_shape = (target_n,) + tuple(value.shape[1:])
+        if is_zarr:
+            value.resize(new_shape)
+        else:
+            value.resize(new_shape, refcheck=False)
+
+    def delete_episode(self, idx: int, progress_cb=None):
+        """删除任意一条 episode（含中间条），并重算后续 episode_ends。
+
+        progress_cb(info: dict) 可选，info 含:
+          phase, key, key_i, n_keys, frac (0..1 按字节加权), message
+        """
         n = int(self.n_episodes)
         if idx < 0 or idx >= n:
             raise IndexError(f"episode {idx} out of range 0..{n - 1}")
         if idx == n - 1:
+            if progress_cb is not None:
+                progress_cb(
+                    {
+                        "phase": "zarr",
+                        "key": "(tail resize)",
+                        "key_i": 0,
+                        "n_keys": 1,
+                        "frac": 0.5,
+                        "message": f"删除末条 ep{idx}（仅截断，较快）…",
+                    }
+                )
             self.drop_episode()
+            if progress_cb is not None:
+                progress_cb(
+                    {
+                        "phase": "zarr",
+                        "key": "(tail resize)",
+                        "key_i": 1,
+                        "n_keys": 1,
+                        "frac": 1.0,
+                        "message": f"已截断 ep{idx}",
+                    }
+                )
             return
 
         ends = np.asarray(self.episode_ends[:], dtype=np.int64).copy()
@@ -594,21 +697,51 @@ class ReplayBuffer:
         end = int(ends[idx])
         remove_len = end - start
         is_zarr = self.backend == "zarr"
+        expected_n = int(ends[-1]) if len(ends) > 0 else 0
 
-        for _key, value in self.data.items():
-            if remove_len <= 0:
-                continue
-            # 拼掉中间段；zarr 用整段读写避免复杂 in-place 移动
-            arr = value[:]
-            new_arr = np.concatenate([arr[:start], arr[end:]], axis=0)
-            if is_zarr:
-                value.resize(new_arr.shape)
-                if new_arr.size > 0:
-                    value[:] = new_arr
-            else:
-                value.resize(new_arr.shape, refcheck=False)
-                if new_arr.size > 0:
-                    value[:] = new_arr
+        if remove_len > 0:
+            # 大数组优先：半删时尽量先完成相机，避免只改了 action
+            items = sorted(
+                self.data.items(),
+                key=lambda kv: -self._array_nbytes(kv[1]),
+            )
+            weights = [max(self._array_nbytes(v), 1) for _, v in items]
+            total_w = float(sum(weights))
+            done_w = 0.0
+            n_keys = len(items)
+            for key_i, (key, value) in enumerate(items):
+                w = float(weights[key_i])
+
+                def _on_key_frac(frac, *, _key=key, _key_i=key_i, _w=w, _done=done_w):
+                    if progress_cb is None:
+                        return
+                    overall = (_done + _w * float(frac)) / total_w
+                    pct = int(round(overall * 100))
+                    progress_cb(
+                        {
+                            "phase": "zarr",
+                            "key": str(_key),
+                            "key_i": int(_key_i) + 1,
+                            "n_keys": int(n_keys),
+                            "frac": float(overall),
+                            "message": (
+                                f"删除 ep{idx} · {_key} "
+                                f"{_key_i + 1}/{n_keys} · {pct}%"
+                            ),
+                        }
+                    )
+
+                if progress_cb is not None:
+                    _on_key_frac(0.0)
+                self._remove_time_slice(
+                    value,
+                    start,
+                    end,
+                    expected_n=expected_n,
+                    is_zarr=is_zarr,
+                    progress_cb=_on_key_frac,
+                )
+                done_w += w
 
         new_ends = []
         for i in range(n):

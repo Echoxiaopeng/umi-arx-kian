@@ -134,7 +134,7 @@ def main(
     print(f"[dry] warm_lat={warm_lat:.3f}s rtc0_lat={lat0:.3f}s H={H}")
 
     init_delay = max(1, estimate_delay_steps(max(lat0, warm_lat), frequency))
-    rtc_batch = min(int(steps_per_inference), 8)
+    rtc_batch = min(int(steps_per_inference), 4)
     current = build_joint_chunk(a0)
     cursor = 0
     last_commanded = state.astype(np.float64)

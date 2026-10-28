@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from typing import Callable
+import threading
 import time
 
 import numpy as np
@@ -20,6 +21,123 @@ import numpy as np
 
 def estimate_delay_steps(latency_s: float, frequency: float, *, floor: int = 1) -> int:
     return max(int(floor), int(np.ceil(float(latency_s) * float(frequency))))
+
+
+class StreamActionBuffer:
+    """Official kai0 ARX-style action queue (async infer + control pop).
+
+    Matches ``arx_openpi_inference_rtc.StreamActionBuffer``: latency trim via
+    ``k``/``max_k``, temporal overlap blend into ``cur_chunk``, control loop
+    pops one action per tick.
+    """
+
+    def __init__(
+        self,
+        *,
+        state_dim: int = 14,
+        smooth_method: str = "temporal",
+    ) -> None:
+        self.state_dim = int(state_dim)
+        self.smooth_method = str(smooth_method)
+        self.lock = threading.Lock()
+        self.cur_chunk: deque[np.ndarray] = deque()
+        self.k = 0
+        self.last_action: np.ndarray | None = None
+
+    def __len__(self) -> int:
+        with self.lock:
+            return len(self.cur_chunk)
+
+    def integrate_new_chunk(
+        self,
+        actions_chunk: np.ndarray,
+        max_k: int,
+        min_m: int = 8,
+    ) -> None:
+        with self.lock:
+            if actions_chunk is None or len(actions_chunk) == 0:
+                return
+            max_k = max(0, int(max_k))
+            min_m = max(1, int(min_m))
+            drop_n = min(self.k, max_k)
+            if drop_n >= len(actions_chunk):
+                return
+            arr = np.asarray(actions_chunk, dtype=np.float64)
+            new_chunk = [arr[i].copy() for i in range(drop_n, len(arr))]
+
+            if str(self.smooth_method).lower() == "raw":
+                self.cur_chunk = deque(new_chunk)
+                self.k = 0
+                return
+
+            if len(self.cur_chunk) == 0 and self.last_action is not None:
+                old_list = [
+                    np.asarray(self.last_action, dtype=np.float64).copy()
+                    for _ in range(min_m)
+                ]
+                self.last_action = None
+            else:
+                old_list = list(self.cur_chunk)
+                if 0 < len(old_list) < min_m:
+                    tail = np.asarray(old_list[-1], dtype=np.float64).copy()
+                    old_list.extend(
+                        [tail.copy() for _ in range(min_m - len(old_list))]
+                    )
+                elif len(old_list) == 0:
+                    self.cur_chunk = deque(new_chunk)
+                    self.k = 0
+                    return
+
+            new_list = list(new_chunk)
+            overlap_len = min(len(old_list), len(new_list))
+            if overlap_len <= 0:
+                self.cur_chunk = deque(new_list)
+                self.k = 0
+                return
+            if len(old_list) > len(new_list):
+                old_list = old_list[: len(new_list)]
+                overlap_len = len(new_list)
+
+            if overlap_len == 1:
+                w_old = np.array([1.0], dtype=np.float64)
+            else:
+                w_old = np.linspace(1.0, 0.0, overlap_len, dtype=np.float64)
+            w_new = 1.0 - w_old
+            smoothed = [
+                w_old[i] * np.asarray(old_list[i], dtype=np.float64)
+                + w_new[i] * np.asarray(new_list[i], dtype=np.float64)
+                for i in range(overlap_len)
+            ]
+            combined = smoothed + new_list[overlap_len:]
+            self.cur_chunk = deque([a.copy() for a in combined])
+            self.k = 0
+
+    def pop_next_action(self) -> np.ndarray | None:
+        with self.lock:
+            if len(self.cur_chunk) == 0:
+                return None
+            if len(self.cur_chunk) == 1:
+                self.last_action = np.asarray(self.cur_chunk[0], dtype=np.float64).copy()
+            act = np.asarray(self.cur_chunk.popleft(), dtype=np.float64)
+            self.k += 1
+            return act
+
+    def peek_actions(self, n: int) -> np.ndarray | None:
+        """Return up to ``n`` upcoming actions without consuming (for ZMQ lookahead)."""
+        with self.lock:
+            if len(self.cur_chunk) == 0 or n <= 0:
+                return None
+            n = min(int(n), len(self.cur_chunk))
+            return np.stack(
+                [np.asarray(self.cur_chunk[i], dtype=np.float64) for i in range(n)],
+                axis=0,
+            )
+
+    def clear(self) -> None:
+        with self.lock:
+            self.cur_chunk.clear()
+            self.last_action = None
+            self.k = 0
 
 
 def round_up_to_batch(steps: int, batch: int) -> int:
@@ -34,7 +152,8 @@ def round_up_to_batch(steps: int, batch: int) -> int:
 # Delay is aligned to at most this many steps. Using steps_per_inference (e.g. 32)
 # as the align quantum would inflate delay≈3 → 32, leave only ~18 actions after
 # trim, then deadlock because s_min/delay > remaining horizon.
-DEFAULT_MAX_DELAY_ALIGN = 8
+# Keep ≤4: RTT≈0.12s@20Hz is ~3 steps; aligning to 8 wasted ~5 actions on trim.
+DEFAULT_MAX_DELAY_ALIGN = 4
 
 
 @dataclass
@@ -84,6 +203,109 @@ def build_joint_chunk(actions: np.ndarray) -> JointRTCChunk:
     if arr.ndim != 2:
         raise ValueError(f"Expected actions [T, D], got {arr.shape}")
     return JointRTCChunk(actions=arr, created_monotonic=time.monotonic())
+
+
+def temporal_smooth_integrate(
+    old_actions: np.ndarray | None,
+    new_chunk: JointRTCChunk,
+    *,
+    min_m: int = 10,
+    last_action: np.ndarray | None = None,
+) -> JointRTCChunk:
+    """Kai0 official ARX ``StreamActionBuffer`` overlap blend (client-side).
+
+    Linearly mixes the unexecuted old suffix with the start of ``new_chunk``
+    over ``overlap_len = min(len(old), len(new))``. A short old suffix is
+    padded to ``min_m`` with hold-last; if the old suffix is empty, pads from
+    ``last_action`` (same as official ``last_action`` path).
+    """
+    if new_chunk.horizon == 0:
+        return new_chunk
+    new_arr = np.asarray(new_chunk.actions, dtype=np.float32)
+    min_m = max(1, int(min_m))
+
+    if old_actions is None or len(np.asarray(old_actions).reshape(-1, new_arr.shape[-1])) == 0:
+        if last_action is None:
+            return new_chunk
+        last = np.asarray(last_action, dtype=np.float32).reshape(-1)
+        if last.shape != new_arr.shape[1:]:
+            return new_chunk
+        old_list = [last.copy() for _ in range(min_m)]
+    else:
+        old_arr = np.asarray(old_actions, dtype=np.float32)
+        if old_arr.ndim != 2 or old_arr.shape[1] != new_arr.shape[1]:
+            return new_chunk
+        old_list = [old_arr[i].copy() for i in range(len(old_arr))]
+        if 0 < len(old_list) < min_m:
+            tail = old_list[-1].copy()
+            old_list.extend([tail.copy() for _ in range(min_m - len(old_list))])
+
+    new_list = [new_arr[i].copy() for i in range(len(new_arr))]
+    overlap_len = min(len(old_list), len(new_list))
+    if overlap_len <= 0:
+        return new_chunk
+    if len(old_list) > len(new_list):
+        old_list = old_list[: len(new_list)]
+        overlap_len = len(new_list)
+
+    if overlap_len == 1:
+        w_old = np.array([1.0], dtype=np.float32)
+    else:
+        w_old = np.linspace(1.0, 0.0, overlap_len, dtype=np.float32)
+    w_new = 1.0 - w_old
+    smoothed = [
+        w_old[i] * np.asarray(old_list[i], dtype=np.float32)
+        + w_new[i] * np.asarray(new_list[i], dtype=np.float32)
+        for i in range(overlap_len)
+    ]
+    combined = np.stack(smoothed + new_list[overlap_len:], axis=0).astype(np.float32)
+    return JointRTCChunk(actions=combined, created_monotonic=new_chunk.created_monotonic)
+
+
+def apply_rtc_client_smooth(
+    new_chunk: JointRTCChunk,
+    *,
+    method: str = "temporal",
+    old_chunk: JointRTCChunk | None = None,
+    old_cursor: int = 0,
+    last_commanded: np.ndarray | None = None,
+    prev_commanded: np.ndarray | None = None,
+    blend_steps: int = 10,
+) -> JointRTCChunk:
+    """Dispatch client-side RTC boundary smoothing.
+
+    - ``temporal``: official kai0 ARX StreamActionBuffer overlap blend
+    - ``c1``: local C1 coast + skip0 (``stitch_chunk_to_state``)
+    - ``raw``: no client blend (server RTC guidance only)
+    """
+    key = str(method).strip().lower()
+    if key in {"raw", "none", "off"}:
+        return new_chunk
+    if key in {"c1", "stitch"}:
+        prev_vel = None
+        if last_commanded is not None and prev_commanded is not None:
+            prev_vel = (
+                np.asarray(last_commanded, dtype=np.float32)
+                - np.asarray(prev_commanded, dtype=np.float32)
+            )
+        return stitch_chunk_to_state(
+            new_chunk,
+            last_commanded,
+            blend_steps=max(1, int(blend_steps)),
+            prev_velocity=prev_vel,
+        )
+    # Default: official temporal overlap.
+    old_actions = None
+    if old_chunk is not None and old_chunk.horizon > 0:
+        start = max(0, min(int(old_cursor), old_chunk.horizon))
+        if start < old_chunk.horizon:
+            old_actions = old_chunk.actions[start:]
+    return temporal_smooth_integrate(
+        old_actions,
+        new_chunk,
+        min_m=max(1, int(blend_steps)),
+        last_action=last_commanded,
+    )
 
 
 def stitch_chunk_to_state(

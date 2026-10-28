@@ -35,7 +35,7 @@ conda activate umi-arx
 python scripts/eval_arx5_kai0_bimanual.py \
     --policy-ip 127.0.0.1 --policy-port 8000 \
     --robot-ports 8765,8766 --camera-reorder 0,1 \
-    --steps-per-inference 32
+    --steps-per-inference 50
 
 
     conda activate umi-arx
@@ -44,11 +44,14 @@ python scripts/eval_arx5_kai0_bimanual.py \
       --robot-ports 8765,8766 --camera-reorder 0,1 --no-preview \
       --steps-per-inference 32
 
-    python scripts/eval_arx5_kai0_bimanual.py \
-      --policy-ip 127.0.0.1 --policy-port 8000 \
-      --robot-ports 8765,8766 --camera-reorder 0,1 --no-preview \
-      --rtc --frequency 20 --steps-per-inference 8 \
-      --rtc-max-guidance-weight 0.5
+python scripts/eval_arx5_kai0_bimanual.py \
+        --policy-ip 127.0.0.1 --policy-port 8000  \
+        --robot-ports 8765,8766 --camera-reorder 0,1 \
+        --no-preview   --rtc --frequency 20 \
+        --steps-per-inference 8   --rtc-s-min 46   \
+        --rtc-max-guidance-weight 0.5 \
+        --rtc-smooth-method temporal \
+        --rtc-blend-steps 10
 
     # DAgger (policy + drag intervention, UMI zarr):
     python scripts/eval_arx5_kai0_bimanual.py \
@@ -96,6 +99,7 @@ from utils.kai0_dagger_drag import record_pose_action  # noqa: E402
 from utils.kai0_dagger_drag import save_intervention_sidecar  # noqa: E402
 from utils.kai0_rtc import JointRTCChunk  # noqa: E402
 from utils.kai0_rtc import JointRTCInferenceWorker  # noqa: E402
+from utils.kai0_rtc import apply_rtc_client_smooth  # noqa: E402
 from utils.kai0_rtc import build_joint_chunk  # noqa: E402
 from utils.kai0_rtc import estimate_delay_steps  # noqa: E402
 from utils.kai0_rtc import stitch_chunk_to_state  # noqa: E402
@@ -103,10 +107,13 @@ from utils.other_util import precise_wait  # noqa: E402
 
 DEFAULT_PROMPT = "Flatten and fold the cloth."
 ACTION_DIM = 14
-# Client C1 blend length. Longer than soft(~10) so catch-up after swap is gradual.
-RTC_BLEND_STEPS = 24
+# Client smooth window: temporal=min_smooth_steps (kai0 ARX default 10);
+# c1=blend length. Prefer temporal to match official ARX RTC client.
+RTC_BLEND_STEPS = 8
+RTC_SMOOTH_METHOD = "temporal"
 # Request at least this many soft-guidance steps (extends into hold-last pad).
-RTC_SOFT_MIN = 20
+RTC_SOFT_MIN = 16
+
 
 
 def _max_abs(a: np.ndarray, b: np.ndarray) -> float:
@@ -215,22 +222,24 @@ DEFAULT_INIT_JOINTS = (
 
 
 class _TeeIO:
-    """Mirror writes to the terminal and a log file (line-buffered)."""
+    """Mirror writes to the terminal and one or more log files (line-buffered)."""
 
-    def __init__(self, primary, secondary) -> None:
+    def __init__(self, primary, *secondaries) -> None:
         self._primary = primary
-        self._secondary = secondary
+        self._secondaries = secondaries
 
     def write(self, data):
         self._primary.write(data)
-        self._secondary.write(data)
         self._primary.flush()
-        self._secondary.flush()
+        for secondary in self._secondaries:
+            secondary.write(data)
+            secondary.flush()
         return len(data)
 
     def flush(self) -> None:
         self._primary.flush()
-        self._secondary.flush()
+        for secondary in self._secondaries:
+            secondary.flush()
 
     def isatty(self) -> bool:
         return self._primary.isatty()
@@ -243,29 +252,39 @@ class _TeeIO:
 
 
 def install_run_log(log_path: Path) -> Path:
-    """Overwrite ``log_path`` and tee stdout/stderr into it for this process."""
-    log_path = Path(log_path).resolve()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_file = open(log_path, "w", encoding="utf-8", buffering=1)  # noqa: SIM115
+    """Tee stdout/stderr to a timestamped ``run_*.log`` and overwrite ``log_path``.
+
+    ``log_path`` is the stable last-run alias (default ``.../last_run.log``).
+    A sibling ``run_YYYYMMDD_HHMMSS.log`` keeps each execution for later debug.
+    """
+    last_path = Path(log_path).resolve()
+    log_dir = last_path.parent
+    log_dir.mkdir(parents=True, exist_ok=True)
+    local_now = datetime.now(timezone.utc).astimezone()
+    timed_path = log_dir / f"run_{local_now.strftime('%Y%m%d_%H%M%S')}.log"
+    # Kept open for the process lifetime; closed in atexit.
+    timed_file = open(timed_path, "w", encoding="utf-8", buffering=1)  # noqa: SIM115
+    last_file = open(last_path, "w", encoding="utf-8", buffering=1)  # noqa: SIM115
     real_out, real_err = sys.stdout, sys.stderr
-    sys.stdout = _TeeIO(real_out, log_file)
-    sys.stderr = _TeeIO(real_err, log_file)
+    sys.stdout = _TeeIO(real_out, timed_file, last_file)
+    sys.stderr = _TeeIO(real_err, timed_file, last_file)
 
     def _restore() -> None:
         sys.stdout = real_out
         sys.stderr = real_err
-        try:
-            log_file.flush()
-            log_file.close()
-        except Exception:  # noqa: BLE001
-            pass
+        for handle in (timed_file, last_file):
+            try:
+                handle.flush()
+                handle.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     atexit.register(_restore)
-    stamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-    print(f"[log] writing run log (overwrite) -> {log_path}")
-    print(f"[log] started_at={stamp}")
+    print(f"[log] writing run log -> {timed_path}")
+    print(f"[log] also updating last log -> {last_path}")
+    print(f"[log] started_at={local_now.isoformat(timespec='seconds')}")
     print(f"[log] argv={' '.join(sys.argv)}")
-    return log_path
+    return timed_path
 
 
 class TerminalKeys:
@@ -632,6 +651,8 @@ def run_rtc(
     rtc_s_min: int,
     rtc_delay_buffer_size: int,
     rtc_max_guidance_weight: float,
+    rtc_blend_steps: int,
+    rtc_smooth_method: str,
 ) -> None:
     """Overlapping RTC loop: execute while next infer runs with prev_chunk guidance."""
     dt = 1.0 / frequency
@@ -646,6 +667,8 @@ def run_rtc(
     last_swap_mono: float | None = None
     batch_sat_count = 0
     batch_step_count = 0
+    blend_steps = max(1, int(rtc_blend_steps))
+    smooth_method = str(rtc_smooth_method).strip().lower()
 
     def _apply_swap(
         tag: str,
@@ -655,17 +678,14 @@ def run_rtc(
     ) -> None:
         nonlocal current_chunk, cursor, swap_count, last_swap_mono
         raw_chunk, trim_steps, s_used = polled
-        prev_vel = None
-        if last_commanded is not None and prev_commanded is not None:
-            prev_vel = (
-                np.asarray(last_commanded, dtype=np.float32)
-                - np.asarray(prev_commanded, dtype=np.float32)
-            )
-        stitched = stitch_chunk_to_state(
+        stitched = apply_rtc_client_smooth(
             raw_chunk,
-            last_commanded,
-            blend_steps=RTC_BLEND_STEPS,
-            prev_velocity=prev_vel,
+            method=smooth_method,
+            old_chunk=current_chunk,
+            old_cursor=swap_at,
+            last_commanded=last_commanded,
+            prev_commanded=prev_commanded,
+            blend_steps=blend_steps,
         )
         now = time.monotonic()
         wall_dt = (now - last_swap_mono) if last_swap_mono is not None else None
@@ -775,7 +795,8 @@ def run_rtc(
         # RTC must schedule in small batches (≤ delay_align). A huge
         # --steps-per-inference (e.g. 50) would dump the whole chunk before
         # maybe_start, leaving an empty leftover and a jerky first swap.
-        rtc_batch = min(int(steps_per_inference), 8)
+        # Cap at 4 so delay/trim tracks ~0.12s RTT (~3 steps@20Hz), not 8.
+        rtc_batch = min(int(steps_per_inference), 4)
         worker = JointRTCInferenceWorker(
             _rtc_infer_fn,
             frequency=frequency,
@@ -793,8 +814,8 @@ def run_rtc(
             f"(model_H={action_horizon}) latency={latency:.3f}s warm={warm_latency:.3f}s "
             f"delay~{worker.capped_delay()} s_min={worker.s_min} max_gw={rtc_max_guidance_weight} "
             f"schedule_batch={rtc_batch} (cli steps_per_inference={steps_per_inference}) "
-            f"delay_align={worker.delay_align} blend={RTC_BLEND_STEPS} "
-            f"soft_min={RTC_SOFT_MIN} stitch=C1+skip0"
+            f"delay_align={worker.delay_align} smooth={smooth_method} "
+            f"blend/min_m={blend_steps} soft_min={RTC_SOFT_MIN}"
         )
         print(
             f"[RTC]   plan: infer_at={trig0} switch_at={switch0} delay={d0} "
@@ -802,10 +823,10 @@ def run_rtc(
         )
         print(f"[RTC]   seed_state={_fmt14(state)}")
         last_swap_mono = time.monotonic()
-        if steps_per_inference > 8:
+        if steps_per_inference > 4:
             print(
-                f"[RTC] NOTE: clamping schedule batch {steps_per_inference}->8; "
-                "use --steps-per-inference 8 for RTC"
+                f"[RTC] NOTE: clamping schedule batch {steps_per_inference}->4; "
+                "use --steps-per-inference 4 for RTC"
             )
 
     try:
@@ -1072,9 +1093,13 @@ def run_dagger(
     rtc_s_min: int,
     rtc_delay_buffer_size: int,
     rtc_max_guidance_weight: float,
+    rtc_blend_steps: int,
+    rtc_smooth_method: str,
 ) -> None:
     """Policy-in-the-loop DAgger with gravity-comp drag and UMI zarr episodes."""
     dt = 1.0 / frequency
+    blend_steps = max(1, int(rtc_blend_steps))
+    smooth_method = str(rtc_smooth_method).strip().lower()
     recording = False
     drag_mode = False
     executing = False
@@ -1188,7 +1213,7 @@ def run_dagger(
             except Exception as exc:  # noqa: BLE001
                 print(f"post-infer hold warning: {exc}")
             state = measured_state(env)
-            blend = RTC_BLEND_STEPS * 2
+            blend = blend_steps * 2
             current_chunk = stitch_chunk_to_state(
                 raw_chunk,
                 state,
@@ -1230,7 +1255,7 @@ def run_dagger(
         init_delay = max(
             1, estimate_delay_steps(max(latency, warm_latency), frequency)
         )
-        rtc_batch = min(int(steps_per_inference), 8)
+        rtc_batch = min(int(steps_per_inference), 4)
         worker = JointRTCInferenceWorker(
             _rtc_infer_fn,
             frequency=frequency,
@@ -1245,6 +1270,7 @@ def run_dagger(
         print(
             f"[DAgger/RTC] seeded H={current_chunk.horizon} "
             f"latency={latency:.3f}s blend={blend} "
+            f"schedule_batch={rtc_batch} delay_align={worker.delay_align} "
             f"state={_fmt14(state)}"
         )
 
@@ -1446,27 +1472,27 @@ def run_dagger(
         polled = worker.poll(executed_since_chunk=cursor)
         if polled is not None:
             raw_chunk, trim_steps, s_used = polled
-            prev_vel = None
-            if last_commanded is not None and prev_commanded is not None:
-                prev_vel = (
-                    np.asarray(last_commanded, dtype=np.float32)
-                    - np.asarray(prev_commanded, dtype=np.float32)
-                )
-            # Longer blend while soft-starting after drag resume.
+            # Longer window while soft-starting after drag resume.
             blend = (
-                RTC_BLEND_STEPS * 2
+                blend_steps * 2
                 if resume_soft_batches_left > 0
-                else RTC_BLEND_STEPS
+                else blend_steps
             )
-            stitched = stitch_chunk_to_state(
+            method = "c1" if resume_soft_batches_left > 0 else smooth_method
+            stitched = apply_rtc_client_smooth(
                 raw_chunk,
-                last_commanded,
+                method=method,
+                old_chunk=current_chunk,
+                old_cursor=cursor,
+                last_commanded=last_commanded,
+                prev_commanded=(
+                    prev_commanded if resume_soft_batches_left <= 0 else None
+                ),
                 blend_steps=blend,
-                prev_velocity=prev_vel if resume_soft_batches_left <= 0 else None,
             )
             print(
                 f"[DAgger/RTC] swap cursor={cursor} trim={trim_steps} "
-                f"s={s_used} H={stitched.horizon} blend={blend}"
+                f"s={s_used} H={stitched.horizon} smooth={method} blend={blend}"
             )
             current_chunk = stitched
             cursor = 0
@@ -1489,31 +1515,30 @@ def run_dagger(
                     done = worker.poll(executed_since_chunk=cursor)
                     if done is not None:
                         raw_chunk, trim_steps, s_used = done
-                        prev_vel = None
-                        if (
-                            last_commanded is not None
-                            and prev_commanded is not None
-                        ):
-                            prev_vel = (
-                                np.asarray(last_commanded, dtype=np.float32)
-                                - np.asarray(prev_commanded, dtype=np.float32)
-                            )
                         blend = (
-                            RTC_BLEND_STEPS * 2
+                            blend_steps * 2
                             if resume_soft_batches_left > 0
-                            else RTC_BLEND_STEPS
+                            else blend_steps
                         )
-                        current_chunk = stitch_chunk_to_state(
+                        method = (
+                            "c1" if resume_soft_batches_left > 0 else smooth_method
+                        )
+                        current_chunk = apply_rtc_client_smooth(
                             raw_chunk,
-                            last_commanded,
-                            blend_steps=blend,
-                            prev_velocity=(
-                                prev_vel if resume_soft_batches_left <= 0 else None
+                            method=method,
+                            old_chunk=current_chunk,
+                            old_cursor=cursor,
+                            last_commanded=last_commanded,
+                            prev_commanded=(
+                                prev_commanded
+                                if resume_soft_batches_left <= 0
+                                else None
                             ),
+                            blend_steps=blend,
                         )
                         print(
                             f"[DAgger/RTC] swap(commit_end) trim={trim_steps} "
-                            f"s={s_used} H={current_chunk.horizon}"
+                            f"s={s_used} H={current_chunk.horizon} smooth={method}"
                         )
                         cursor = 0
                         return True
@@ -1695,7 +1720,7 @@ def run_dagger(
 @click.option("--prompt", default=DEFAULT_PROMPT, show_default=True)
 @click.option("--frequency", default=20.0, type=float, show_default=True)
 @click.option("--steps-per-inference", default=8, type=click.IntRange(1, 50), show_default=True)
-@click.option("--max-joint-speed", default=1.5, type=float, show_default=True, help="rad/s")
+@click.option("--max-joint-speed", default=2.5, type=float, show_default=True, help="rad/s")
 @click.option("--gripper-min", default=0.0, type=float, show_default=True)
 @click.option("--gripper-max", default=0.085, type=float, show_default=True)
 @click.option("--camera-obs-latency", default=0.17, type=float, show_default=True)
@@ -1767,12 +1792,35 @@ def run_dagger(
     show_default=True,
     help="RTC server soft-guidance weight (kai0 default 0.5). Raise carefully.",
 )
+@click.option(
+    "--rtc-smooth-method",
+    type=click.Choice(["temporal", "c1", "raw"], case_sensitive=False),
+    default=RTC_SMOOTH_METHOD,
+    show_default=True,
+    help=(
+        "Client boundary smooth: temporal=official kai0 ARX StreamActionBuffer "
+        "overlap blend; c1=local C1+skip0 stitch; raw=no client blend."
+    ),
+)
+@click.option(
+    "--rtc-blend-steps",
+    default=RTC_BLEND_STEPS,
+    type=click.IntRange(1, 48),
+    show_default=True,
+    help=(
+        "temporal: min_smooth_steps (kai0 ARX default 10). "
+        "c1: C1 blend length after each swap."
+    ),
+)
 @click.option("--output", default="data_local/kai0_eval", show_default=True)
 @click.option(
     "--log-file",
     default=str(DEFAULT_RUN_LOG),
     show_default=True,
-    help="Overwrite this file each run with teed stdout/stderr (for post-run debug).",
+    help=(
+        "Last-run log path (overwritten each run). A timestamped sibling "
+        "run_YYYYMMDD_HHMMSS.log is also written in the same directory."
+    ),
 )
 def main(
     policy_ip: str,
@@ -1800,6 +1848,8 @@ def main(
     rtc_s_min: int,
     rtc_delay_buffer_size: int,
     rtc_max_guidance_weight: float,
+    rtc_smooth_method: str,
+    rtc_blend_steps: int,
     output: str,
     log_file: str,
 ) -> None:
@@ -1838,7 +1888,8 @@ def main(
             )
         print(
             f"[RTC] enabled: s_min={rtc_s_min}, delay_buf={rtc_delay_buffer_size}, "
-            f"max_gw={rtc_max_guidance_weight}, steps_per_inference={steps_per_inference}"
+            f"max_gw={rtc_max_guidance_weight}, smooth={rtc_smooth_method}, "
+            f"blend/min_m={rtc_blend_steps}, steps_per_inference={steps_per_inference}"
         )
     if dagger:
         print(
@@ -1938,6 +1989,8 @@ def main(
                     rtc_s_min=rtc_s_min,
                     rtc_delay_buffer_size=rtc_delay_buffer_size,
                     rtc_max_guidance_weight=rtc_max_guidance_weight,
+                    rtc_blend_steps=rtc_blend_steps,
+                    rtc_smooth_method=rtc_smooth_method,
                 )
             elif rtc:
                 run_rtc(
@@ -1945,6 +1998,8 @@ def main(
                     rtc_s_min=rtc_s_min,
                     rtc_delay_buffer_size=rtc_delay_buffer_size,
                     rtc_max_guidance_weight=rtc_max_guidance_weight,
+                    rtc_blend_steps=rtc_blend_steps,
+                    rtc_smooth_method=rtc_smooth_method,
                 )
             else:
                 run_open_loop(**common)

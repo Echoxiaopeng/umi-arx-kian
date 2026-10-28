@@ -269,6 +269,32 @@
       color: var(--accent);
       font-weight: 600;
     }
+    .del-progress {
+      display: none;
+      margin-top: 8px;
+      width: 100%;
+    }
+    .del-progress.show {
+      display: block;
+    }
+    .del-progress .del-progress-track {
+      height: 8px;
+      border-radius: 4px;
+      background: #1a2433;
+      overflow: hidden;
+      border: 1px solid #2a3a50;
+    }
+    .del-progress .del-progress-bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #3d9cf0, #7ec8ff);
+      transition: width 0.15s linear;
+    }
+    .del-progress .del-progress-label {
+      margin-top: 4px;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
     .badge.VIEW {
       background: #1e2a3c;
       color: #7ec8ff;
@@ -754,6 +780,10 @@
             <button type="button" id="btnArmR" title="Right / robot1 only (key 1)">R</button>
           </div>
           <div class="msg" id="msg"></div>
+          <div class="del-progress" id="delProgress">
+            <div class="del-progress-track"><div class="del-progress-bar" id="delProgressBar"></div></div>
+            <div class="del-progress-label" id="delProgressLabel"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -767,6 +797,10 @@
         </span>
         <button id="btnBackHub" type="button">返回入口</button>
         <div class="msg" id="msgView"></div>
+      </div>
+      <div class="del-progress" id="delProgressView">
+        <div class="del-progress-track"><div class="del-progress-bar" id="delProgressBarView"></div></div>
+        <div class="del-progress-label" id="delProgressLabelView"></div>
       </div>
       <div class="path-row" title="当前已加载的数据目录">
         <label>当前目录</label>
@@ -948,6 +982,33 @@
         $("msgView").classList.toggle("busy", busy);
       }
       if ($("hubMsg")) $("hubMsg").textContent = t || "";
+    }
+
+    function setDeleteProgress(s) {
+      const deleting = s && (s.mode === "DELETING" || !!s.deleting);
+      const p = (s && s.delete_progress) || null;
+      const frac = p && typeof p.frac === "number" ? Math.max(0, Math.min(1, p.frac)) : 0;
+      const pct = Math.round(frac * 100);
+      const label = p
+        ? (p.message || `删除中 ${pct}%`)
+        : (deleting ? "删除中…" : "");
+      [
+        ["delProgress", "delProgressBar", "delProgressLabel"],
+        ["delProgressView", "delProgressBarView", "delProgressLabelView"],
+      ].forEach(([wrapId, barId, labelId]) => {
+        const wrap = $(wrapId);
+        const bar = $(barId);
+        const lab = $(labelId);
+        if (!wrap || !bar) return;
+        wrap.classList.toggle("show", !!deleting);
+        if (deleting) {
+          bar.style.width = pct + "%";
+          if (lab) lab.textContent = label;
+        } else {
+          bar.style.width = "0%";
+          if (lab) lab.textContent = "";
+        }
+      });
     }
 
     const MODE_LABELS = {
@@ -1267,6 +1328,7 @@
       $("poseBox").innerHTML = formatPoseHtml(s);
       if ($("camLagBox")) $("camLagBox").innerHTML = formatCamLagHtml(s);
       if (s.message) setMsg(s.message);
+      setDeleteProgress(s);
       syncDatasetPathLabel(s);
 
       if (hubMode) return;
@@ -2373,7 +2435,13 @@
         setMsg("正在删除中，请稍候…");
         return;
       }
-      $("delText").textContent = `Delete saved episode ${selectedEp}? Videos and zarr slice will be removed.`;
+      const nEp = Number(status.n_episodes ?? 0);
+      const isLast = nEp > 0 && Number(selectedEp) === nEp - 1;
+      const speedHint = isLast
+        ? "这是最后一条，删除通常很快。"
+        : "这不是最后一条：需要把后面所有相机数据在磁盘上前移，可能要数分钟，页面会显示进度。";
+      $("delText").textContent =
+        `删除已保存的 episode ${selectedEp}？将移除对应视频与 zarr 片段。${speedHint}`;
       $("delModal").classList.add("show");
     };
     $("delNo").onclick = () => {
