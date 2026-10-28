@@ -48,7 +48,7 @@ python scripts/eval_arx5_kai0_bimanual.py \
         --policy-ip 127.0.0.1 --policy-port 8000  \
         --robot-ports 8765,8766 --camera-reorder 0,1 \
         --no-preview   --rtc --frequency 20 \
-        --steps-per-inference 8   --rtc-s-min 46   \
+        --steps-per-inference 8   --rtc-s-min 20   \
         --rtc-max-guidance-weight 0.5 \
         --rtc-smooth-method temporal \
         --rtc-blend-steps 10
@@ -63,6 +63,10 @@ python scripts/eval_arx5_kai0_bimanual.py \
 Controls (default): C=start execution, S=stop/hold, I=infer once without motion, Q=quit.
 Controls (--dagger): C=start episode+policy, D=drag intervene, R=resume policy,
   S=save episode, B=abort episode, Q=quit.
+
+On start (after cameras/arms are ready), a throw-away inference warms the policy
+server (JAX compile) so the first C is not delayed; use --skip-server-warmup
+to disable.
 """
 
 from __future__ import annotations
@@ -460,6 +464,76 @@ def rtc_policy_observation(
     return payload
 
 
+def warmup_policy_server(
+    *,
+    env: Arx5EnvWithImages,
+    policy: WebsocketClientPolicy,
+    prompt: str,
+    rtc: bool,
+    rtc_s_min: int,
+    rtc_max_guidance_weight: float,
+) -> None:
+    """Throw-away infer(s) so the policy server compiles before the first C.
+
+    Arms are not commanded. First server-side run may take minutes (JAX).
+    With ``rtc``, also warms the RTC guidance path used by ``_seed_and_start``.
+    """
+    obs = env.get_obs()
+    state = measured_state(env)
+    print(
+        "[warmup] sending throw-away inference "
+        "(first run may take 1-3 min while the model compiles; arms will not move)..."
+    )
+    sys.stdout.flush()
+    started = time.monotonic()
+    warm = policy.infer(policy_observation(obs, state, prompt))
+    warm_latency = time.monotonic() - started
+    raw = np.asarray(warm["actions"], dtype=np.float32)
+    if raw.ndim != 2 or raw.shape[1] != ACTION_DIM:
+        raise RuntimeError(
+            f"Warmup returned {raw.shape}, expected [T, {ACTION_DIM}]"
+        )
+    action_horizon = int(raw.shape[0])
+    print(
+        f"[warmup] plain infer ready in {warm_latency:.1f}s "
+        f"actions={raw.shape}"
+    )
+    sys.stdout.flush()
+
+    if not rtc:
+        print("[warmup] policy server ready (press C when ready to execute)")
+        return
+
+    seed_prev = np.tile(state.astype(np.float32)[None, :], (action_horizon, 1))
+    print(
+        "[warmup] sending RTC throw-away inference "
+        "(compiles guidance path; arms will not move)..."
+    )
+    sys.stdout.flush()
+    started = time.monotonic()
+    result = policy.infer(
+        rtc_policy_observation(
+            obs,
+            state,
+            prompt,
+            prev_action_chunk=seed_prev,
+            inference_delay=0,
+            execute_horizon=min(int(rtc_s_min), action_horizon),
+            max_guidance_weight=float(rtc_max_guidance_weight),
+            enable_rtc=True,
+        )
+    )
+    rtc_latency = time.monotonic() - started
+    rtc_raw = np.asarray(result["actions"], dtype=np.float32)
+    print(
+        f"[warmup] RTC infer ready in {rtc_latency:.1f}s "
+        f"actions={rtc_raw.shape} "
+        f"total={warm_latency + rtc_latency:.1f}s"
+    )
+    print("[warmup] policy server ready (press C when ready to execute)")
+    sys.stdout.flush()
+
+
 def guarded_chunk(
     actions: np.ndarray,
     current: np.ndarray,
@@ -468,6 +542,7 @@ def guarded_chunk(
     max_joint_step: float,
     gripper_min: float,
     gripper_max: float,
+    max_joint_step_per_arm: tuple[float, float] | None = None,
 ) -> np.ndarray:
     actions = np.asarray(actions, dtype=np.float64)
     if actions.ndim != 2 or actions.shape[1] != ACTION_DIM:
@@ -478,17 +553,62 @@ def guarded_chunk(
     chunk = actions[: min(count, len(actions))].copy()
     previous = np.asarray(current, dtype=np.float64).copy()
     for index in range(len(chunk)):
-        for offset in (0, 7):
+        for arm_i, offset in enumerate((0, 7)):
+            lim = (
+                float(max_joint_step_per_arm[arm_i])
+                if max_joint_step_per_arm is not None
+                else float(max_joint_step)
+            )
             delta = chunk[index, offset : offset + 6] - previous[offset : offset + 6]
             chunk[index, offset : offset + 6] = (
-                previous[offset : offset + 6]
-                + np.clip(delta, -max_joint_step, max_joint_step)
+                previous[offset : offset + 6] + np.clip(delta, -lim, lim)
             )
             chunk[index, offset + 6] = np.clip(
                 chunk[index, offset + 6], gripper_min, gripper_max
             )
         previous = chunk[index]
     return chunk
+
+
+def resume_soft_step_limits(
+    max_joint_step: float,
+    batches_left: int,
+    *,
+    total_batches: int = 10,
+    hold_batches: int = 6,
+) -> tuple[float, float]:
+    """Δq caps after drag→policy (R).
+
+    First ``hold_batches``: lim=0 (pure hold). Then ease-in equally on both
+    arms up to ~0.18 * max_joint_step (keeps the hold→move onset gentle).
+    """
+    total = max(1, int(total_batches))
+    left = max(0, int(batches_left))
+    done = total - left
+    if done < int(hold_batches):
+        return 0.0, 0.0
+    move_total = max(1, total - int(hold_batches))
+    move_done = done - int(hold_batches)
+    t = float(np.clip(move_done / float(move_total), 0.0, 1.0))
+    # cubic ease-in: starts near 0, ends ~0.18 of max_joint_step
+    base = 0.02 + 0.16 * (t * t * t)
+    lim = float(max_joint_step) * base
+    return lim, lim
+
+
+def resume_post_soft_step_limit(
+    max_joint_step: float,
+    batches_left: int,
+    *,
+    total_batches: int = 6,
+) -> float:
+    """Taper from soft cap → full max_joint_step after the soft window."""
+    total = max(1, int(total_batches))
+    left = max(0, int(batches_left))
+    done = total - left
+    t = float(np.clip(done / float(total), 0.0, 1.0))
+    # 0.20 → 1.00 of max_joint_step
+    return float(max_joint_step) * (0.20 + 0.80 * t)
 
 
 def command_joint_actions(
@@ -517,13 +637,19 @@ def command_joint_actions(
             robot.schedule_joint_waypoint(target, target_time=float(target_time))
 
 
-def hold_current(env: Arx5EnvWithImages) -> None:
-    # Near-future stamp so the controller inserts a hold waypoint immediately.
+def hold_current(
+    env: Arx5EnvWithImages,
+    *,
+    horizon_s: float = 0.05,
+) -> float:
+    """Hold measured joints. Returns wall-clock target time of the hold waypoint."""
+    target_t = time.time() + float(horizon_s)
     command_joint_actions(
         env,
         measured_state(env).reshape(1, -1),
-        np.asarray([time.time() + 0.05], dtype=np.float64),
+        np.asarray([target_t], dtype=np.float64),
     )
+    return float(target_t)
 
 
 def show_preview(obs: dict, status: str, *, enabled: bool) -> None:
@@ -1110,6 +1236,10 @@ def run_dagger(
     ol_schedule_end = 0.0
     # After R: soft-start so first chunks don't dump a long jerking traj.
     resume_soft_batches_left = 0
+    resume_post_soft_batches_left = 0
+    resume_soft_total = 14
+    resume_hold_batches = 6
+    resume_post_soft_total = 6
     # RTC bookkeeping
     worker: JointRTCInferenceWorker | None = None
     current_chunk = None
@@ -1180,6 +1310,19 @@ def run_dagger(
         nonlocal worker, current_chunk, cursor, schedule_end
         nonlocal last_commanded, prev_commanded
         _stop_rtc()
+
+        def _hold_pulse(tag: str, horizon_s: float = 0.35) -> None:
+            nonlocal schedule_end
+            if not resume_blend:
+                return
+            try:
+                t_hold = hold_current(env, horizon_s=horizon_s)
+                schedule_end = max(float(schedule_end), t_hold)
+            except Exception as exc:  # noqa: BLE001
+                print(f"{tag} warning: {exc}")
+
+        # One hold covering warm+RTC infer; track its target in schedule_end.
+        _hold_pulse("pre-seed hold", horizon_s=0.40)
         obs = env.get_obs()
         state = measured_state(env)
         started = time.monotonic()
@@ -1206,12 +1349,8 @@ def run_dagger(
         raw_chunk = build_joint_chunk(raw)
         # Match plain run_rtc on C: raw chunk. Only stitch hard after drag (R).
         if resume_blend:
-            # Re-measure after infer latency — arms can settle/drift under full
-            # gain while we waited; stitching to a stale pre-infer pose jerks.
-            try:
-                hold_current(env)
-            except Exception as exc:  # noqa: BLE001
-                print(f"post-infer hold warning: {exc}")
+            # Fresh hold AFTER infer, then policy must schedule after this time.
+            _hold_pulse("post-infer hold", horizon_s=0.15)
             state = measured_state(env)
             blend = blend_steps * 2
             current_chunk = stitch_chunk_to_state(
@@ -1221,9 +1360,8 @@ def run_dagger(
                 prev_velocity=None,
                 keep_anchor=True,  # from rest: first cmd must be hold, not skip0
             )
-            # Explicit short hold prefix so leave-drag settle isn't the first
-            # motion the servo sees from the policy stream.
-            hold_n = max(2, min(4, int(round(0.15 * frequency))))
+            # ~0.4s pure hold in the chunk before any policy motion.
+            hold_n = max(6, min(10, int(round(0.40 * frequency))))
             hold_rows = np.tile(
                 np.asarray(state, dtype=np.float32)[None, :], (hold_n, 1)
             )
@@ -1243,14 +1381,19 @@ def run_dagger(
             ) if len(raw) else 0.0
             print(
                 f"[DAgger/RTC] resume stitch keep_anchor hold_n={hold_n} "
-                f"raw0_jump L={jump_l:.4f} R={jump_r:.4f}"
+                f"raw0_jump L={jump_l:.4f} R={jump_r:.4f} "
+                f"schedule_end={schedule_end:.3f}"
             )
         else:
             blend = 0
             current_chunk = raw_chunk
             last_commanded = None
         cursor = 0
-        schedule_end = 0.0
+        if resume_blend:
+            # Strictly after the last hold waypoint (never behind).
+            schedule_end = max(float(schedule_end), time.time() + 0.05) + 0.02
+        else:
+            schedule_end = 0.0
         prev_commanded = None
         init_delay = max(
             1, estimate_delay_steps(max(latency, warm_latency), frequency)
@@ -1319,6 +1462,7 @@ def run_dagger(
 
     def _resume_policy() -> None:
         nonlocal drag_mode, executing, resume_soft_batches_left
+        nonlocal resume_post_soft_batches_left, schedule_end
         if not recording:
             print("No active episode")
             return
@@ -1327,32 +1471,29 @@ def run_dagger(
             return
         leave_drag_stay_pose(env)
         drag_mode = False
-        # Re-seed from measured joints after GC exit (stale joint_interp risk).
+        # One short hold to arm joint_control; seed tracks schedule_end itself.
         try:
-            hold_current(env)
+            schedule_end = max(float(schedule_end), hold_current(env, horizon_s=0.20))
         except Exception as exc:  # noqa: BLE001
             print(f"post-drag hold warning: {exc}")
-        # Let full-gain hold settle before dumping a new policy chunk.
-        # Extra settle: right arm often finishes restore_gains last and needs
-        # a beat before the first policy waypoint.
-        time.sleep(0.5)
+        time.sleep(0.20)
         try:
-            hold_current(env)
+            schedule_end = max(float(schedule_end), hold_current(env, horizon_s=0.25))
         except Exception as exc:  # noqa: BLE001
             print(f"post-settle hold warning: {exc}")
         executing = True
         _clear_ol_chunk()
-        # Soft-start after R (OL and RTC): policy often saturates max_joint_step
-        # from a dragged pose and feels like shaking. Mid-chunk RTC skip0 is
-        # wrong here (standstill) — seed uses keep_anchor + hold prefix.
+        # Soft-start after R: pure hold → ease-in → post-soft taper to full step.
         if use_rtc:
-            resume_soft_batches_left = 10
+            resume_soft_batches_left = int(resume_soft_total)
+            resume_post_soft_batches_left = int(resume_post_soft_total)
             _seed_rtc(resume_blend=True)
         else:
-            resume_soft_batches_left = 4
+            resume_soft_batches_left = 8
+            resume_post_soft_batches_left = 4
         print(
             "[DAgger] Resumed policy from current pose "
-            f"(soft-start batches={resume_soft_batches_left})"
+            f"(soft={resume_soft_batches_left} post={resume_post_soft_batches_left})"
         )
 
     def _save_episode() -> None:
@@ -1436,22 +1577,39 @@ def run_dagger(
         latency = time.monotonic() - started
         soft = resume_soft_batches_left > 0
         count = min(8, int(steps_per_inference)) if soft else int(steps_per_inference)
+        per_arm = None
+        step_lim = float(max_joint_step)
         if soft:
-            soft_scale = 0.15 if resume_soft_batches_left >= 2 else 0.40
+            per_arm = resume_soft_step_limits(
+                max_joint_step,
+                resume_soft_batches_left,
+                total_batches=6,
+                hold_batches=2,
+            )
+            step_lim = max(per_arm) if max(per_arm) > 0 else 1e-6
+        if soft and max(per_arm) <= 0.0:
+            ol_actions = np.tile(
+                np.asarray(current, dtype=np.float64).reshape(1, -1), (count, 1)
+            )
         else:
-            soft_scale = 1.0
-        step_lim = float(max_joint_step) * soft_scale
-        ol_actions = guarded_chunk(
-            result["actions"],
-            current,
-            count=count,
-            max_joint_step=step_lim,
-            gripper_min=gripper_min,
-            gripper_max=gripper_max,
-        )
+            ol_actions = guarded_chunk(
+                result["actions"],
+                current,
+                count=count,
+                max_joint_step=step_lim,
+                gripper_min=gripper_min,
+                gripper_max=gripper_max,
+                max_joint_step_per_arm=per_arm,
+            )
         if soft:
             resume_soft_batches_left -= 1
-        t0 = max(time.time() + 0.05, ol_schedule_end)
+            d0 = ol_actions[0] - np.asarray(current, dtype=np.float64)
+            print(
+                f"[DAgger/OL] soft lim L={per_arm[0]:.4f} R={per_arm[1]:.4f} "
+                f"d0 L={float(np.max(np.abs(d0[0:6]))):.4f} "
+                f"R={float(np.max(np.abs(d0[7:13]))):.4f}"
+            )
+        t0 = max(time.time() + 0.05, float(ol_schedule_end) + 0.01)
         stamps = np.arange(len(ol_actions), dtype=np.float64) * dt + t0
         command_joint_actions(env, ol_actions, stamps)
         ol_schedule_end = float(stamps[-1])
@@ -1464,38 +1622,45 @@ def run_dagger(
     def _schedule_rtc_batch() -> bool:
         """Schedule next RTC batch; return False if nothing to do this tick."""
         nonlocal current_chunk, cursor, schedule_end, last_commanded, prev_commanded
-        nonlocal resume_soft_batches_left
+        nonlocal resume_soft_batches_left, resume_post_soft_batches_left
         if worker is None or current_chunk is None:
             _seed_rtc()
             return False
 
+        soft = resume_soft_batches_left > 0
+        post_soft = (not soft) and resume_post_soft_batches_left > 0
         polled = worker.poll(executed_since_chunk=cursor)
         if polled is not None:
-            raw_chunk, trim_steps, s_used = polled
-            # Longer window while soft-starting after drag resume.
-            blend = (
-                blend_steps * 2
-                if resume_soft_batches_left > 0
-                else blend_steps
-            )
-            method = "c1" if resume_soft_batches_left > 0 else smooth_method
-            stitched = apply_rtc_client_smooth(
-                raw_chunk,
-                method=method,
-                old_chunk=current_chunk,
-                old_cursor=cursor,
-                last_commanded=last_commanded,
-                prev_commanded=(
-                    prev_commanded if resume_soft_batches_left <= 0 else None
-                ),
-                blend_steps=blend,
-            )
-            print(
-                f"[DAgger/RTC] swap cursor={cursor} trim={trim_steps} "
-                f"s={s_used} H={stitched.horizon} smooth={method} blend={blend}"
-            )
-            current_chunk = stitched
-            cursor = 0
+            # Soft resume from standstill: defer RTC swaps (reinits jerked arms).
+            # Post-soft: allow temporal swaps only (no c1).
+            if soft:
+                print(
+                    f"[DAgger/RTC] soft: defer swap "
+                    f"(left={resume_soft_batches_left})"
+                )
+            else:
+                raw_chunk, trim_steps, s_used = polled
+                blend = blend_steps * 2 if post_soft else blend_steps
+                method = "temporal" if post_soft else smooth_method
+                if method == "c1":
+                    method = "temporal"
+                stitched = apply_rtc_client_smooth(
+                    raw_chunk,
+                    method=method,
+                    old_chunk=current_chunk,
+                    old_cursor=cursor,
+                    last_commanded=last_commanded,
+                    prev_commanded=(
+                        None if post_soft else prev_commanded
+                    ),
+                    blend_steps=blend,
+                )
+                print(
+                    f"[DAgger/RTC] swap cursor={cursor} trim={trim_steps} "
+                    f"s={s_used} H={stitched.horizon} smooth={method} blend={blend}"
+                )
+                current_chunk = stitched
+                cursor = 0
 
         if cursor >= current_chunk.horizon:
             if worker.awaiting_swap:
@@ -1511,18 +1676,16 @@ def run_dagger(
         if worker.commit_end is not None:
             if cursor >= worker.commit_end:
                 # Hold until the pending infer commits, then swap next tick.
+                if soft:
+                    return False
                 if worker.awaiting_swap:
                     done = worker.poll(executed_since_chunk=cursor)
                     if done is not None:
                         raw_chunk, trim_steps, s_used = done
-                        blend = (
-                            blend_steps * 2
-                            if resume_soft_batches_left > 0
-                            else blend_steps
-                        )
-                        method = (
-                            "c1" if resume_soft_batches_left > 0 else smooth_method
-                        )
+                        blend = blend_steps * 2 if post_soft else blend_steps
+                        method = "temporal" if post_soft else smooth_method
+                        if method == "c1":
+                            method = "temporal"
                         current_chunk = apply_rtc_client_smooth(
                             raw_chunk,
                             method=method,
@@ -1530,9 +1693,7 @@ def run_dagger(
                             old_cursor=cursor,
                             last_commanded=last_commanded,
                             prev_commanded=(
-                                prev_commanded
-                                if resume_soft_batches_left <= 0
-                                else None
+                                None if post_soft else prev_commanded
                             ),
                             blend_steps=blend,
                         )
@@ -1551,9 +1712,8 @@ def run_dagger(
             )
 
         remaining = current_chunk.horizon - cursor
-        soft = resume_soft_batches_left > 0
         schedule_batch = min(steps_per_inference, worker.delay_align)
-        if soft:
+        if soft or post_soft:
             schedule_batch = min(schedule_batch, 4)
         n = min(schedule_batch, remaining, remaining_commit)
         if n <= 0:
@@ -1562,33 +1722,74 @@ def run_dagger(
         anchor = (
             last_commanded if last_commanded is not None else measured_state(env)
         )
-        # Early soft batches after R: very small Δq so a large right-arm
-        # policy jump cannot saturate into a visible shake.
+        per_arm = None
+        step_lim = float(max_joint_step)
         if soft:
-            soft_scale = 0.12 if resume_soft_batches_left >= 6 else 0.28
+            per_arm = resume_soft_step_limits(
+                max_joint_step,
+                resume_soft_batches_left,
+                total_batches=resume_soft_total,
+                hold_batches=resume_hold_batches,
+            )
+            step_lim = max(per_arm) if max(per_arm) > 0 else 1e-6
+        elif post_soft:
+            step_lim = resume_post_soft_step_limit(
+                max_joint_step,
+                resume_post_soft_batches_left,
+                total_batches=resume_post_soft_total,
+            )
+            per_arm = (step_lim, step_lim)
+
+        if soft and max(per_arm) <= 0.0:
+            # Pure hold batches: ignore policy targets entirely.
+            batch_actions = np.tile(
+                np.asarray(anchor, dtype=np.float64).reshape(1, -1), (n, 1)
+            )
         else:
-            soft_scale = 1.0
-        step_lim = float(max_joint_step) * soft_scale
-        batch_actions = guarded_chunk(
-            current_chunk.actions[cursor : cursor + n],
-            anchor,
-            count=n,
-            max_joint_step=step_lim,
-            gripper_min=gripper_min,
-            gripper_max=gripper_max,
-        )
+            # Hold→move onset: re-anchor to measured so we don't shove from a
+            # stale last_commanded that drifted during the hold window.
+            if soft and max(per_arm) > 0.0:
+                try:
+                    measured = measured_state(env)
+                    if last_commanded is None or float(
+                        np.max(np.abs(measured - anchor))
+                    ) > 1e-3:
+                        anchor = measured
+                        last_commanded = np.asarray(measured, dtype=np.float64)
+                except Exception:  # noqa: BLE001
+                    pass
+            batch_actions = guarded_chunk(
+                current_chunk.actions[cursor : cursor + n],
+                anchor,
+                count=n,
+                max_joint_step=step_lim,
+                gripper_min=gripper_min,
+                gripper_max=gripper_max,
+                max_joint_step_per_arm=per_arm,
+            )
         if soft:
             resume_soft_batches_left -= 1
-            # Per-arm first-step jump (helps spot right-only shake).
             d0 = batch_actions[0] - np.asarray(anchor, dtype=np.float64)
             jump_l = float(np.max(np.abs(d0[0:6])))
             jump_r = float(np.max(np.abs(d0[7:13])))
             print(
-                f"[DAgger/RTC] sched soft n={n} step_lim={step_lim:.4f} "
+                f"[DAgger/RTC] sched soft n={n} "
+                f"lim L={per_arm[0]:.4f} R={per_arm[1]:.4f} "
                 f"left={resume_soft_batches_left} "
-                f"d0 L={jump_l:.4f} R={jump_r:.4f}"
+                f"d0 L={jump_l:.4f} R={jump_r:.4f} "
+                f"t0_ref={schedule_end:.3f}"
             )
-        t0 = max(time.time() + 0.05, schedule_end)
+        elif post_soft:
+            resume_post_soft_batches_left -= 1
+            d0 = batch_actions[0] - np.asarray(anchor, dtype=np.float64)
+            print(
+                f"[DAgger/RTC] sched post-soft n={n} lim={step_lim:.4f} "
+                f"left={resume_post_soft_batches_left} "
+                f"d0 L={float(np.max(np.abs(d0[0:6]))):.4f} "
+                f"R={float(np.max(np.abs(d0[7:13]))):.4f}"
+            )
+        # Never schedule behind an outstanding hold / prior batch.
+        t0 = max(time.time() + 0.05, float(schedule_end) + 0.01)
         stamps = np.arange(len(batch_actions), dtype=np.float64) * dt + t0
         command_joint_actions(env, batch_actions, stamps)
         schedule_end = float(stamps[-1])
@@ -1822,6 +2023,14 @@ def run_dagger(
         "run_YYYYMMDD_HHMMSS.log is also written in the same directory."
     ),
 )
+@click.option(
+    "--skip-server-warmup",
+    is_flag=True,
+    help=(
+        "Do not run throw-away inference at startup. First C/I may then take "
+        "1-3 min while the policy server compiles, or hit the WS timeout."
+    ),
+)
 def main(
     policy_ip: str,
     policy_port: int,
@@ -1852,6 +2061,7 @@ def main(
     rtc_blend_steps: int,
     output: str,
     log_file: str,
+    skip_server_warmup: bool,  # noqa: FBT001
 ) -> None:
     if frequency <= 0 or max_joint_speed <= 0:
         raise click.BadParameter("frequency and max-joint-speed must be positive")
@@ -1961,6 +2171,21 @@ def main(
                 duration=float(init_duration),
                 gripper_min=gripper_min,
                 gripper_max=gripper_max,
+            )
+
+        if skip_server_warmup:
+            print(
+                "[warmup] skipped (--skip-server-warmup); "
+                "first C/I may be slow while the server compiles"
+            )
+        else:
+            warmup_policy_server(
+                env=env,
+                policy=policy,
+                prompt=prompt,
+                rtc=rtc,
+                rtc_s_min=rtc_s_min,
+                rtc_max_guidance_weight=rtc_max_guidance_weight,
             )
 
         try:

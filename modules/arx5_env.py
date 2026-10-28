@@ -1,9 +1,10 @@
-from typing import Optional, List
+from typing import Optional, List, Callable
 import pathlib
 import numpy as np
 import time
 import shutil
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing.managers import SharedMemoryManager
 from modules.arx5_controller import Arx5Controller
 from peripherals.multi_uvc_camera import MultiUvcCamera, VideoRecorder
@@ -524,25 +525,64 @@ class Arx5Env:
         if self.action_accumulator is not None:
             self.action_accumulator.put(new_actions, new_timestamps)
 
+    def _run_on_robots_parallel(
+        self,
+        fn: Callable,
+        *,
+        name: str,
+    ) -> None:
+        """Run ``fn(robot)`` on every arm concurrently (bimanual exit/enter drag).
+
+        Serial set_end_control/restore made robot1 finish ~0.7–1s later than
+        robot0; resuming policy then felt like a right-arm jerk.
+        """
+        robots = list(self.robots)
+        if len(robots) <= 1:
+            for robot in robots:
+                fn(robot)
+            return
+        errors: list[tuple[int, BaseException]] = []
+        with ThreadPoolExecutor(max_workers=len(robots)) as pool:
+            futures = {
+                pool.submit(fn, robot): idx for idx, robot in enumerate(robots)
+            }
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    fut.result()
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append((idx, exc))
+        if errors:
+            detail = "; ".join(f"robot{i}: {exc}" for i, exc in errors)
+            raise RuntimeError(f"{name} failed: {detail}")
+
     def set_gravity_compensation(self, wait: bool = True, timeout: float = 5.0):
-        for robot in self.robots:
+        def _one(robot):
             try:
                 robot.set_gravity_compensation(wait=wait, timeout=timeout)
             except TypeError:
                 robot.set_gravity_compensation()
 
+        self._run_on_robots_parallel(_one, name="set_gravity_compensation")
+
     def set_end_control(self):
-        for robot in self.robots:
-            robot.set_end_control()
+        self._run_on_robots_parallel(
+            lambda robot: robot.set_end_control(),
+            name="set_end_control",
+        )
 
     def restore_gains_after_drag(self):
-        for robot in self.robots:
+        def _one(robot):
             if hasattr(robot, "restore_gains_after_drag"):
                 robot.restore_gains_after_drag()
 
+        self._run_on_robots_parallel(_one, name="restore_gains_after_drag")
+
     def set_to_damping(self):
-        for robot in self.robots:
-            robot.set_to_damping()
+        self._run_on_robots_parallel(
+            lambda robot: robot.set_to_damping(),
+            name="set_to_damping",
+        )
 
     def get_robot_state(self):
         return [robot.get_state() for robot in self.robots]

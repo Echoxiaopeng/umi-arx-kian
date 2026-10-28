@@ -1334,15 +1334,12 @@ class Arx5Controller(mp.Process):
                                             gain_override=blended,
                                         )
                                         time.sleep(0.10)
-                                    # Hold with EE pose after restore.
-                                    # Enabling joint_control here issues
-                                    # SET_JOINT_POSITION every tick; on a
-                                    # cartesian zmq_server that hot-swaps to
-                                    # joint and dies with spdlog "logger
-                                    # already exists" (breaks collect save→
-                                    # re-enter-drag). Kai0 --joint already
-                                    # holds via schedule_joint_waypoint.
-                                    joint_control_active = False
+                                    # Post-restore hold:
+                                    # - cartesian collect: EE pose stream OK
+                                    # - Kai0 --joint: keep passive after pin;
+                                    #   never enable joint_control tick-hold
+                                    #   here (fought hold_current/policy and
+                                    #   shook both arms).
                                     try:
                                         self.robot_client.get_state()
                                         curr_pose = self.robot_client.tcp_pose
@@ -1372,13 +1369,38 @@ class Arx5Controller(mp.Process):
                                                 ),
                                             )
                                         )
-                                        allow_ee_pose = True
                                         _seed_joint_interp_from_state()
+                                        joint_control_active = False
+                                        try:
+                                            self.robot_client.set_tcp_pose(
+                                                curr_pose, curr_gripper_pos
+                                            )
+                                            allow_ee_pose = True
+                                            print(
+                                                "[Arx5Controller] post-restore "
+                                                "EE hold"
+                                            )
+                                        except Exception as probe_exc:
+                                            allow_ee_pose = False
+                                            if _looks_like_joint_server_error(
+                                                probe_exc
+                                            ):
+                                                print(
+                                                    "[Arx5Controller] post-restore "
+                                                    "passive pin (--joint)"
+                                                )
+                                            else:
+                                                print(
+                                                    "[Arx5Controller] post-restore "
+                                                    f"EE probe warning: {probe_exc}"
+                                                )
                                     except Exception as seed_exc:
                                         print(
-                                            "[Arx5Controller] post-restore EE hold "
+                                            "[Arx5Controller] post-restore seed "
                                             f"warning: {seed_exc}"
                                         )
+                                        allow_ee_pose = False
+                                        joint_control_active = False
                                     print(
                                         "[Arx5Controller] full gain restored after arrive"
                                     )
@@ -1390,7 +1412,6 @@ class Arx5Controller(mp.Process):
                                 saved_gain_before_drag = None
                             else:
                                 print("[Arx5Controller] no saved gain to restore")
-                                joint_control_active = False
                                 try:
                                     self.robot_client.get_state()
                                     curr_pose = self.robot_client.tcp_pose
@@ -1407,10 +1428,11 @@ class Arx5Controller(mp.Process):
                                             [[curr_gripper_pos, 0, 0, 0, 0, 0]]
                                         ),
                                     )
-                                    allow_ee_pose = True
                                     _seed_joint_interp_from_state()
                                 except Exception:
                                     pass
+                                allow_ee_pose = False
+                                joint_control_active = False
                             print_drag_diag("restore_full_gain.after")
                         finally:
                             self.restore_gains_done.value = True
