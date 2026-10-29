@@ -41,17 +41,18 @@ python scripts/eval_arx5_kai0_bimanual.py \
     conda activate umi-arx
     python scripts/eval_arx5_kai0_bimanual.py \
       --policy-ip 127.0.0.1 --policy-port 8000 \
-      --robot-ports 8765,8766 --camera-reorder 0,1 --no-preview \
+      --robot-ports 8765,8766 --camera-reorder 0,1 \
       --steps-per-inference 32
 
+# Gentler RTC fade (smoothstep handoff + longer soft/blend):
 python scripts/eval_arx5_kai0_bimanual.py \
         --policy-ip 127.0.0.1 --policy-port 8000  \
         --robot-ports 8765,8766 --camera-reorder 0,1 \
-        --no-preview   --rtc --frequency 20 \
-        --steps-per-inference 8   --rtc-s-min 20   \
-        --rtc-max-guidance-weight 0.5 \
+        --rtc --frequency 20 \
+        --steps-per-inference 4 --rtc-s-min 20 \
+        --rtc-max-guidance-weight 0.7 \
         --rtc-smooth-method temporal \
-        --rtc-blend-steps 10
+        --rtc-blend-steps 16 --rtc-fade smoothstep
 
     # DAgger (policy + drag intervention, UMI zarr):
     python scripts/eval_arx5_kai0_bimanual.py \
@@ -113,10 +114,13 @@ DEFAULT_PROMPT = "Flatten and fold the cloth."
 ACTION_DIM = 14
 # Client smooth window: temporal=min_smooth_steps (kai0 ARX default 10);
 # c1=blend length. Prefer temporal to match official ARX RTC client.
-RTC_BLEND_STEPS = 8
+# 16 + smoothstep keeps leftover influence longer and avoids a C1 kink when
+# the blend hands off to the raw suffix (mid-chunk jerk).
+RTC_BLEND_STEPS = 16
 RTC_SMOOTH_METHOD = "temporal"
+RTC_FADE = "smoothstep"  # linear | smoothstep | ease_out
 # Request at least this many soft-guidance steps (extends into hold-last pad).
-RTC_SOFT_MIN = 16
+RTC_SOFT_MIN = 28
 
 
 
@@ -779,6 +783,7 @@ def run_rtc(
     rtc_max_guidance_weight: float,
     rtc_blend_steps: int,
     rtc_smooth_method: str,
+    rtc_fade: str = RTC_FADE,
 ) -> None:
     """Overlapping RTC loop: execute while next infer runs with prev_chunk guidance."""
     dt = 1.0 / frequency
@@ -795,6 +800,7 @@ def run_rtc(
     batch_step_count = 0
     blend_steps = max(1, int(rtc_blend_steps))
     smooth_method = str(rtc_smooth_method).strip().lower()
+    fade = str(rtc_fade).strip().lower()
 
     def _apply_swap(
         tag: str,
@@ -812,6 +818,7 @@ def run_rtc(
             last_commanded=last_commanded,
             prev_commanded=prev_commanded,
             blend_steps=blend_steps,
+            fade=fade,
         )
         now = time.monotonic()
         wall_dt = (now - last_swap_mono) if last_swap_mono is not None else None
@@ -941,7 +948,7 @@ def run_rtc(
             f"delay~{worker.capped_delay()} s_min={worker.s_min} max_gw={rtc_max_guidance_weight} "
             f"schedule_batch={rtc_batch} (cli steps_per_inference={steps_per_inference}) "
             f"delay_align={worker.delay_align} smooth={smooth_method} "
-            f"blend/min_m={blend_steps} soft_min={RTC_SOFT_MIN}"
+            f"fade={fade} blend/min_m={blend_steps} soft_min={RTC_SOFT_MIN}"
         )
         print(
             f"[RTC]   plan: infer_at={trig0} switch_at={switch0} delay={d0} "
@@ -1137,7 +1144,28 @@ def run_rtc(
                     f"sat_cum={batch_sat_count}/{batch_step_count}"
                 )
 
-            t0 = max(time.time() + 0.05, schedule_end)
+            now_wall = time.time()
+            if schedule_end > 0.0:
+                # Continue on one fixed control grid across 4-step batches and
+                # RTC swaps. Re-anchoring every batch at ``now + dt`` adds the
+                # Python loop overhead to the boundary interval (typically
+                # 60--65 ms instead of 50 ms at 20 Hz), which is felt as a
+                # periodic 5 Hz speed ripple.
+                grid_t0 = schedule_end + dt
+                if grid_t0 > now_wall:
+                    t0 = grid_t0
+                else:
+                    # We genuinely missed the next slot. Do not submit a stale
+                    # waypoint; restart one period ahead and make the underrun
+                    # visible in the log.
+                    late_s = now_wall - grid_t0
+                    t0 = now_wall + dt
+                    print(
+                        f"[RTC] schedule underrun={late_s * 1000.0:.1f}ms; "
+                        "re-anchoring control grid"
+                    )
+            else:
+                t0 = now_wall + dt
             action_timestamps = (
                 np.arange(len(batch_actions), dtype=np.float64) * dt + t0
             )
@@ -1221,11 +1249,13 @@ def run_dagger(
     rtc_max_guidance_weight: float,
     rtc_blend_steps: int,
     rtc_smooth_method: str,
+    rtc_fade: str = RTC_FADE,
 ) -> None:
     """Policy-in-the-loop DAgger with gravity-comp drag and UMI zarr episodes."""
     dt = 1.0 / frequency
     blend_steps = max(1, int(rtc_blend_steps))
     smooth_method = str(rtc_smooth_method).strip().lower()
+    fade = str(rtc_fade).strip().lower()
     recording = False
     drag_mode = False
     executing = False
@@ -1654,10 +1684,12 @@ def run_dagger(
                         None if post_soft else prev_commanded
                     ),
                     blend_steps=blend,
+                    fade=fade,
                 )
                 print(
                     f"[DAgger/RTC] swap cursor={cursor} trim={trim_steps} "
-                    f"s={s_used} H={stitched.horizon} smooth={method} blend={blend}"
+                    f"s={s_used} H={stitched.horizon} smooth={method} "
+                    f"fade={fade} blend={blend}"
                 )
                 current_chunk = stitched
                 cursor = 0
@@ -1696,10 +1728,12 @@ def run_dagger(
                                 None if post_soft else prev_commanded
                             ),
                             blend_steps=blend,
+                            fade=fade,
                         )
                         print(
                             f"[DAgger/RTC] swap(commit_end) trim={trim_steps} "
-                            f"s={s_used} H={current_chunk.horizon} smooth={method}"
+                            f"s={s_used} H={current_chunk.horizon} "
+                            f"smooth={method} fade={fade}"
                         )
                         cursor = 0
                         return True
@@ -2013,6 +2047,16 @@ def run_dagger(
         "c1: C1 blend length after each swap."
     ),
 )
+@click.option(
+    "--rtc-fade",
+    type=click.Choice(["smoothstep", "linear", "ease_out"], case_sensitive=False),
+    default=RTC_FADE,
+    show_default=True,
+    help=(
+        "temporal old→new weight curve. smoothstep=C1-friendly handoff; "
+        "ease_out=stay on leftover longer; linear=official kai0."
+    ),
+)
 @click.option("--output", default="data_local/kai0_eval", show_default=True)
 @click.option(
     "--log-file",
@@ -2059,6 +2103,7 @@ def main(
     rtc_max_guidance_weight: float,
     rtc_smooth_method: str,
     rtc_blend_steps: int,
+    rtc_fade: str,
     output: str,
     log_file: str,
     skip_server_warmup: bool,  # noqa: FBT001
@@ -2099,7 +2144,8 @@ def main(
         print(
             f"[RTC] enabled: s_min={rtc_s_min}, delay_buf={rtc_delay_buffer_size}, "
             f"max_gw={rtc_max_guidance_weight}, smooth={rtc_smooth_method}, "
-            f"blend/min_m={rtc_blend_steps}, steps_per_inference={steps_per_inference}"
+            f"fade={rtc_fade}, blend/min_m={rtc_blend_steps}, "
+            f"soft_min={RTC_SOFT_MIN}, steps_per_inference={steps_per_inference}"
         )
     if dagger:
         print(
@@ -2216,6 +2262,7 @@ def main(
                     rtc_max_guidance_weight=rtc_max_guidance_weight,
                     rtc_blend_steps=rtc_blend_steps,
                     rtc_smooth_method=rtc_smooth_method,
+                    rtc_fade=rtc_fade,
                 )
             elif rtc:
                 run_rtc(
@@ -2225,6 +2272,7 @@ def main(
                     rtc_max_guidance_weight=rtc_max_guidance_weight,
                     rtc_blend_steps=rtc_blend_steps,
                     rtc_smooth_method=rtc_smooth_method,
+                    rtc_fade=rtc_fade,
                 )
             else:
                 run_open_loop(**common)

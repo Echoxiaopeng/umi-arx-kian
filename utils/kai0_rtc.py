@@ -98,10 +98,7 @@ class StreamActionBuffer:
                 old_list = old_list[: len(new_list)]
                 overlap_len = len(new_list)
 
-            if overlap_len == 1:
-                w_old = np.array([1.0], dtype=np.float64)
-            else:
-                w_old = np.linspace(1.0, 0.0, overlap_len, dtype=np.float64)
+            w_old = blend_fade_weights(overlap_len, fade="smoothstep").astype(np.float64)
             w_new = 1.0 - w_old
             smoothed = [
                 w_old[i] * np.asarray(old_list[i], dtype=np.float64)
@@ -205,19 +202,44 @@ def build_joint_chunk(actions: np.ndarray) -> JointRTCChunk:
     return JointRTCChunk(actions=arr, created_monotonic=time.monotonic())
 
 
+def blend_fade_weights(overlap_len: int, fade: str = "smoothstep") -> np.ndarray:
+    """Old-trajectory weights over an overlap window (1 → 0).
+
+    - ``linear``: official kai0 linspace (can leave a C1 kink when blend ends)
+    - ``smoothstep``: zero slope at both ends → gentler handoff into raw suffix
+    - ``ease_out``: stay on old longer, then drop (delays mid-chunk catch-up)
+    """
+    n = max(1, int(overlap_len))
+    if n == 1:
+        return np.array([1.0], dtype=np.float32)
+    t = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    key = str(fade).strip().lower()
+    if key in {"linear", "lin"}:
+        return (1.0 - t).astype(np.float32)
+    if key in {"ease_out", "ease-out", "slow"}:
+        # w_old = (1-t)^2: keeps leftover influence longer into the window.
+        return np.square(1.0 - t).astype(np.float32)
+    # Default smoothstep on the *new* weight → C1-friendly endpoints.
+    w_new = t * t * (3.0 - 2.0 * t)
+    return (1.0 - w_new).astype(np.float32)
+
+
 def temporal_smooth_integrate(
     old_actions: np.ndarray | None,
     new_chunk: JointRTCChunk,
     *,
     min_m: int = 10,
     last_action: np.ndarray | None = None,
+    fade: str = "smoothstep",
 ) -> JointRTCChunk:
     """Kai0 official ARX ``StreamActionBuffer`` overlap blend (client-side).
 
-    Linearly mixes the unexecuted old suffix with the start of ``new_chunk``
-    over ``overlap_len = min(len(old), len(new))``. A short old suffix is
-    padded to ``min_m`` with hold-last; if the old suffix is empty, pads from
+    Mixes the unexecuted old suffix with the start of ``new_chunk`` over
+    ``overlap_len = min(len(old), len(new))``. A short old suffix is padded to
+    ``min_m`` with hold-last; if the old suffix is empty, pads from
     ``last_action`` (same as official ``last_action`` path).
+
+    ``fade`` controls the old→new weight curve (see ``blend_fade_weights``).
     """
     if new_chunk.horizon == 0:
         return new_chunk
@@ -248,10 +270,7 @@ def temporal_smooth_integrate(
         old_list = old_list[: len(new_list)]
         overlap_len = len(new_list)
 
-    if overlap_len == 1:
-        w_old = np.array([1.0], dtype=np.float32)
-    else:
-        w_old = np.linspace(1.0, 0.0, overlap_len, dtype=np.float32)
+    w_old = blend_fade_weights(overlap_len, fade=fade)
     w_new = 1.0 - w_old
     smoothed = [
         w_old[i] * np.asarray(old_list[i], dtype=np.float32)
@@ -271,6 +290,7 @@ def apply_rtc_client_smooth(
     last_commanded: np.ndarray | None = None,
     prev_commanded: np.ndarray | None = None,
     blend_steps: int = 10,
+    fade: str = "smoothstep",
 ) -> JointRTCChunk:
     """Dispatch client-side RTC boundary smoothing.
 
@@ -294,7 +314,7 @@ def apply_rtc_client_smooth(
             blend_steps=max(1, int(blend_steps)),
             prev_velocity=prev_vel,
         )
-    # Default: official temporal overlap.
+    # Default: official temporal overlap (fade curve selectable).
     old_actions = None
     if old_chunk is not None and old_chunk.horizon > 0:
         start = max(0, min(int(old_cursor), old_chunk.horizon))
@@ -305,6 +325,7 @@ def apply_rtc_client_smooth(
         new_chunk,
         min_m=max(1, int(blend_steps)),
         last_action=last_commanded,
+        fade=fade,
     )
 
 
