@@ -120,7 +120,10 @@ RTC_BLEND_STEPS = 16
 RTC_SMOOTH_METHOD = "temporal"
 RTC_FADE = "smoothstep"  # linear | smoothstep | ease_out
 # Request at least this many soft-guidance steps (extends into hold-last pad).
-RTC_SOFT_MIN = 28
+RTC_SOFT_MIN = 32
+# Command-space acceleration limit for RTC. At 20 Hz, 8 rad/s² allows the
+# per-step velocity (Δq) to change by at most 0.02 rad.
+RTC_MAX_JOINT_ACCEL = 8.0
 
 
 
@@ -547,6 +550,8 @@ def guarded_chunk(
     gripper_min: float,
     gripper_max: float,
     max_joint_step_per_arm: tuple[float, float] | None = None,
+    previous_before_current: np.ndarray | None = None,
+    max_joint_accel_step: float | None = None,
 ) -> np.ndarray:
     actions = np.asarray(actions, dtype=np.float64)
     if actions.ndim != 2 or actions.shape[1] != ACTION_DIM:
@@ -556,6 +561,11 @@ def guarded_chunk(
 
     chunk = actions[: min(count, len(actions))].copy()
     previous = np.asarray(current, dtype=np.float64).copy()
+    previous_before = (
+        np.asarray(previous_before_current, dtype=np.float64).copy()
+        if previous_before_current is not None
+        else None
+    )
     for index in range(len(chunk)):
         for arm_i, offset in enumerate((0, 7)):
             lim = (
@@ -564,12 +574,31 @@ def guarded_chunk(
                 else float(max_joint_step)
             )
             delta = chunk[index, offset : offset + 6] - previous[offset : offset + 6]
+            if (
+                previous_before is not None
+                and max_joint_accel_step is not None
+                and max_joint_accel_step > 0
+            ):
+                prev_delta = (
+                    previous[offset : offset + 6]
+                    - previous_before[offset : offset + 6]
+                )
+                accel_step = float(max_joint_accel_step)
+                delta = np.clip(
+                    delta,
+                    prev_delta - accel_step,
+                    prev_delta + accel_step,
+                )
+            # Velocity safety limit remains authoritative if the incoming
+            # velocity was already outside the acceleration-feasible range.
+            delta = np.clip(delta, -lim, lim)
             chunk[index, offset : offset + 6] = (
-                previous[offset : offset + 6] + np.clip(delta, -lim, lim)
+                previous[offset : offset + 6] + delta
             )
             chunk[index, offset + 6] = np.clip(
                 chunk[index, offset + 6], gripper_min, gripper_max
             )
+        previous_before = previous
         previous = chunk[index]
     return chunk
 
@@ -783,6 +812,7 @@ def run_rtc(
     rtc_max_guidance_weight: float,
     rtc_blend_steps: int,
     rtc_smooth_method: str,
+    rtc_max_joint_accel: float,
     rtc_fade: str = RTC_FADE,
 ) -> None:
     """Overlapping RTC loop: execute while next infer runs with prev_chunk guidance."""
@@ -801,6 +831,7 @@ def run_rtc(
     blend_steps = max(1, int(rtc_blend_steps))
     smooth_method = str(rtc_smooth_method).strip().lower()
     fade = str(rtc_fade).strip().lower()
+    max_joint_accel_step = float(rtc_max_joint_accel) * dt * dt
 
     def _apply_swap(
         tag: str,
@@ -820,6 +851,21 @@ def run_rtc(
             blend_steps=blend_steps,
             fade=fade,
         )
+        if last_commanded is not None and max_joint_accel_step > 0:
+            smoothed_actions = guarded_chunk(
+                stitched.actions,
+                last_commanded,
+                count=stitched.horizon,
+                max_joint_step=max_joint_step,
+                gripper_min=gripper_min,
+                gripper_max=gripper_max,
+                previous_before_current=prev_commanded,
+                max_joint_accel_step=max_joint_accel_step,
+            )
+            stitched = JointRTCChunk(
+                actions=smoothed_actions.astype(np.float32),
+                created_monotonic=stitched.created_monotonic,
+            )
         now = time.monotonic()
         wall_dt = (now - last_swap_mono) if last_swap_mono is not None else None
         swap_count += 1
@@ -894,7 +940,7 @@ def run_rtc(
     def _seed_and_start() -> None:
         """Warmup + first RTC chunk; create worker."""
         nonlocal worker, current_chunk, cursor, schedule_end, last_commanded
-        nonlocal last_swap_mono
+        nonlocal prev_commanded, last_swap_mono
         _stop_worker()
         obs = env.get_obs()
         state = measured_state(env)
@@ -920,8 +966,21 @@ def run_rtc(
         )
         latency = time.monotonic() - started
         raw = np.asarray(result["actions"], dtype=np.float32)
-        current_chunk = build_joint_chunk(raw)
+        initial_actions = guarded_chunk(
+            raw,
+            state,
+            count=len(raw),
+            max_joint_step=max_joint_step,
+            gripper_min=gripper_min,
+            gripper_max=gripper_max,
+            previous_before_current=state,
+            max_joint_accel_step=max_joint_accel_step,
+        )
+        current_chunk = build_joint_chunk(initial_actions)
         cursor = 0
+        # Seed zero command velocity so the first RTC chunk ramps from rest.
+        last_commanded = np.asarray(state, dtype=np.float64).copy()
+        prev_commanded = np.asarray(state, dtype=np.float64).copy()
         init_delay = max(
             1, estimate_delay_steps(max(latency, warm_latency), frequency)
         )
@@ -948,7 +1007,9 @@ def run_rtc(
             f"delay~{worker.capped_delay()} s_min={worker.s_min} max_gw={rtc_max_guidance_weight} "
             f"schedule_batch={rtc_batch} (cli steps_per_inference={steps_per_inference}) "
             f"delay_align={worker.delay_align} smooth={smooth_method} "
-            f"fade={fade} blend/min_m={blend_steps} soft_min={RTC_SOFT_MIN}"
+            f"fade={fade} blend/min_m={blend_steps} soft_min={RTC_SOFT_MIN} "
+            f"max_accel={rtc_max_joint_accel:.2f}rad/s^2 "
+            f"(ddq_step={max_joint_accel_step:.4f}rad)"
         )
         print(
             f"[RTC]   plan: infer_at={trig0} switch_at={switch0} delay={d0} "
@@ -2057,6 +2118,16 @@ def run_dagger(
         "ease_out=stay on leftover longer; linear=official kai0."
     ),
 )
+@click.option(
+    "--rtc-max-joint-accel",
+    default=RTC_MAX_JOINT_ACCEL,
+    type=click.FloatRange(min=0.0),
+    show_default=True,
+    help=(
+        "RTC command-space joint acceleration limit in rad/s^2. "
+        "0 disables it; 8 gives max Δ(Δq)=0.02 rad at 20 Hz."
+    ),
+)
 @click.option("--output", default="data_local/kai0_eval", show_default=True)
 @click.option(
     "--log-file",
@@ -2104,6 +2175,7 @@ def main(
     rtc_smooth_method: str,
     rtc_blend_steps: int,
     rtc_fade: str,
+    rtc_max_joint_accel: float,
     output: str,
     log_file: str,
     skip_server_warmup: bool,  # noqa: FBT001
@@ -2145,7 +2217,8 @@ def main(
             f"[RTC] enabled: s_min={rtc_s_min}, delay_buf={rtc_delay_buffer_size}, "
             f"max_gw={rtc_max_guidance_weight}, smooth={rtc_smooth_method}, "
             f"fade={rtc_fade}, blend/min_m={rtc_blend_steps}, "
-            f"soft_min={RTC_SOFT_MIN}, steps_per_inference={steps_per_inference}"
+            f"soft_min={RTC_SOFT_MIN}, max_accel={rtc_max_joint_accel:.2f}rad/s^2, "
+            f"steps_per_inference={steps_per_inference}"
         )
     if dagger:
         print(
@@ -2272,6 +2345,7 @@ def main(
                     rtc_max_guidance_weight=rtc_max_guidance_weight,
                     rtc_blend_steps=rtc_blend_steps,
                     rtc_smooth_method=rtc_smooth_method,
+                    rtc_max_joint_accel=rtc_max_joint_accel,
                     rtc_fade=rtc_fade,
                 )
             else:
