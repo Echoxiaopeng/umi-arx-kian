@@ -95,6 +95,8 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 os.chdir(ROOT_DIR)
 
+from modules.arx5_controller import apply_drag_profile  # noqa: E402
+from modules.arx5_controller import get_drag_profile  # noqa: E402
 from modules.arx5_env_with_images_zmq import Arx5EnvWithImages  # noqa: E402
 from modules.replay_buffer import ReplayBuffer  # noqa: E402
 from utils.other_util import precise_wait  # noqa: E402
@@ -1431,11 +1433,14 @@ def run_collect_session(
     web_state=None,
     web_cmds=None,
     web_server=None,
+    drag_profile="light",
 ) -> None:
     """连接机械臂 + 相机，跑一轮数采会话；Q / 网页 quit 后返回（不退出进程）。
 
     若传入 web_state/web_cmds/web_server（hub 复用），则不另起端口，并在连接阶段写 logs。
     """
+    apply_drag_profile(drag_profile)
+
     # 仅非 web、非 terminal_keys 时才需要 pynput；--web 用网页键，避免本机双触发
     KeystrokeCounter = None
     if not terminal_keys and not web:
@@ -1488,6 +1493,7 @@ def run_collect_session(
         print(f"  init_gripper_delta: {init_gripper_delta:+.4f} m")
         print(f"  grip clip  : [{gripper_min_width:.4f}, {gripper_max_width:.4f}]")
     print(f"  init_duration: {init_duration:.1f}s")
+    print(f"  drag_profile: {get_drag_profile()}  (soft-hold; true GC ignores)")
     print(f"  no_zero_force: {no_zero_force}")
     if no_zero_force:
         print("  startup: reset_to_home → optional init → C to record (P optional)")
@@ -2270,6 +2276,16 @@ def run_collect_session(
     help="启动微调时长（秒；与 fast_wam warmup_sec 一致）",
 )
 @click.option(
+    "--drag_profile",
+    type=click.Choice(["light", "stable"], case_sensitive=False),
+    default="light",
+    show_default=True,
+    help=(
+        "软阻尼拖拽手感：light=更轻（采数）；stable=更稳防坠（偏沉）。"
+        "真零力 server 时此参数无效。"
+    ),
+)
+@click.option(
     "--no_zero_force",
     is_flag=True,
     default=True,
@@ -2344,6 +2360,7 @@ def main(
     gripper_min_width,
     gripper_max_width,
     init_duration,
+    drag_profile,
     no_zero_force,
     quit_home_duration,
     web,
@@ -2386,6 +2403,7 @@ def main(
         gripper_min_width=gripper_min_width,
         gripper_max_width=gripper_max_width,
         init_duration=init_duration,
+        drag_profile=drag_profile,
         no_zero_force=no_zero_force,
         quit_home_duration=quit_home_duration,
         web=web,

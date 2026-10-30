@@ -90,6 +90,8 @@ CLIENT_SRC = ROOT / "packages" / "openpi-client" / "src"
 if CLIENT_SRC.is_dir():
     sys.path.insert(0, str(CLIENT_SRC))
 
+from modules.arx5_controller import apply_drag_profile  # noqa: E402
+from modules.arx5_controller import get_drag_profile  # noqa: E402
 from modules.arx5_env_with_images_bimanual_rs import Arx5EnvWithImages  # noqa: E402
 from openpi_client.websocket_client_policy import WebsocketClientPolicy  # noqa: E402
 from utils.kai0_dagger_drag import abort_episode  # noqa: E402
@@ -2235,6 +2237,16 @@ def run_dagger(
     is_flag=True,
     help="Verbose timing diagnostics for chunk boundaries / RTC swap behavior.",
 )
+@click.option(
+    "--drag-profile",
+    type=click.Choice(["light", "stable"], case_sensitive=False),
+    default="stable",
+    show_default=True,
+    help=(
+        "Soft-hold drag feel for DAgger intervene (D): stable=anti-sag (heavier), "
+        "light=same as collect. Ignored when true gravity-comp server is used."
+    ),
+)
 def main(
     policy_ip: str,
     policy_port: int,
@@ -2269,6 +2281,7 @@ def main(
     log_file: str,
     skip_server_warmup: bool,  # noqa: FBT001
     debug_timing: bool,  # noqa: FBT001
+    drag_profile: str,
 ) -> None:
     if frequency <= 0 or max_joint_speed <= 0:
         raise click.BadParameter("frequency and max-joint-speed must be positive")
@@ -2323,6 +2336,14 @@ def main(
         print("OBSERVE ONLY: motor commands are permanently disabled")
     if dagger and observe_only:
         raise click.ClickException("--dagger cannot be combined with --observe-only")
+
+    # Before spawning controllers so soft-hold DAgger drag uses the chosen feel.
+    apply_drag_profile(drag_profile)
+    if dagger:
+        print(
+            f"[drag] profile={get_drag_profile()} "
+            "(soft-hold intervene; true GC ignores)"
+        )
 
     dt = 1.0 / frequency
     max_joint_step = max_joint_speed * dt

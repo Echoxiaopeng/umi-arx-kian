@@ -1,22 +1,23 @@
-import multiprocessing as mp
+import ctypes
 import enum
+import multiprocessing as mp
+import os
+import time
+from multiprocessing import Value
 from multiprocessing.managers import SharedMemoryManager
 from typing import Optional, cast
-import numpy as np
-from utils.other_util import precise_wait
-from shared_memory.shared_memory_queue import SharedMemoryQueue, Empty
-from shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
 
+import numpy as np
+import numpy.typing as npt
+
+from modules.arx5_zmq_client import Arx5Client
 from modules.pose_trajectory_interpolator import (
     JointTrajectoryInterpolator,
     PoseTrajectoryInterpolator,
 )
-import time
-from modules.arx5_zmq_client import Arx5Client
-import numpy.typing as npt
-
-from multiprocessing import Value
-import ctypes
+from shared_memory.shared_memory_queue import Empty, SharedMemoryQueue
+from shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
+from utils.other_util import precise_wait
 
 
 class Command(enum.Enum):
@@ -69,14 +70,82 @@ DRAG_GRIPPER_HOLD_CLOSED_LO = 0.020
 # 阻尼拖拽（无真零力时）：纯 kp=0 + 极小 kd 会立刻垂臂。
 # 用硬增益比例托住重力；仅在「明显是人手在拖」时才让 hold 跟随，
 # 否则重力慢坠也会被当成跟手，hold 跟着掉（日志里 z 从 0.38→-0.01）。
+#
+# 两套手感（采数 / DAgger 可分开）:
+#   light  — 更轻跟手，闲置可能略坠（采数默认）
+#   stable — 防坠更硬，拖起来略沉（DAgger / 介入默认）
+# 通过 apply_drag_profile() 或环境变量 ARX_DRAG_PROFILE 切换。
+DRAG_PROFILES = {
+    "light": {
+        "kp_scale": 0.08,
+        "kd_scale": 0.10,
+        "hold_pos_deadband_m": 0.020,
+        "hold_vel_thresh": 0.28,
+        "hold_joint_err": 0.08,
+    },
+    "stable": {
+        "kp_scale": 0.18,
+        "kd_scale": 0.20,
+        "hold_pos_deadband_m": 0.025,
+        "hold_vel_thresh": 0.40,
+        "hold_joint_err": 0.10,
+    },
+}
+DRAG_PROFILE_ENV = "ARX_DRAG_PROFILE"
+DRAG_PROFILE_DEFAULT = "stable"
+
 # kd 相对 set_to_damping 后再乘此系数（越大越不易下坠，拖拽略沉）。
-DRAG_ARM_KD_SCALE = 0.20
+DRAG_ARM_KD_SCALE = float(DRAG_PROFILES[DRAG_PROFILE_DEFAULT]["kd_scale"])
 # 相对进入拖拽前硬 kp 的比例；0.06 托不住双臂+相机，约 0.15–0.20 才稳。
-DRAG_ARM_KP_SCALE = 0.18
+DRAG_ARM_KP_SCALE = float(DRAG_PROFILES[DRAG_PROFILE_DEFAULT]["kp_scale"])
 # hold 跟随：要够大的速度+误差才跟手；门槛过低会把重力下坠当成拖动。
-DRAG_HOLD_POS_DEADBAND_M = 0.025
-DRAG_HOLD_VEL_THRESH = 0.40  # rad/s, max |qd|
-DRAG_HOLD_JOINT_ERR = 0.10  # rad, L2 of first 6 joints
+DRAG_HOLD_POS_DEADBAND_M = float(
+    DRAG_PROFILES[DRAG_PROFILE_DEFAULT]["hold_pos_deadband_m"]
+)
+DRAG_HOLD_VEL_THRESH = float(DRAG_PROFILES[DRAG_PROFILE_DEFAULT]["hold_vel_thresh"])
+DRAG_HOLD_JOINT_ERR = float(DRAG_PROFILES[DRAG_PROFILE_DEFAULT]["hold_joint_err"])
+_ACTIVE_DRAG_PROFILE = DRAG_PROFILE_DEFAULT
+
+
+def apply_drag_profile(name: str, *, sync_env: bool = True) -> str:
+    """Apply soft-hold drag feel profile. Returns normalized name.
+
+    Also sets ``ARX_DRAG_PROFILE`` so controller subprocesses (spawn) reload
+    the same profile at ``run()`` start.
+    """
+    global DRAG_ARM_KP_SCALE, DRAG_ARM_KD_SCALE
+    global DRAG_HOLD_POS_DEADBAND_M, DRAG_HOLD_VEL_THRESH, DRAG_HOLD_JOINT_ERR
+    global _ACTIVE_DRAG_PROFILE
+
+    key = str(name).strip().lower()
+    if key not in DRAG_PROFILES:
+        known = ", ".join(sorted(DRAG_PROFILES))
+        raise ValueError(f"unknown drag profile {name!r}; expected one of: {known}")
+    cfg = DRAG_PROFILES[key]
+    DRAG_ARM_KP_SCALE = float(cfg["kp_scale"])
+    DRAG_ARM_KD_SCALE = float(cfg["kd_scale"])
+    DRAG_HOLD_POS_DEADBAND_M = float(cfg["hold_pos_deadband_m"])
+    DRAG_HOLD_VEL_THRESH = float(cfg["hold_vel_thresh"])
+    DRAG_HOLD_JOINT_ERR = float(cfg["hold_joint_err"])
+    _ACTIVE_DRAG_PROFILE = key
+    if sync_env:
+        os.environ[DRAG_PROFILE_ENV] = key
+    return key
+
+
+def get_drag_profile() -> str:
+    return str(_ACTIVE_DRAG_PROFILE)
+
+
+def reload_drag_profile_from_env() -> str:
+    """Child-process safe: apply profile from ``ARX_DRAG_PROFILE`` if set.
+
+    If the env var is unset, keep the (possibly fork-inherited) current profile.
+    """
+    raw = os.environ.get(DRAG_PROFILE_ENV, "").strip()
+    if not raw:
+        return get_drag_profile()
+    return apply_drag_profile(raw, sync_env=False)
 
 
 def _looks_like_joint_server_error(exc: BaseException) -> bool:
@@ -590,6 +659,17 @@ class Arx5Controller(mp.Process):
 
     # ========= main loop in process ============
     def run(self):
+        # spawn 子进程会重新 import；从环境变量恢复父进程选定的手感。
+        try:
+            profile = reload_drag_profile_from_env()
+            print(
+                f"[Arx5Controller] drag profile={profile} "
+                f"(kp*={DRAG_ARM_KP_SCALE}, kd*={DRAG_ARM_KD_SCALE})",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Arx5Controller] drag profile reload warning: {exc}", flush=True)
+
         self.robot_client = Arx5Client(self.robot_ip, self.robot_port)
         if self.reset_to_home_on_start:
             self.robot_client.reset_to_home()
@@ -1353,7 +1433,8 @@ class Arx5Controller(mp.Process):
                                     )
                                     print(
                                         "[Arx5Controller] soft-hold damping drag ON "
-                                        f"(arm kp*={DRAG_ARM_KP_SCALE}, "
+                                        f"(profile={get_drag_profile()}, "
+                                        f"arm kp*={DRAG_ARM_KP_SCALE}, "
                                         f"kd*={DRAG_ARM_KD_SCALE}; "
                                         f"hold={drag_hold_mode}; "
                                         "gripper kp=0 + torque assist). "
