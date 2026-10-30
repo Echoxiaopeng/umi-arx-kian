@@ -14,11 +14,18 @@ Still uses this repo's ZMQ/camera stack (not ROS2).
 
 Example (policy server must be started with ``--rtc``)::
 
-    python scripts/eval_arx5_kai0_bimanual_rtc_v2.py \\
-      --policy-ip 127.0.0.1 --policy-port 8000 \\
-      --robot-ports 8765,8766 --camera-reorder 0,1 --no-preview \\
-      --frequency 20 --inference-rate 4 \\
-      --rtc-max-guidance-weight 0.5 --min-smooth-steps 10 --latency-k 8
+# 效果不错，很平滑。
+python scripts/eval_arx5_kai0_bimanual_rtc_v2.py \
+  --policy-ip 127.0.0.1 --policy-port 8000 \
+  --robot-ports 8765,8766 --camera-reorder 0,1 \
+  --frequency 20 --inference-rate 4 \
+  --rtc-max-guidance-weight 0.5 \
+  --min-smooth-steps 10 --latency-k 8 \
+  --dispatch tick
+
+
+``--dispatch schedule`` (default): timed ZMQ waypoints via interpolator.
+``--dispatch tick``: ROS-style immediate SET_JOINT_POSITION each control tick.
 
 Controls: C=start, S=stop/hold, Q=quit.
 """
@@ -118,6 +125,7 @@ def run_rtc_v2(
     latency_k: int,
     min_smooth_steps: int,
     disable_smoothing: bool,
+    dispatch: str = "schedule",
 ) -> None:
     """Official-style: infer thread fills buffer; control pops 1 action / tick."""
     dt = 1.0 / float(frequency)
@@ -125,6 +133,7 @@ def run_rtc_v2(
     exec_h = int(chunk_size if rtc_execute_horizon is None else rtc_execute_horizon)
     exec_h = max(1, min(exec_h, int(chunk_size)))
     smooth = "raw" if disable_smoothing else "temporal"
+    use_immediate = str(dispatch).lower() == "tick"
     buffer = StreamActionBuffer(state_dim=ACTION_DIM, smooth_method=smooth)
     delay_tracker = _DelayTracker()
     prev_chunk_lock = threading.Lock()
@@ -136,6 +145,9 @@ def run_rtc_v2(
     step_count = 0
     empty_streak = 0
     last_infer_log = 0.0
+
+    def _hold() -> None:
+        _v1.hold_current(env, immediate=use_immediate)
 
     def _get_obs_state() -> tuple[dict, np.ndarray]:
         obs = env.get_obs()
@@ -231,7 +243,8 @@ def run_rtc_v2(
         f"[v2] RTC async+buffer: ctrl={frequency}Hz infer={inference_rate}Hz "
         f"H={chunk_size} exec_h={exec_h} soft≈{soft_len}+(grows with delay) "
         f"max_gw={rtc_max_guidance_weight} smooth={smooth} "
-        f"min_m={min_smooth_steps} latency_k={latency_k}"
+        f"min_m={min_smooth_steps} latency_k={latency_k} "
+        f"dispatch={'tick/immediate' if use_immediate else 'schedule'}"
     )
 
     infer_thread = threading.Thread(
@@ -248,13 +261,13 @@ def run_rtc_v2(
                     executing = False
                     stop_event.set()
                     buffer.clear()
-                    _v1.hold_current(env)
+                    _hold()
                     return
                 if key == "s":
                     executing = False
                     buffer.clear()
                     last_commanded = None
-                    _v1.hold_current(env)
+                    _hold()
                     print("Policy stopped; holding measured joints")
                 elif key == "c":
                     if observe_only:
@@ -262,7 +275,11 @@ def run_rtc_v2(
                     else:
                         executing = True
                         empty_streak = 0
-                        print("Policy execution started (RTC v2 async+buffer)")
+                        mode = "tick" if use_immediate else "schedule"
+                        print(
+                            f"Policy execution started (RTC v2 async+buffer, "
+                            f"dispatch={mode})"
+                        )
 
             _v1.show_preview(
                 obs,
@@ -298,12 +315,17 @@ def run_rtc_v2(
                 gripper_min=gripper_min,
                 gripper_max=gripper_max,
             )
-            target_t = max(time.time() + 0.02, t_loop + 0.02)
-            _v1.command_joint_actions(
-                env,
-                guarded.reshape(1, -1),
-                np.asarray([target_t], dtype=np.float64),
-            )
+            if use_immediate:
+                # Blend over one control period on the ~200 Hz interpolator.
+                # Hard set_joint_position every 20 Hz tick causes step jitter.
+                _v1.command_joint_immediate(env, guarded, duration_s=dt)
+            else:
+                target_t = max(time.time() + 0.02, t_loop + 0.02)
+                _v1.command_joint_actions(
+                    env,
+                    guarded.reshape(1, -1),
+                    np.asarray([target_t], dtype=np.float64),
+                )
             last_commanded = guarded
             step_count += 1
             if step_count % 40 == 0:
@@ -401,6 +423,16 @@ def run_rtc_v2(
     help="Official --rtc_disable_smoothing: latency trim only, no temporal blend.",
 )
 @click.option(
+    "--dispatch",
+    type=click.Choice(["schedule", "tick"], case_sensitive=False),
+    default="schedule",
+    show_default=True,
+    help=(
+        "schedule=timed ZMQ waypoints (interpolator); "
+        "tick=ROS-style immediate joint cmd each control step."
+    ),
+)
+@click.option(
     "--log-file",
     default=str(DEFAULT_RUN_LOG),
     show_default=True,
@@ -433,6 +465,7 @@ def main(
     latency_k: int,
     min_smooth_steps: int,
     rtc_disable_smoothing: bool,  # noqa: FBT001
+    dispatch: str,
     log_file: str,
 ) -> None:
     if frequency <= 0 or inference_rate <= 0 or max_joint_speed <= 0:
@@ -476,7 +509,8 @@ def main(
         f"[v2] enabled: ctrl={frequency}Hz infer={inference_rate}Hz "
         f"exec_h≈{soft_hint} max_gw={rtc_max_guidance_weight} "
         f"smooth={'raw' if rtc_disable_smoothing else 'temporal'} "
-        f"min_m={min_smooth_steps} latency_k={latency_k}"
+        f"min_m={min_smooth_steps} latency_k={latency_k} "
+        f"dispatch={dispatch}"
     )
     print("Controls: C=start execution, S=stop/hold, Q=quit")
     if observe_only:
@@ -559,10 +593,13 @@ def main(
                 latency_k=int(latency_k),
                 min_smooth_steps=int(min_smooth_steps),
                 disable_smoothing=rtc_disable_smoothing,
+                dispatch=dispatch,
             )
         finally:
             try:
-                _v1.hold_current(env)
+                _v1.hold_current(
+                    env, immediate=(str(dispatch).lower() == "tick")
+                )
             except Exception as exc:  # noqa: BLE001
                 print(f"Final hold warning: {exc}")
             if preview_enabled:

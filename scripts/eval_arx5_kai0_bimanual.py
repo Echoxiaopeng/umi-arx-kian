@@ -665,16 +665,43 @@ def command_joint_actions(
             robot.schedule_joint_waypoint(target, target_time=float(target_time))
 
 
+def command_joint_immediate(
+    env: Arx5EnvWithImages,
+    action: np.ndarray,
+    *,
+    duration_s: float | None = None,
+) -> None:
+    """Tick command: blend one absolute dual-arm pose over duration_s.
+
+    No wall-clock stamps. ``duration_s=None`` → each arm uses ``1/frequency``.
+    Pass ``duration_s=0`` to snap-hold.
+    """
+    action = np.asarray(action, dtype=np.float64).reshape(-1)
+    if action.shape[0] != ACTION_DIM:
+        raise RuntimeError(f"Expected action [{ACTION_DIM}], got {action.shape}")
+    for robot_index, robot in enumerate(env.robots):
+        target = np.asarray(
+            action[7 * robot_index : 7 * robot_index + 7], dtype=np.float64
+        )
+        robot.set_joint_immediate(target, duration_s=duration_s)
+
+
 def hold_current(
     env: Arx5EnvWithImages,
     *,
     horizon_s: float = 0.05,
+    immediate: bool = False,
 ) -> float:
     """Hold measured joints. Returns wall-clock target time of the hold waypoint."""
+    q = measured_state(env).reshape(1, -1)
+    if immediate:
+        # Snap-hold: freeze at measured joints.
+        command_joint_immediate(env, q[0], duration_s=0.0)
+        return float(time.time())
     target_t = time.time() + float(horizon_s)
     command_joint_actions(
         env,
-        measured_state(env).reshape(1, -1),
+        q,
         np.asarray([target_t], dtype=np.float64),
     )
     return float(target_t)

@@ -33,6 +33,7 @@ class Command(enum.Enum):
     SET_END_CONTROL = 10
     RESTORE_GAINS_AFTER_DRAG = 11
     SCHEDULE_JOINT_WAYPOINT = 12
+    SET_JOINT_IMMEDIATE = 13
 
 
 # 拖拽夹爪：轻回弹 + 跟手；旧硬墙默认关（曾偏猛）。
@@ -487,6 +488,34 @@ class Arx5Controller(mp.Process):
         }
         self.input_queue.put(message)
 
+    def set_joint_immediate(
+        self,
+        joint_angles: npt.NDArray[np.float64],
+        *,
+        duration_s: float | None = None,
+    ):
+        """Tick-driven joint command (no wall-clock client stamps).
+
+        ``duration_s`` is the blend window on the controller interpolator
+        (default ``1/frequency``). Use a short/zero duration to snap-hold.
+        Avoids stair-step PD setpoints that jitter at low client rates.
+        """
+        assert self.is_alive()
+        joint_angles = np.asarray(joint_angles, dtype=np.float64)
+        assert joint_angles.shape == (7,), (
+            f"Expected 7 joint angles, got {joint_angles.shape}"
+        )
+        if duration_s is None:
+            duration_s = 1.0 / float(self.frequency)
+        message = {
+            "cmd": Command.SET_JOINT_IMMEDIATE.value,
+            "joint_angles": joint_angles,
+            # Reuse schema key "duration" (SharedMemoryQueue has fixed fields).
+            "duration": float(duration_s),
+            "target_time": 0.0,
+        }
+        self.input_queue.put(message)
+
     def add_waypoint(
         self, pose: npt.NDArray[np.float64], gripper_pos: float, target_time: float
     ):
@@ -656,6 +685,46 @@ class Arx5Controller(mp.Process):
                     last_waypoint_time=last_joint_waypoint_time,
                 )
                 last_joint_waypoint_time = target_time
+                joint_control_active = True
+
+            def _set_joint_immediate_cmd(joint_angles, duration_s: float):
+                """Blend to q over duration_s via interpolator (200Hz loop sends).
+
+                Snap only when duration_s ~= 0 (hold). Hard set_joint_position
+                every client tick causes audible/step jitter at 20 Hz.
+                """
+                nonlocal joint_interp, last_joint_waypoint_time, joint_control_active
+                nonlocal _joint_pose_fail_t
+                q = np.asarray(joint_angles, dtype=np.float64).reshape(7)
+                dur = max(0.0, float(duration_s))
+                if not joint_control_active:
+                    _seed_joint_interp_from_state()
+                if dur <= 1e-4:
+                    # Snap-hold: freeze interpolator at q; next ticks re-hold.
+                    t_cmd = time.monotonic()
+                    joint_interp = JointTrajectoryInterpolator(
+                        times=np.array([t_cmd]), joints=np.array([q])
+                    )
+                    last_joint_waypoint_time = t_cmd
+                    joint_control_active = True
+                    try:
+                        self.robot_client.set_joint_position(q)
+                    except Exception as e:
+                        if time.monotonic() - _joint_pose_fail_t > 1.0:
+                            _joint_pose_fail_t = time.monotonic()
+                            print(
+                                f"[Arx5Controller] set_joint_immediate "
+                                f"snap failed: {e}"
+                            )
+                    return
+                t_arrive = t_now + dur
+                joint_interp = joint_interp.drive_to_waypoint(
+                    joint=q,
+                    time=t_arrive,
+                    curr_time=t_now,
+                    max_joint_speed=np.inf,
+                )
+                last_joint_waypoint_time = t_arrive
                 joint_control_active = True
 
             def print_drag_diag(tag: str, gain_override=None) -> None:
@@ -1097,6 +1166,32 @@ class Arx5Controller(mp.Process):
                             print(
                                 "[Arx5Controller] Exception in "
                                 f"schedule_joint_waypoint: {e}"
+                            )
+                    elif cmd == Command.SET_JOINT_IMMEDIATE.value:
+                        joint_angles = command.get("joint_angles", None)
+                        if joint_angles is None:
+                            print(
+                                "[Arx5Controller] Warning: missing joint_angles "
+                                "field in SET_JOINT_IMMEDIATE"
+                            )
+                            continue
+                        duration_s = command.get(
+                            "duration", 1.0 / float(self.frequency)
+                        )
+                        try:
+                            _set_joint_immediate_cmd(
+                                joint_angles, float(duration_s)
+                            )
+                            if self.verbose:
+                                print(
+                                    "[Arx5Controller] set_joint_immediate "
+                                    f"dur={float(duration_s):.3f} -> "
+                                    f"{np.asarray(joint_angles).round(3)}"
+                                )
+                        except Exception as e:
+                            print(
+                                "[Arx5Controller] Exception in "
+                                f"set_joint_immediate: {e}"
                             )
                     elif cmd == Command.SET_JOINT_TRAJECTORY.value:
                         joint_traj = command.get("joint_traj", None)
