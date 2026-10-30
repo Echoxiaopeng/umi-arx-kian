@@ -38,18 +38,13 @@ python scripts/eval_arx5_kai0_bimanual.py \
     --steps-per-inference 50
 
 
-    conda activate umi-arx
-    python scripts/eval_arx5_kai0_bimanual.py \
-      --policy-ip 127.0.0.1 --policy-port 8000 \
-      --robot-ports 8765,8766 --camera-reorder 0,1 \
-      --steps-per-inference 32
 
 # Gentler RTC fade (smoothstep handoff + longer soft/blend):
 python scripts/eval_arx5_kai0_bimanual.py \
         --policy-ip 127.0.0.1 --policy-port 8000  \
         --robot-ports 8765,8766 --camera-reorder 0,1 \
         --rtc --frequency 20 \
-        --steps-per-inference 4 --rtc-s-min 20 \
+        --steps-per-inference 4 --rtc-s-min 32 \
         --rtc-max-guidance-weight 0.7 \
         --rtc-smooth-method temporal \
         --rtc-blend-steps 16 --rtc-fade smoothstep
@@ -720,10 +715,13 @@ def run_open_loop(
     gripper_max: float,
     observe_only: bool,
     preview_enabled: bool,
+    debug_timing: bool,
 ) -> None:
     """Original blocking infer → execute chunk → wait loop."""
     dt = 1.0 / frequency
     executing = False
+    prev_chunk_end_wall: float | None = None
+    chunk_index = 0
     while True:
         obs = env.get_obs()
         requested_infer = False
@@ -755,6 +753,7 @@ def run_open_loop(
             time.sleep(0.02)
             continue
 
+        infer_start_wall = time.time()
         current = measured_state(env)
         started = time.monotonic()
         result = policy.infer(policy_observation(obs, current, prompt))
@@ -774,10 +773,27 @@ def run_open_loop(
         if not executing:
             continue
 
+        chunk_index += 1
+        boundary_gap_ms = (
+            (infer_start_wall - prev_chunk_end_wall) * 1000.0
+            if prev_chunk_end_wall is not None
+            else float("nan")
+        )
         command_start_time = time.time() + 0.05
         action_timestamps = (
             np.arange(len(actions), dtype=np.float64) * dt + command_start_time
         )
+        if debug_timing:
+            exec_window_ms = (len(actions) * dt) * 1000.0
+            bridge_ms = (
+                command_start_time - infer_start_wall
+            ) * 1000.0  # infer-done -> first waypoint target
+            print(
+                f"[DBG][OL] chunk#{chunk_index} "
+                f"infer={latency*1000.0:.1f}ms boundary_gap={boundary_gap_ms:.1f}ms "
+                f"bridge={bridge_ms:.1f}ms exec_window={exec_window_ms:.1f}ms "
+                f"H={len(actions)}"
+            )
         command_joint_actions(env, actions, action_timestamps)
 
         deadline = float(action_timestamps[-1])
@@ -792,6 +808,7 @@ def run_open_loop(
             if not executing:
                 break
             time.sleep(0.01)
+        prev_chunk_end_wall = deadline
 
 
 def run_rtc(
@@ -814,6 +831,7 @@ def run_rtc(
     rtc_smooth_method: str,
     rtc_max_joint_accel: float,
     rtc_fade: str = RTC_FADE,
+    debug_timing: bool = False,
 ) -> None:
     """Overlapping RTC loop: execute while next infer runs with prev_chunk guidance."""
     dt = 1.0 / frequency
@@ -828,6 +846,8 @@ def run_rtc(
     last_swap_mono: float | None = None
     batch_sat_count = 0
     batch_step_count = 0
+    underrun_count = 0
+    max_underrun_ms = 0.0
     blend_steps = max(1, int(rtc_blend_steps))
     smooth_method = str(rtc_smooth_method).strip().lower()
     fade = str(rtc_fade).strip().lower()
@@ -918,12 +938,18 @@ def run_rtc(
         nonlocal worker, current_chunk, cursor, schedule_end, last_commanded
         nonlocal prev_commanded
         nonlocal swap_count, last_swap_mono, batch_sat_count, batch_step_count
+        nonlocal underrun_count, max_underrun_ms
         if worker is not None:
             if batch_step_count > 0:
                 print(
                     f"[RTC] session stats: swaps={swap_count} "
                     f"guard_sat={batch_sat_count}/{batch_step_count} "
                     f"({100.0 * batch_sat_count / batch_step_count:.1f}%)"
+                )
+            if debug_timing:
+                print(
+                    f"[DBG][RTC] underrun_count={underrun_count} "
+                    f"max_underrun={max_underrun_ms:.1f}ms"
                 )
             worker.close(wait=True, timeout_s=5.0)
             worker = None
@@ -936,6 +962,8 @@ def run_rtc(
         last_swap_mono = None
         batch_sat_count = 0
         batch_step_count = 0
+        underrun_count = 0
+        max_underrun_ms = 0.0
 
     def _seed_and_start() -> None:
         """Warmup + first RTC chunk; create worker."""
@@ -1098,6 +1126,12 @@ def run_rtc(
 
             polled = worker.poll(executed_since_chunk=cursor)
             if polled is not None:
+                if debug_timing and current_chunk is not None:
+                    remain = max(0, current_chunk.horizon - cursor)
+                    print(
+                        f"[DBG][RTC] swap_ready cursor={cursor}/{current_chunk.horizon} "
+                        f"leftover={remain}"
+                    )
                 _apply_swap("swap", swap_at=cursor, polled=polled)
 
             if cursor >= current_chunk.horizon:
@@ -1143,6 +1177,12 @@ def run_rtc(
                             break
                         done = worker.poll(executed_since_chunk=cursor)
                         if done is not None:
+                            if debug_timing and current_chunk is not None:
+                                remain = max(0, current_chunk.horizon - cursor)
+                                print(
+                                    f"[DBG][RTC] swap_commit cursor={cursor}/"
+                                    f"{current_chunk.horizon} leftover={remain}"
+                                )
                             _apply_swap("swap(commit_end)", swap_at=cursor, polled=done)
                             break
                         time.sleep(0.005)
@@ -1160,6 +1200,11 @@ def run_rtc(
             schedule_batch = min(steps_per_inference, worker.delay_align)
             n = min(schedule_batch, remaining, remaining_commit)
             if n <= 0:
+                if debug_timing and current_chunk is not None and worker.commit_end is not None:
+                    print(
+                        f"[DBG][RTC] wait_commit cursor={cursor}/{current_chunk.horizon} "
+                        f"commit_end={worker.commit_end}"
+                    )
                 time.sleep(0.005)
                 continue
             # Continuity anchor: last commanded pose (not measured), so swap
@@ -1220,9 +1265,13 @@ def run_rtc(
                     # waypoint; restart one period ahead and make the underrun
                     # visible in the log.
                     late_s = now_wall - grid_t0
+                    late_ms = late_s * 1000.0
+                    underrun_count += 1
+                    if late_ms > max_underrun_ms:
+                        max_underrun_ms = late_ms
                     t0 = now_wall + dt
                     print(
-                        f"[RTC] schedule underrun={late_s * 1000.0:.1f}ms; "
+                        f"[RTC] schedule underrun={late_ms:.1f}ms; "
                         "re-anchoring control grid"
                     )
             else:
@@ -1258,6 +1307,13 @@ def run_rtc(
                     max_gw=rtc_max_guidance_weight,
                     state=last_commanded,
                 )
+                if debug_timing:
+                    remain = current_chunk.horizon - cursor
+                    print(
+                        f"[DBG][RTC] infer_launched cursor={cursor}/{current_chunk.horizon} "
+                        f"remain={remain} commit_end={worker.commit_end} "
+                        f"delay_align={worker.delay_align}"
+                    )
 
             deadline = schedule_end
             while time.time() < deadline:
@@ -1311,6 +1367,7 @@ def run_dagger(
     rtc_blend_steps: int,
     rtc_smooth_method: str,
     rtc_fade: str = RTC_FADE,
+    debug_timing: bool = False,  # reserved; keep signature aligned with common args
 ) -> None:
     """Policy-in-the-loop DAgger with gravity-comp drag and UMI zarr episodes."""
     dt = 1.0 / frequency
@@ -2146,6 +2203,11 @@ def run_dagger(
         "1-3 min while the policy server compiles, or hit the WS timeout."
     ),
 )
+@click.option(
+    "--debug-timing",
+    is_flag=True,
+    help="Verbose timing diagnostics for chunk boundaries / RTC swap behavior.",
+)
 def main(
     policy_ip: str,
     policy_port: int,
@@ -2179,6 +2241,7 @@ def main(
     output: str,
     log_file: str,
     skip_server_warmup: bool,  # noqa: FBT001
+    debug_timing: bool,  # noqa: FBT001
 ) -> None:
     if frequency <= 0 or max_joint_speed <= 0:
         raise click.BadParameter("frequency and max-joint-speed must be positive")
@@ -2206,6 +2269,8 @@ def main(
     )
     metadata = policy.get_server_metadata()
     print(f"Policy connected; metadata={metadata}")
+    if debug_timing:
+        print("[DBG] timing diagnostics enabled")
     if rtc:
         if not metadata.get("supports_rtc"):
             raise click.ClickException(
@@ -2320,6 +2385,7 @@ def main(
                 gripper_max=gripper_max,
                 observe_only=observe_only,
                 preview_enabled=preview_enabled,
+                debug_timing=debug_timing,
             )
             if dagger:
                 print(
