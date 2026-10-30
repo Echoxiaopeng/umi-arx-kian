@@ -380,15 +380,21 @@ def move_to_init_joints(
     duration: float,
     gripper_min: float,
     gripper_max: float,
+    on_progress=None,
+    progress_label: str = "init",
 ) -> None:
-    """Interpolate both arms in joint space to dataset init (needs --joint ZMQ)."""
+    """Interpolate both arms in joint space to a target pose (needs --joint ZMQ).
+
+    ``on_progress`` optional ``callable(label, pct:int, detail:str)``.
+    """
     target14 = np.asarray(target14, dtype=np.float64).reshape(ACTION_DIM)
     target14[6] = float(np.clip(target14[6], gripper_min, gripper_max))
     target14[13] = float(np.clip(target14[13], gripper_min, gripper_max))
+    label = str(progress_label or "init")
 
     current = measured_state(env).astype(np.float64)
     print(
-        "Joint init (collect_bimanual_10_22 ep0 median):\n"
+        f"Joint move [{label}]:\n"
         f"  from {np.array2string(current, precision=4, separator=',')}\n"
         f"    to {np.array2string(target14, precision=4, separator=',')}"
     )
@@ -412,13 +418,52 @@ def move_to_init_joints(
             "--port 8765 --joint --no-idle-reset-home --no_cmd_timeout 0\n"
             f"Underlying error: {exc}"
         ) from exc
-    time.sleep(float(duration) + 0.3)
+
+    arm_idx = np.array([0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12], dtype=np.int64)
+    start_err = float(np.linalg.norm(current[arm_idx] - target14[arm_idx]))
+    t0 = time.monotonic()
+    wait_s = float(duration) + 0.3
+    last_pct = -1
+    while True:
+        now = time.monotonic()
+        elapsed = now - t0
+        after = measured_state(env).astype(np.float64)
+        err_vec = np.abs(after - target14)
+        cur_err = float(np.linalg.norm(after[arm_idx] - target14[arm_idx]))
+        time_frac = elapsed / max(float(duration), 1e-6)
+        dist_frac = (
+            1.0 - cur_err / start_err if start_err > 1e-6 else min(1.0, time_frac)
+        )
+        done = elapsed >= wait_s
+        frac = 1.0 if done else float(np.clip(max(dist_frac, 0.85 * time_frac), 0.0, 0.99))
+        pct = int(round(100.0 * frac))
+        detail = (
+            f"err_max={err_vec.max():.4f} joints_l2={cur_err:.4f} "
+            f"t={elapsed:.1f}/{duration:.1f}s"
+        )
+        if pct != last_pct or done:
+            last_pct = pct
+            print(f"[{label}] {pct:3d}%  {detail}", flush=True)
+            if on_progress is not None:
+                try:
+                    on_progress(label, pct, detail)
+                except Exception:  # noqa: BLE001
+                    pass
+        if done:
+            break
+        time.sleep(0.08)
+
     after = measured_state(env).astype(np.float64)
     err = np.abs(after - target14)
     print(
-        f"Joint init done. |after-target| max={err.max():.4f} "
-        f"joints_max={err[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]].max():.4f}"
+        f"Joint move [{label}] done. |after-target| max={err.max():.4f} "
+        f"joints_max={err[arm_idx].max():.4f}"
     )
+    if on_progress is not None:
+        try:
+            on_progress(label, 100, "done")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def measured_state(env: Arx5EnvWithImages) -> np.ndarray:
@@ -476,11 +521,12 @@ def warmup_policy_server(
     rtc: bool,
     rtc_s_min: int,
     rtc_max_guidance_weight: float,
-) -> None:
+) -> int:
     """Throw-away infer(s) so the policy server compiles before the first C.
 
     Arms are not commanded. First server-side run may take minutes (JAX).
     With ``rtc``, also warms the RTC guidance path used by ``_seed_and_start``.
+    Returns model action horizon ``H``.
     """
     obs = env.get_obs()
     state = measured_state(env)
@@ -506,7 +552,7 @@ def warmup_policy_server(
 
     if not rtc:
         print("[warmup] policy server ready (press C when ready to execute)")
-        return
+        return action_horizon
 
     seed_prev = np.tile(state.astype(np.float32)[None, :], (action_horizon, 1))
     print(
@@ -536,6 +582,7 @@ def warmup_policy_server(
     )
     print("[warmup] policy server ready (press C when ready to execute)")
     sys.stdout.flush()
+    return action_horizon
 
 
 def guarded_chunk(

@@ -27,7 +27,9 @@ python scripts/eval_arx5_kai0_bimanual_rtc_v2.py \
 ``--dispatch schedule`` (default): timed ZMQ waypoints via interpolator.
 ``--dispatch tick``: ROS-style immediate SET_JOINT_POSITION each control tick.
 
-Controls: C=start, S=stop/hold, Q=quit.
+Controls: C=start, S=stop/hold, Enter=return to init (after stop), Q=home then quit.
+
+Live dashboard (default on): http://127.0.0.1:8090/  (--no-web to disable).
 """
 
 from __future__ import annotations
@@ -54,6 +56,13 @@ if CLIENT_SRC.is_dir():
     sys.path.insert(0, str(CLIENT_SRC))
 
 from modules.arx5_env_with_images_bimanual_rs import Arx5EnvWithImages  # noqa: E402
+from modules.eval_kai0_web_ui import (  # noqa: E402
+    CommandQueue,
+    SharedEvalState,
+    make_progress_cb,
+    obs_to_jpeg,
+    start_eval_web_ui,
+)
 from openpi_client.websocket_client_policy import WebsocketClientPolicy  # noqa: E402
 from utils.kai0_rtc import StreamActionBuffer  # noqa: E402
 from utils.other_util import precise_wait  # noqa: E402
@@ -68,6 +77,8 @@ _spec.loader.exec_module(_v1)
 ACTION_DIM = 14
 DEFAULT_PROMPT = _v1.DEFAULT_PROMPT
 DEFAULT_INIT_JOINTS = _v1.DEFAULT_INIT_JOINTS
+# Joint-space home (ARX --joint): arm q → 0, grippers open-ish at 0.
+DEFAULT_HOME_JOINTS14 = np.zeros(ACTION_DIM, dtype=np.float64)
 
 
 class _DelayTracker:
@@ -76,10 +87,12 @@ class _DelayTracker:
     def __init__(self, maxlen: int = 20) -> None:
         self._buf: deque[float] = deque(maxlen=int(maxlen))
         self.pred_delay_steps = 0
+        self.last_rtt_s = 0.0
 
     def update(self, rtt_s: float, control_hz: float) -> int:
         if rtt_s is None or not np.isfinite(rtt_s):
             return self.pred_delay_steps
+        self.last_rtt_s = float(rtt_s)
         self._buf.append(float(rtt_s))
         median_rtt = float(np.median(np.asarray(self._buf, dtype=np.float64)))
         self.pred_delay_steps = int(max(0, round(median_rtt * float(control_hz))))
@@ -105,6 +118,57 @@ def _guard_one(
     return np.asarray(out[0], dtype=np.float64)
 
 
+def _reset_both_to_home(
+    env: Arx5EnvWithImages,
+    *,
+    frequency: float,
+    duration: float,
+    gripper_min: float,
+    gripper_max: float,
+    on_progress=None,
+) -> None:
+    """Slow joint-space ease to home (zeros), not firmware RESET_TO_HOME.
+
+    Firmware home is often too abrupt; reuse the same interpolator path as init.
+    """
+    print(
+        f"[v2] Q: slow joint home over {float(duration):.1f}s "
+        "(not firmware RESET_TO_HOME)...",
+        flush=True,
+    )
+    target = DEFAULT_HOME_JOINTS14.copy()
+    target[6] = float(np.clip(target[6], gripper_min, gripper_max))
+    target[13] = float(np.clip(target[13], gripper_min, gripper_max))
+
+    _v1.move_to_init_joints(
+        env,
+        target,
+        frequency=frequency,
+        duration=float(duration),
+        gripper_min=gripper_min,
+        gripper_max=gripper_max,
+        on_progress=on_progress,
+        progress_label="home",
+    )
+
+
+def _web_keys_from_cmds(cmd_queue: CommandQueue | None) -> list[str]:
+    if cmd_queue is None:
+        return []
+    out: list[str] = []
+    for item in cmd_queue.drain():
+        action = str(item.get("action", "")).lower()
+        if action in {"c", "start"}:
+            out.append("c")
+        elif action in {"s", "stop"}:
+            out.append("s")
+        elif action in {"init", "enter", "return_init"}:
+            out.append("\n")
+        elif action in {"q", "home", "quit"}:
+            out.append("q")
+    return out
+
+
 def run_rtc_v2(
     *,
     env: Arx5EnvWithImages,
@@ -126,6 +190,12 @@ def run_rtc_v2(
     min_smooth_steps: int,
     disable_smoothing: bool,
     dispatch: str = "schedule",
+    skip_server_warmup: bool = False,
+    init_q14: np.ndarray | None = None,
+    init_duration: float = 2.5,
+    home_duration: float = 5.0,
+    web_state: SharedEvalState | None = None,
+    web_cmds: CommandQueue | None = None,
 ) -> None:
     """Official-style: infer thread fills buffer; control pops 1 action / tick."""
     dt = 1.0 / float(frequency)
@@ -219,11 +289,31 @@ def run_rtc_v2(
             else:
                 next_t = time.monotonic()
 
-    # Warmup + seed prev_chunk like official.
+    # Same warmup as v1: plain + RTC guidance compile (unless skipped).
     obs, state = _get_obs_state()
-    warm = policy.infer(_v1.policy_observation(obs, state, prompt))
-    warm_actions = np.asarray(warm["actions"], dtype=np.float32)
-    action_horizon = int(warm_actions.shape[0])
+    if skip_server_warmup:
+        print(
+            "[warmup] skipped (--skip-server-warmup); "
+            "first C may be slow while the server compiles"
+        )
+        warm = policy.infer(_v1.policy_observation(obs, state, prompt))
+        action_horizon = int(np.asarray(warm["actions"]).shape[0])
+    else:
+        # Warm RTC path with the same execute_horizon v2 will use at runtime.
+        warm_exec_h = int(
+            chunk_size if rtc_execute_horizon is None else rtc_execute_horizon
+        )
+        warm_exec_h = max(1, min(warm_exec_h, int(chunk_size)))
+        action_horizon = _v1.warmup_policy_server(
+            env=env,
+            policy=policy,
+            prompt=prompt,
+            rtc=True,
+            rtc_s_min=warm_exec_h,
+            rtc_max_guidance_weight=rtc_max_guidance_weight,
+        )
+        obs, state = _get_obs_state()
+
     if chunk_size != action_horizon:
         print(
             f"[v2] NOTE: --chunk-size={chunk_size} vs model H={action_horizon}; "
@@ -246,6 +336,58 @@ def run_rtc_v2(
         f"min_m={min_smooth_steps} latency_k={latency_k} "
         f"dispatch={'tick/immediate' if use_immediate else 'schedule'}"
     )
+    print(
+        "Controls: C=start, S=stop/hold, "
+        "Enter=return to init (after S), Q=home then quit"
+    )
+    progress_cb = make_progress_cb(web_state)
+
+    def _log(msg: str) -> None:
+        print(msg, flush=True)
+        if web_state is not None:
+            web_state.append_log(msg)
+
+    def _publish_web(obs: dict, *, mode: str) -> None:
+        if web_state is None:
+            return
+        try:
+            joints = _v1.measured_state(env)
+        except Exception:  # noqa: BLE001
+            joints = np.zeros(ACTION_DIM, dtype=np.float64)
+        web_state.update(
+            mode=mode,
+            step=step_count,
+            infer_count=infer_count,
+            buf_len=len(buffer),
+            delay_steps=int(delay_tracker.pred_delay_steps),
+            exec_h=int(exec_h),
+            frequency=float(frequency),
+            inference_rate=float(inference_rate),
+            dispatch="tick" if use_immediate else "schedule",
+            rtt_s=float(delay_tracker.last_rtt_s),
+            joints14=joints,
+            prompt=prompt,
+            jpeg=obs_to_jpeg(obs),
+        )
+
+    def _reseed_prev_from_state() -> None:
+        nonlocal rtc_prev_chunk
+        state_now = _v1.measured_state(env)
+        with prev_chunk_lock:
+            rtc_prev_chunk = np.tile(
+                state_now.astype(np.float32)[None, :], (chunk_size, 1)
+            )
+
+    if web_state is not None:
+        web_state.update(
+            mode="HOLD",
+            frequency=float(frequency),
+            inference_rate=float(inference_rate),
+            dispatch="tick" if use_immediate else "schedule",
+            exec_h=int(exec_h),
+            prompt=prompt,
+        )
+        web_state.append_log("control loop ready")
 
     infer_thread = threading.Thread(
         target=_infer_loop, name="kai0-rtc-v2-infer", daemon=True
@@ -256,35 +398,89 @@ def run_rtc_v2(
     try:
         while True:
             obs = env.get_obs()
-            for key in keys.read():
+            for key in list(keys.read()) + _web_keys_from_cmds(web_cmds):
                 if key == "q":
                     executing = False
                     stop_event.set()
                     buffer.clear()
-                    _hold()
+                    if web_state is not None:
+                        web_state.update(mode="HOME")
+                    try:
+                        _reset_both_to_home(
+                            env,
+                            frequency=frequency,
+                            duration=float(home_duration),
+                            gripper_min=gripper_min,
+                            gripper_max=gripper_max,
+                            on_progress=progress_cb,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        _log(f"[v2] home on Q failed: {exc}; holding instead")
+                        _hold()
+                    if web_state is not None:
+                        web_state.clear_progress()
                     return
                 if key == "s":
                     executing = False
                     buffer.clear()
                     last_commanded = None
                     _hold()
-                    print("Policy stopped; holding measured joints")
+                    _log(
+                        "Policy stopped; holding measured joints "
+                        "(Enter → init, C → resume, Q → home+quit)"
+                    )
+                elif key in {"\n", "\r"}:
+                    if executing:
+                        _log("Ignore Enter while executing; press S first")
+                    elif observe_only:
+                        _log("Ignoring Enter: --observe-only")
+                    elif init_q14 is None:
+                        _log(
+                            "No init joints configured "
+                            "(started with --no-init); cannot return to init"
+                        )
+                    else:
+                        _log("Returning to init joints...")
+                        if web_state is not None:
+                            web_state.update(mode="INIT")
+                        try:
+                            _v1.move_to_init_joints(
+                                env,
+                                init_q14,
+                                frequency=frequency,
+                                duration=float(init_duration),
+                                gripper_min=gripper_min,
+                                gripper_max=gripper_max,
+                                on_progress=progress_cb,
+                            )
+                            last_commanded = None
+                            buffer.clear()
+                            _reseed_prev_from_state()
+                            _log("At init; press C to start, Q to home+quit")
+                        except Exception as exc:  # noqa: BLE001
+                            _log(f"[v2] return-to-init failed: {exc}")
+                            _hold()
+                        if web_state is not None:
+                            web_state.clear_progress()
+                            web_state.update(mode="HOLD")
                 elif key == "c":
                     if observe_only:
-                        print("Ignoring C: --observe-only")
+                        _log("Ignoring C: --observe-only")
                     else:
                         executing = True
                         empty_streak = 0
                         mode = "tick" if use_immediate else "schedule"
-                        print(
+                        _log(
                             f"Policy execution started (RTC v2 async+buffer, "
                             f"dispatch={mode})"
                         )
 
+            mode_now = "EXEC" if executing else "HOLD"
+            _publish_web(obs, mode=mode_now)
             _v1.show_preview(
                 obs,
-                f"V2 RTC {'EXEC' if executing else 'HOLD'}  buf={len(buffer)}  "
-                f"S:stop Q:quit",
+                f"V2 RTC {mode_now}  buf={len(buffer)}  "
+                f"S:stop Enter:init Q:home",
                 enabled=preview_enabled,
             )
 
@@ -380,6 +576,13 @@ def run_rtc_v2(
 @click.option("--init-joints", default=DEFAULT_INIT_JOINTS, show_default=False)
 @click.option("--init-duration", default=2.5, type=float, show_default=True)
 @click.option(
+    "--home-duration",
+    default=5.0,
+    type=float,
+    show_default=True,
+    help="Seconds for slow joint-space return to home on Q (ease-in-out).",
+)
+@click.option(
     "--chunk-size",
     default=50,
     type=int,
@@ -433,6 +636,19 @@ def run_rtc_v2(
     ),
 )
 @click.option(
+    "--skip-server-warmup",
+    is_flag=True,
+    help="Skip plain+RTC throw-away infer (first C may wait on JAX compile).",
+)
+@click.option(
+    "--web/--no-web",
+    default=True,
+    show_default=True,
+    help="Serve live camera/status dashboard (see --web-port).",
+)
+@click.option("--web-host", default="0.0.0.0", show_default=True)
+@click.option("--web-port", default=8090, type=int, show_default=True)
+@click.option(
     "--log-file",
     default=str(DEFAULT_RUN_LOG),
     show_default=True,
@@ -458,6 +674,7 @@ def main(
     no_init: bool,  # noqa: FBT001
     init_joints: str,
     init_duration: float,
+    home_duration: float,
     chunk_size: int,
     rtc_execute_horizon: int | None,
     rtc_max_guidance_weight: float,
@@ -466,6 +683,10 @@ def main(
     min_smooth_steps: int,
     rtc_disable_smoothing: bool,  # noqa: FBT001
     dispatch: str,
+    skip_server_warmup: bool,  # noqa: FBT001
+    web: bool,  # noqa: FBT001
+    web_host: str,
+    web_port: int,
     log_file: str,
 ) -> None:
     if frequency <= 0 or inference_rate <= 0 or max_joint_speed <= 0:
@@ -474,6 +695,8 @@ def main(
         raise click.BadParameter("invalid gripper range")
     if rtc_max_guidance_weight <= 0:
         raise click.BadParameter("--rtc-max-guidance-weight must be positive")
+    if home_duration <= 0 or init_duration <= 0:
+        raise click.BadParameter("--home-duration/--init-duration must be > 0")
 
     log_path = Path(log_file)
     if not log_path.is_absolute():
@@ -512,7 +735,10 @@ def main(
         f"min_m={min_smooth_steps} latency_k={latency_k} "
         f"dispatch={dispatch}"
     )
-    print("Controls: C=start execution, S=stop/hold, Q=quit")
+    print(
+        "Controls: C=start, S=stop/hold, "
+        "Enter=return to init (after S), Q=home then quit"
+    )
     if observe_only:
         print("OBSERVE ONLY: motor commands are permanently disabled")
 
@@ -536,74 +762,118 @@ def main(
     output_path = (ROOT / "data_local" / "kai0_eval").resolve()
     output_path.mkdir(parents=True, exist_ok=True)
 
-    with SharedMemoryManager() as shm_manager, Arx5EnvWithImages(
-        output_dir=output_path,
-        robots_config=_v1.robot_config(
-            robot_ip,
-            ports,
-            robot_obs_latency,
-            reset_to_home_on_start=do_home,
-        ),
-        frequency=frequency,
-        obs_image_resolution=(224, 224),
-        max_obs_buffer_size=120,
-        obs_float32=False,
-        camera_reorder=camera_order,
-        camera_obs_latency=camera_obs_latency,
-        camera_obs_horizon=1,
-        robot_obs_horizon=1,
-        init_joints=False,
-        enable_multi_cam_vis=False,
-        shm_manager=shm_manager,
-        rs_serial=rs_serial,
-        enable_depth=False,
-    ) as env, _v1.TerminalKeys() as keys:
-        print("Waiting for cameras and both ARX5 ZMQ controllers...")
-        while not env.is_ready:
-            time.sleep(0.1)
-        print("Environment ready")
+    web_state: SharedEvalState | None = None
+    web_cmds: CommandQueue | None = None
+    web_server = None
+    if web:
+        web_state = SharedEvalState()
+        web_cmds = CommandQueue()
+        web_server = start_eval_web_ui(
+            web_state, web_cmds, host=web_host, port=int(web_port)
+        )
+        web_state.append_log(
+            f"dashboard http://{web_host}:{web_port}/ (cameras + status)"
+        )
+        print(f"[v2] open dashboard: http://127.0.0.1:{web_port}/")
 
-        if init_q14 is not None:
-            time.sleep(0.5)
-            _v1.move_to_init_joints(
-                env,
-                init_q14,
-                frequency=frequency,
-                duration=float(init_duration),
-                gripper_min=gripper_min,
-                gripper_max=gripper_max,
-            )
-        try:
-            run_rtc_v2(
-                env=env,
-                policy=policy,
-                keys=keys,
-                prompt=prompt,
-                frequency=frequency,
-                inference_rate=inference_rate,
-                max_joint_step=max_joint_step,
-                gripper_min=gripper_min,
-                gripper_max=gripper_max,
-                observe_only=observe_only,
-                preview_enabled=preview_enabled,
-                chunk_size=int(chunk_size),
-                rtc_execute_horizon=rtc_execute_horizon,
-                rtc_max_guidance_weight=rtc_max_guidance_weight,
-                rtc_mask_prefix_delay=rtc_mask_prefix_delay,
-                latency_k=int(latency_k),
-                min_smooth_steps=int(min_smooth_steps),
-                disable_smoothing=rtc_disable_smoothing,
-                dispatch=dispatch,
-            )
-        finally:
-            try:
-                _v1.hold_current(
-                    env, immediate=(str(dispatch).lower() == "tick")
+    try:
+        with SharedMemoryManager() as shm_manager, Arx5EnvWithImages(
+            output_dir=output_path,
+            robots_config=_v1.robot_config(
+                robot_ip,
+                ports,
+                robot_obs_latency,
+                reset_to_home_on_start=do_home,
+            ),
+            frequency=frequency,
+            obs_image_resolution=(224, 224),
+            max_obs_buffer_size=120,
+            obs_float32=False,
+            camera_reorder=camera_order,
+            camera_obs_latency=camera_obs_latency,
+            camera_obs_horizon=1,
+            robot_obs_horizon=1,
+            init_joints=False,
+            enable_multi_cam_vis=False,
+            shm_manager=shm_manager,
+            rs_serial=rs_serial,
+            enable_depth=False,
+        ) as env, _v1.TerminalKeys() as keys:
+            print("Waiting for cameras and both ARX5 ZMQ controllers...")
+            if web_state is not None:
+                web_state.append_log("waiting for cameras / ARX5 controllers...")
+            while not env.is_ready:
+                time.sleep(0.1)
+            print("Environment ready")
+            if web_state is not None:
+                web_state.append_log("environment ready")
+
+            if init_q14 is not None:
+                time.sleep(0.5)
+                if web_state is not None:
+                    web_state.update(mode="INIT")
+                _v1.move_to_init_joints(
+                    env,
+                    init_q14,
+                    frequency=frequency,
+                    duration=float(init_duration),
+                    gripper_min=gripper_min,
+                    gripper_max=gripper_max,
+                    on_progress=make_progress_cb(web_state),
                 )
-            except Exception as exc:  # noqa: BLE001
-                print(f"Final hold warning: {exc}")
-            if preview_enabled:
-                cv2.destroyAllWindows()
+                if web_state is not None:
+                    web_state.clear_progress()
+                    web_state.update(mode="HOLD")
+                    try:
+                        web_state.update(
+                            jpeg=obs_to_jpeg(env.get_obs()),
+                            joints14=_v1.measured_state(env),
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+            try:
+                run_rtc_v2(
+                    env=env,
+                    policy=policy,
+                    keys=keys,
+                    prompt=prompt,
+                    frequency=frequency,
+                    inference_rate=inference_rate,
+                    max_joint_step=max_joint_step,
+                    gripper_min=gripper_min,
+                    gripper_max=gripper_max,
+                    observe_only=observe_only,
+                    preview_enabled=preview_enabled,
+                    chunk_size=int(chunk_size),
+                    rtc_execute_horizon=rtc_execute_horizon,
+                    rtc_max_guidance_weight=rtc_max_guidance_weight,
+                    rtc_mask_prefix_delay=rtc_mask_prefix_delay,
+                    latency_k=int(latency_k),
+                    min_smooth_steps=int(min_smooth_steps),
+                    disable_smoothing=rtc_disable_smoothing,
+                    dispatch=dispatch,
+                    skip_server_warmup=skip_server_warmup,
+                    init_q14=init_q14,
+                    init_duration=float(init_duration),
+                    home_duration=float(home_duration),
+                    web_state=web_state,
+                    web_cmds=web_cmds,
+                )
+            finally:
+                try:
+                    _v1.hold_current(
+                        env, immediate=(str(dispatch).lower() == "tick")
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Final hold warning: {exc}")
+                if preview_enabled:
+                    cv2.destroyAllWindows()
+    finally:
+        if web_server is not None:
+            try:
+                web_server.stop()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 if __name__ == "__main__":

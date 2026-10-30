@@ -1,0 +1,879 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Kai0 Eval · Operator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0c1016;
+      --panel: #151c27;
+      --panel-2: #1a2332;
+      --border: #2a3648;
+      --text: #e7ecf3;
+      --muted: #8394ad;
+      --accent: #3d9cf0;
+      --accent-dim: #1e4d7a;
+      --ok: #3ecf8e;
+      --warn: #f0b429;
+      --danger: #f07178;
+      --ui-font: 16px;
+      --radius: 12px;
+      --shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+    }
+    * { box-sizing: border-box; }
+    html {
+      font-size: var(--ui-font);
+      height: 100%;
+      width: 100%;
+      overflow: hidden;
+    }
+    body {
+      margin: 0;
+      width: 100%;
+      max-width: 100vw;
+      height: 100vh;
+      height: 100dvh;
+      overflow: hidden;
+      font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(900px 480px at 8% -8%, #1a2a3d 0%, transparent 55%),
+        radial-gradient(700px 420px at 100% 0%, #142018 0%, transparent 45%),
+        linear-gradient(180deg, #0e131a 0%, var(--bg) 40%, #0a0d12 100%);
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── header ── */
+    header {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 18px;
+      border-bottom: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 88%, black);
+      backdrop-filter: blur(8px);
+      flex-wrap: wrap;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      border-radius: 9px;
+      background:
+        linear-gradient(145deg, #2b6ea3 0%, #1a3d55 55%, #0f2a20 100%);
+      border: 1px solid #3d6f95;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.12);
+      position: relative;
+      flex: 0 0 auto;
+    }
+    .brand-mark::after {
+      content: "";
+      position: absolute;
+      inset: 8px;
+      border-radius: 4px;
+      border: 1.5px solid rgba(126, 215, 255, 0.55);
+      border-top-color: transparent;
+      border-left-color: transparent;
+      transform: rotate(45deg);
+    }
+    .brand h1 {
+      margin: 0;
+      font-size: clamp(0.92rem, 0.9rem + 0.3vw, 1.08rem);
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+    .brand .sub {
+      color: var(--muted);
+      font-size: 0.78rem;
+      margin-top: 1px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: min(52vw, 28rem);
+    }
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .live-dot {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: #101722;
+      font-size: 0.75rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .live-dot i {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--danger);
+      box-shadow: 0 0 0 0 rgba(240, 113, 120, 0.55);
+    }
+    .live-dot.on i {
+      background: var(--ok);
+      animation: pulse 1.4s ease-in-out infinite;
+      box-shadow: 0 0 0 0 rgba(62, 207, 142, 0.55);
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(62, 207, 142, 0.45); }
+      70% { box-shadow: 0 0 0 8px rgba(62, 207, 142, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(62, 207, 142, 0); }
+    }
+    .font-btns {
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 2px;
+      background: #101722;
+    }
+    .font-btns button {
+      padding: 4px 9px;
+      min-width: 2rem;
+      border: none;
+      background: transparent;
+      color: var(--text);
+      cursor: pointer;
+      border-radius: 6px;
+      font-size: 0.85rem;
+    }
+    .font-btns button:hover { background: #243044; }
+    .font-btns #fontLabel {
+      color: var(--muted);
+      font-size: 0.75rem;
+      font-variant-numeric: tabular-nums;
+      padding: 0 6px;
+      min-width: 2.6rem;
+      text-align: center;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 14px;
+      border-radius: 8px;
+      font-size: 0.92rem;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      background: #2a3140;
+      color: #c5d0e0;
+      border: 2px solid #4a5568;
+      line-height: 1.1;
+    }
+    .badge.EXEC {
+      background: #123528;
+      color: #5dffb0;
+      border-color: var(--ok);
+      box-shadow: 0 0 0 1px #3ecf8e55;
+      animation: modePulse 1.2s ease-in-out infinite;
+    }
+    .badge.HOLD {
+      background: #3a2e10;
+      color: #ffd666;
+      border-color: var(--warn);
+    }
+    .badge.INIT, .badge.HOME {
+      background: #1a3a4a;
+      color: #7ed7ff;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px #3d9cf066;
+      animation: modePulse 1s ease-in-out infinite;
+    }
+    .badge.IDLE {
+      background: #2a3140;
+      color: #c5d0e0;
+    }
+    @keyframes modePulse {
+      0%, 100% { filter: brightness(1); }
+      50% { filter: brightness(1.12); }
+    }
+
+    /* ── layout ── */
+    .wrap {
+      flex: 1 1 auto;
+      min-height: 0;
+      min-width: 0;
+      width: 100%;
+      padding: 10px 12px 12px;
+      display: grid;
+      /* Camera column capped — telemetry/side gets more room */
+      grid-template-columns: minmax(0, min(720px, 52vw)) minmax(0, 1fr);
+      gap: 10px;
+      align-content: stretch;
+      justify-content: stretch;
+      overflow: hidden;
+    }
+    @media (max-width: 1100px) {
+      .wrap {
+        grid-template-columns: minmax(0, min(560px, 48vw)) minmax(0, 1fr);
+      }
+    }
+    @media (max-width: 900px) {
+      .wrap {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto minmax(0, 1fr);
+        overflow: hidden;
+      }
+      .side {
+        overflow: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+    }
+
+    .panel {
+      background: linear-gradient(180deg, var(--panel-2) 0%, var(--panel) 100%);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      min-width: 0;
+      max-width: 100%;
+    }
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 10px 14px 0;
+    }
+    .panel h2 {
+      margin: 0;
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .panel-body { padding: 10px 14px 14px; }
+
+    .stage {
+      display: flex;
+      flex-direction: column;
+      align-self: start;
+      width: 100%;
+      overflow: hidden;
+    }
+    .video-shell {
+      position: relative;
+      flex: 0 0 auto;
+      margin: 8px 12px 10px;
+      border-radius: 10px;
+      overflow: hidden;
+      background: #05070a;
+      border: 1px solid #1c2533;
+      width: 100%;
+      /* Explicit height — aspect-ratio+max-height was collapsing to 0 in grid */
+      height: clamp(140px, 20vh, 200px);
+    }
+    .video-shell img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      object-position: center;
+      display: block;
+      background: #000;
+    }
+    .hud {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 10px 12px;
+      background:
+        linear-gradient(180deg, rgba(0,0,0,0.45) 0%, transparent 22%),
+        linear-gradient(0deg, rgba(0,0,0,0.4) 0%, transparent 18%);
+    }
+    .hud-top, .hud-bottom {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .hud-chip {
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: 0.72rem;
+      padding: 4px 8px;
+      border-radius: 6px;
+      background: rgba(12, 16, 22, 0.72);
+      border: 1px solid rgba(255,255,255,0.08);
+      color: #d7e2f0;
+      backdrop-filter: blur(4px);
+      max-width: min(48%, 22rem);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .cam-labels {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .cam-labels span {
+      font-size: 0.68rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #9db0c9;
+      background: rgba(12,16,22,0.65);
+      border: 1px solid rgba(255,255,255,0.06);
+      padding: 3px 7px;
+      border-radius: 999px;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      padding: 0 12px 12px;
+      flex: 0 0 auto;
+    }
+    @media (max-width: 640px) {
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    .metric {
+      background: #101722;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: clamp(8px, 0.7em, 12px) clamp(8px, 0.75em, 12px);
+      min-width: 0;
+    }
+    .metric .label {
+      font-size: 0.68rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .metric .value {
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: clamp(0.95rem, 1.05rem + 0.2vw, 1.2rem);
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.02em;
+      word-break: break-word;
+    }
+    .metric .unit {
+      font-size: 0.72rem;
+      color: var(--muted);
+      font-weight: 500;
+      margin-left: 3px;
+    }
+
+    .side {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+      overscroll-behavior: contain;
+    }
+    .side .panel {
+      flex: 0 1 auto;
+      min-height: 0;
+    }
+    .side .panel.ctrl { flex: 0 0 auto; }
+    .side .panel.tele {
+      flex: 0 1 auto;
+      max-height: 28%;
+      display: flex;
+      flex-direction: column;
+    }
+    .side .panel.tele .panel-body {
+      overflow: auto;
+      min-height: 0;
+    }
+    .side .panel.joints {
+      flex: 0 1 auto;
+      max-height: 34%;
+      display: flex;
+      flex-direction: column;
+    }
+    .side .panel.joints .panel-body {
+      overflow: auto;
+      min-height: 0;
+      padding-top: 6px;
+    }
+    .side .panel.grow {
+      flex: 1 1 0;
+      display: flex;
+      flex-direction: column;
+      min-height: 96px;
+    }
+
+    .progress-card {
+      padding: 12px 14px 14px;
+    }
+    .progress-track {
+      height: 12px;
+      border-radius: 999px;
+      background: #0b1018;
+      border: 1px solid var(--border);
+      overflow: hidden;
+      position: relative;
+    }
+    .progress-track > span {
+      display: block;
+      height: 100%;
+      width: 0%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #1f6a9e, #3d9cf0 55%, #7ed7ff);
+      box-shadow: 0 0 16px rgba(61, 156, 240, 0.35);
+      transition: width 0.12s linear;
+    }
+    .progress-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 8px;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    .progress-meta strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+    .msg-line {
+      margin-top: 10px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: #101722;
+      border: 1px solid var(--border);
+      color: #c8d4e6;
+      font-size: 0.82rem;
+      line-height: 1.35;
+      min-height: 2.4em;
+      max-height: 4.2em;
+      overflow: auto;
+      word-break: break-word;
+    }
+
+    .kv {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+      gap: 7px 10px;
+      font-size: 0.86rem;
+      font-variant-numeric: tabular-nums;
+      min-width: 0;
+    }
+    .kv .k { color: var(--muted); min-width: 0; }
+    .kv .v {
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      text-align: right;
+      min-width: 0;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .joint-block { margin-bottom: 12px; }
+    .joint-block:last-child { margin-bottom: 0; }
+    .joint-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 6px;
+      font-size: 0.78rem;
+    }
+    .joint-title .arm {
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      color: #d7e2f0;
+    }
+    .joint-title .grip {
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      color: var(--muted);
+      font-size: 0.72rem;
+    }
+    .joint-rows { display: flex; flex-direction: column; gap: 5px; }
+    .jrow {
+      display: grid;
+      grid-template-columns: 28px 1fr 52px;
+      gap: 8px;
+      align-items: center;
+      font-size: 0.72rem;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+    }
+    .jrow .name { color: var(--muted); }
+    .jrow .val { text-align: right; color: #c5d0e0; font-variant-numeric: tabular-nums; }
+    .jbar {
+      height: 7px;
+      border-radius: 999px;
+      background: #0b1018;
+      border: 1px solid #243044;
+      overflow: hidden;
+    }
+    .jbar > i {
+      display: block;
+      height: 100%;
+      width: 50%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #2a6b4a, #3ecf8e);
+      transform-origin: left center;
+    }
+    .jbar.right > i {
+      background: linear-gradient(90deg, #1e4d7a, #3d9cf0);
+    }
+
+    .btns {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      padding: 0 12px 12px;
+      width: 100%;
+    }
+    button.cmd {
+      appearance: none;
+      width: 100%;
+      min-width: 0;
+      min-height: 2.5rem;
+      border: 1px solid var(--border);
+      background: #121a24;
+      color: var(--text);
+      border-radius: 9px;
+      padding: 0.55em 0.6em;
+      font: inherit;
+      font-weight: 600;
+      font-size: clamp(0.74rem, 0.8rem, 0.9rem);
+      line-height: 1.2;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.35em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      transition: border-color 0.12s, background 0.12s, transform 0.08s;
+    }
+    button.cmd:hover { border-color: var(--accent); background: #182232; }
+    button.cmd:active { transform: translateY(1px); }
+    button.cmd.ok { background: #143328; border-color: #2f8f66; }
+    button.cmd.primary { background: var(--accent-dim); border-color: var(--accent); }
+    button.cmd.danger { background: #3a1c22; border-color: var(--danger); }
+    button.cmd kbd {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+      min-width: 1.4em;
+      padding: 0.1em 0.4em;
+      border-radius: 4px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(0,0,0,0.25);
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: 0.78em;
+      font-weight: 600;
+      color: #b8c7dc;
+    }
+
+    .logs {
+      flex: 1 1 auto;
+      min-height: 0;
+      margin: 0 12px 12px;
+      overflow: auto;
+      overscroll-behavior: contain;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: 0.72rem;
+      line-height: 1.45;
+      color: #b7c5d8;
+      background:
+        linear-gradient(180deg, #0a0f16 0%, #0d131c 100%);
+      border-radius: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+    }
+    .logs div {
+      margin: 0 0 5px;
+      padding-bottom: 5px;
+      border-bottom: 1px dashed #1c2736;
+    }
+    .logs div:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+    .hint-bar {
+      padding: 0 14px 12px;
+      color: var(--muted);
+      font-size: 0.75rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true"></div>
+      <div>
+        <h1>Kai0 Eval · Operator</h1>
+        <div class="sub" id="controls">C start · S stop · Enter init · Q home</div>
+      </div>
+    </div>
+    <div class="header-right">
+      <span class="live-dot" id="liveDot"><i></i><span id="clock">--:--:--</span></span>
+      <span class="badge IDLE" id="modeBadge">IDLE</span>
+      <div class="font-btns" title="字号">
+        <button type="button" id="fontDown" aria-label="减小字体">A−</button>
+        <span id="fontLabel">16</span>
+        <button type="button" id="fontUp" aria-label="增大字体">A+</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <section class="panel stage">
+      <div class="panel-head">
+        <h2>Live cameras</h2>
+        <span class="hud-chip" id="dispatchChip">dispatch —</span>
+      </div>
+      <div class="video-shell">
+        <img id="video" alt="live cameras" src="/api/video" />
+        <div class="hud">
+          <div class="hud-top">
+            <div class="cam-labels">
+              <span>L wrist</span><span>center</span><span>R wrist</span>
+            </div>
+            <span class="hud-chip" id="hudMode">HOLD</span>
+          </div>
+          <div class="hud-bottom">
+            <span class="hud-chip" id="hudPrompt">prompt —</span>
+            <span class="hud-chip" id="hudRtt">RTT —</span>
+          </div>
+        </div>
+      </div>
+      <div class="metrics">
+        <div class="metric"><div class="label">Step</div><div class="value" id="mStep">0</div></div>
+        <div class="metric"><div class="label">Buffer</div><div class="value" id="mBuf">0</div></div>
+        <div class="metric"><div class="label">Delay</div><div class="value" id="mDelay">0<span class="unit">st</span></div></div>
+        <div class="metric"><div class="label">Infers</div><div class="value" id="mInfer">0</div></div>
+      </div>
+    </section>
+
+    <aside class="side">
+      <section class="panel ctrl">
+        <div class="panel-head"><h2>Motion / progress</h2></div>
+        <div class="progress-card">
+          <div class="progress-track"><span id="progBar"></span></div>
+          <div class="progress-meta">
+            <span id="progLabel">idle</span>
+            <strong id="progPct">—</strong>
+          </div>
+          <div class="msg-line" id="message">Waiting for telemetry…</div>
+        </div>
+        <div class="btns">
+          <button type="button" class="cmd ok" data-action="start"><kbd>C</kbd>Start</button>
+          <button type="button" class="cmd" data-action="stop"><kbd>S</kbd>Stop</button>
+          <button type="button" class="cmd primary" data-action="init"><kbd>↵</kbd>Init</button>
+          <button type="button" class="cmd danger" data-action="home"><kbd>Q</kbd>Home</button>
+        </div>
+        <div class="hint-bar" id="rateHint">ctrl — Hz · infer — Hz</div>
+      </section>
+
+      <section class="panel tele">
+        <div class="panel-head"><h2>Telemetry</h2></div>
+        <div class="panel-body">
+          <div class="kv" id="kv"></div>
+        </div>
+      </section>
+
+      <section class="panel joints">
+        <div class="panel-head"><h2>Joints</h2></div>
+        <div class="panel-body" id="joints"></div>
+      </section>
+
+      <section class="panel grow">
+        <div class="panel-head"><h2>Logs</h2></div>
+        <div class="logs" id="logs"></div>
+      </section>
+    </aside>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const modeBadge = $("modeBadge");
+    const liveDot = $("liveDot");
+    const clockEl = $("clock");
+    const progBar = $("progBar");
+    const progLabel = $("progLabel");
+    const progPct = $("progPct");
+    const logsEl = $("logs");
+    const jointsEl = $("joints");
+    const kvEl = $("kv");
+    const messageEl = $("message");
+    const controlsEl = $("controls");
+    const fontLabel = $("fontLabel");
+
+    let lastOk = 0;
+    let uiFont = 16;
+
+    function fmt(n, d = 3) {
+      if (typeof n !== "number" || !Number.isFinite(n)) return "—";
+      return n.toFixed(d);
+    }
+
+    function setFont(px) {
+      uiFont = Math.max(13, Math.min(22, px));
+      document.documentElement.style.setProperty("--ui-font", uiFont + "px");
+      fontLabel.textContent = String(uiFont);
+      try { localStorage.setItem("kai0_eval_font", String(uiFont)); } catch (_) {}
+    }
+    try {
+      const saved = Number(localStorage.getItem("kai0_eval_font"));
+      if (Number.isFinite(saved)) setFont(saved);
+    } catch (_) {}
+    $("fontDown").onclick = () => setFont(uiFont - 1);
+    $("fontUp").onclick = () => setFont(uiFont + 1);
+
+    function setMode(mode) {
+      const m = String(mode || "IDLE").toUpperCase();
+      modeBadge.textContent = m;
+      modeBadge.className = "badge " + m;
+      $("hudMode").textContent = m;
+    }
+
+    function renderKv(s) {
+      const rows = [
+        ["exec_h", s.exec_h],
+        ["dispatch", s.dispatch || "—"],
+        ["ctrl Hz", fmt(s.frequency, 1)],
+        ["infer Hz", fmt(s.inference_rate, 1)],
+        ["RTT", fmt(s.rtt_s, 3) + " s"],
+        ["prompt", s.prompt || "—"],
+      ];
+      kvEl.innerHTML = rows.map(([k, v]) =>
+        `<span class="k">${k}</span><span class="v" title="${String(v).replace(/"/g, "&quot;")}">${v}</span>`
+      ).join("");
+    }
+
+    function jointBar(val, isRight) {
+      // map roughly [-π, π] → 0..100 for arm joints visual
+      const t = Math.max(0, Math.min(1, (Number(val) + Math.PI) / (2 * Math.PI)));
+      const pct = Math.round(t * 100);
+      return `<div class="jbar${isRight ? " right" : ""}"><i style="width:${pct}%"></i></div>`;
+    }
+
+    function renderJoints(j) {
+      if (!Array.isArray(j) || j.length < 14) {
+        jointsEl.innerHTML = `<div class="msg-line">No joint telemetry</div>`;
+        return;
+      }
+      const arms = [
+        { name: "LEFT", vals: j.slice(0, 6), grip: j[6], right: false },
+        { name: "RIGHT", vals: j.slice(7, 13), grip: j[13], right: true },
+      ];
+      jointsEl.innerHTML = arms.map(arm => `
+        <div class="joint-block">
+          <div class="joint-title">
+            <span class="arm">${arm.name}</span>
+            <span class="grip">grip ${fmt(arm.grip, 3)}</span>
+          </div>
+          <div class="joint-rows">
+            ${arm.vals.map((v, i) => `
+              <div class="jrow">
+                <span class="name">j${i + 1}</span>
+                ${jointBar(v, arm.right)}
+                <span class="val">${fmt(v, 3)}</span>
+              </div>
+            `).join("")}
+          </div>
+        </div>
+      `).join("");
+    }
+
+    function renderLogs(logs) {
+      const stick = logsEl.scrollTop + logsEl.clientHeight >= logsEl.scrollHeight - 28;
+      logsEl.innerHTML = (logs || []).map(line => {
+        const safe = String(line).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+        return `<div>${safe}</div>`;
+      }).join("");
+      if (stick) logsEl.scrollTop = logsEl.scrollHeight;
+    }
+
+    function renderProgress(s) {
+      const pct = Number(s.progress_pct);
+      if (!Number.isFinite(pct) || pct < 0) {
+        progBar.style.width = "0%";
+        progLabel.textContent = "idle";
+        progPct.textContent = "—";
+        return;
+      }
+      progBar.style.width = Math.min(100, Math.max(0, pct)) + "%";
+      progLabel.textContent = `${s.progress_label || "move"} · ${s.progress_detail || ""}`.trim();
+      progPct.textContent = pct + "%";
+    }
+
+    async function sendCmd(action) {
+      try {
+        await fetch("/api/cmd", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action }),
+        });
+      } catch (_) {}
+    }
+    document.querySelectorAll("button.cmd").forEach(btn => {
+      btn.addEventListener("click", () => sendCmd(btn.dataset.action));
+    });
+
+    function tickClock() {
+      const d = new Date();
+      clockEl.textContent = d.toLocaleTimeString("en-GB", { hour12: false });
+      liveDot.classList.toggle("on", Date.now() - lastOk < 1500);
+    }
+    setInterval(tickClock, 250);
+
+    async function tick() {
+      try {
+        const res = await fetch("/api/status", { cache: "no-store" });
+        if (!res.ok) return;
+        const s = await res.json();
+        lastOk = Date.now();
+        setMode(s.mode);
+        renderKv(s);
+        renderJoints(s.joints14);
+        renderLogs(s.logs);
+        renderProgress(s);
+        messageEl.textContent = s.message || "—";
+        $("mStep").textContent = s.step ?? 0;
+        $("mBuf").textContent = s.buf_len ?? 0;
+        $("mDelay").innerHTML = `${s.delay_steps ?? 0}<span class="unit">st</span>`;
+        $("mInfer").textContent = s.infer_count ?? 0;
+        $("dispatchChip").textContent = `dispatch ${s.dispatch || "—"}`;
+        $("hudRtt").textContent = `RTT ${fmt(s.rtt_s, 3)}s`;
+        $("hudPrompt").textContent = (s.prompt || "prompt —").slice(0, 48);
+        $("rateHint").textContent =
+          `ctrl ${fmt(s.frequency, 1)} Hz · infer ${fmt(s.inference_rate, 1)} Hz · exec_h ${s.exec_h ?? "—"}`;
+        if (s.controls) controlsEl.textContent = s.controls;
+      } catch (_) {}
+    }
+
+    setInterval(tick, 200);
+    tick();
+    tickClock();
+  </script>
+</body>
+</html>
