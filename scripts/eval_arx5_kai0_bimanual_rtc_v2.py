@@ -15,13 +15,16 @@ Still uses this repo's ZMQ/camera stack (not ROS2).
 Example (policy server must be started with ``--rtc``)::
 
 # 效果不错，很平滑。
+conda activate umi-arx 
 python scripts/eval_arx5_kai0_bimanual_rtc_v2.py \
   --policy-ip 127.0.0.1 --policy-port 8000 \
   --robot-ports 8765,8766 --camera-reorder 0,1 \
   --frequency 20 --inference-rate 4 \
   --rtc-max-guidance-weight 0.5 \
   --min-smooth-steps 10 --latency-k 8 \
-  --dispatch tick
+  --dispatch tick \
+  --gripper-close-threshold 0.03 \
+  --no-gripper-tighten
 
 
 ``--dispatch schedule`` (default): timed ZMQ waypoints via interpolator.
@@ -99,6 +102,32 @@ class _DelayTracker:
         return self.pred_delay_steps
 
 
+def _tighten_grippers(
+    action: np.ndarray,
+    *,
+    gripper_min: float,
+    gripper_max: float,
+    close_threshold: float,
+    grasp_width: float,
+    enabled: bool,
+) -> np.ndarray:
+    """Kai0/ZMQ: larger = more open. Soft policy closes → snap to grasp_width."""
+    out = np.asarray(action, dtype=np.float64).copy()
+    if not enabled:
+        out[6] = float(np.clip(out[6], gripper_min, gripper_max))
+        out[13] = float(np.clip(out[13], gripper_min, gripper_max))
+        return out
+    thr = float(close_threshold)
+    target = float(grasp_width)
+    exec_min = max(0.0, min(float(gripper_min), target))
+    for idx in (6, 13):
+        g = float(out[idx])
+        if g < thr:
+            g = target
+        out[idx] = float(np.clip(g, exec_min, gripper_max))
+    return out
+
+
 def _guard_one(
     action: np.ndarray,
     current: np.ndarray,
@@ -106,16 +135,33 @@ def _guard_one(
     max_joint_step: float,
     gripper_min: float,
     gripper_max: float,
+    gripper_close_threshold: float = 0.04,
+    gripper_grasp_width: float = 0.0,
+    gripper_tighten: bool = True,
 ) -> np.ndarray:
+    # Allow grasp_width below gripper_min during the joint-rate guard clip.
+    clip_lo = (
+        min(float(gripper_min), float(gripper_grasp_width))
+        if gripper_tighten
+        else float(gripper_min)
+    )
+    clip_lo = max(0.0, clip_lo)
     out = _v1.guarded_chunk(
         np.asarray(action, dtype=np.float64).reshape(1, -1),
         current,
         count=1,
         max_joint_step=max_joint_step,
-        gripper_min=gripper_min,
+        gripper_min=clip_lo,
         gripper_max=gripper_max,
     )
-    return np.asarray(out[0], dtype=np.float64)
+    return _tighten_grippers(
+        np.asarray(out[0], dtype=np.float64),
+        gripper_min=gripper_min,
+        gripper_max=gripper_max,
+        close_threshold=gripper_close_threshold,
+        grasp_width=gripper_grasp_width,
+        enabled=gripper_tighten,
+    )
 
 
 def _reset_both_to_home(
@@ -189,6 +235,9 @@ def run_rtc_v2(
     latency_k: int,
     min_smooth_steps: int,
     disable_smoothing: bool,
+    gripper_close_threshold: float = 0.04,
+    gripper_grasp_width: float = 0.0,
+    gripper_tighten: bool = True,
     dispatch: str = "schedule",
     skip_server_warmup: bool = False,
     init_q14: np.ndarray | None = None,
@@ -510,6 +559,9 @@ def run_rtc_v2(
                 max_joint_step=max_joint_step,
                 gripper_min=gripper_min,
                 gripper_max=gripper_max,
+                gripper_close_threshold=gripper_close_threshold,
+                gripper_grasp_width=gripper_grasp_width,
+                gripper_tighten=gripper_tighten,
             )
             if use_immediate:
                 # Blend over one control period on the ~200 Hz interpolator.
@@ -567,6 +619,26 @@ def run_rtc_v2(
 @click.option("--max-joint-speed", default=1.5, type=float, show_default=True)
 @click.option("--gripper-min", default=0.0, type=float, show_default=True)
 @click.option("--gripper-max", default=0.088, type=float, show_default=True)
+@click.option(
+    "--gripper-tighten/--no-gripper-tighten",
+    default=True,
+    show_default=True,
+    help="When policy width < threshold, force grasp_width (tighter close).",
+)
+@click.option(
+    "--gripper-close-threshold",
+    default=0.04,
+    type=float,
+    show_default=True,
+    help="ZMQ open-width below this is treated as grasp → snap to grasp_width.",
+)
+@click.option(
+    "--gripper-grasp-width",
+    default=0.0,
+    type=float,
+    show_default=True,
+    help="Forced open-width (m) while grasping; 0 = fully closed.",
+)
 @click.option("--camera-obs-latency", default=0.125, type=float, show_default=True)
 @click.option("--robot-obs-latency", default=0.0001, type=float, show_default=True)
 @click.option("--server-timeout", default=30.0, type=float, show_default=True)
@@ -666,6 +738,9 @@ def main(
     max_joint_speed: float,
     gripper_min: float,
     gripper_max: float,
+    gripper_tighten: bool,  # noqa: FBT001
+    gripper_close_threshold: float,
+    gripper_grasp_width: float,
     camera_obs_latency: float,
     robot_obs_latency: float,
     server_timeout: float,
@@ -693,6 +768,12 @@ def main(
         raise click.BadParameter("frequency/inference-rate/max-joint-speed must be > 0")
     if not 0 <= gripper_min < gripper_max:
         raise click.BadParameter("invalid gripper range")
+    if gripper_close_threshold <= 0:
+        raise click.BadParameter("--gripper-close-threshold must be > 0")
+    if gripper_grasp_width < 0:
+        raise click.BadParameter("--gripper-grasp-width must be >= 0")
+    if gripper_grasp_width >= gripper_max:
+        raise click.BadParameter("--gripper-grasp-width must be < --gripper-max")
     if rtc_max_guidance_weight <= 0:
         raise click.BadParameter("--rtc-max-guidance-weight must be positive")
     if home_duration <= 0 or init_duration <= 0:
@@ -728,12 +809,17 @@ def main(
         if rtc_execute_horizon is None
         else min(int(rtc_execute_horizon), int(chunk_size))
     )
+    grip_note = (
+        f"tighten<{gripper_close_threshold:.3f}→{gripper_grasp_width:.4f}"
+        if gripper_tighten
+        else "tighten=off"
+    )
     print(
         f"[v2] enabled: ctrl={frequency}Hz infer={inference_rate}Hz "
         f"exec_h≈{soft_hint} max_gw={rtc_max_guidance_weight} "
         f"smooth={'raw' if rtc_disable_smoothing else 'temporal'} "
         f"min_m={min_smooth_steps} latency_k={latency_k} "
-        f"dispatch={dispatch}"
+        f"dispatch={dispatch} grip={grip_note}"
     )
     print(
         "Controls: C=start, S=stop/hold, "
@@ -842,6 +928,9 @@ def main(
                     max_joint_step=max_joint_step,
                     gripper_min=gripper_min,
                     gripper_max=gripper_max,
+                    gripper_close_threshold=float(gripper_close_threshold),
+                    gripper_grasp_width=float(gripper_grasp_width),
+                    gripper_tighten=bool(gripper_tighten),
                     observe_only=observe_only,
                     preview_enabled=preview_enabled,
                     chunk_size=int(chunk_size),
