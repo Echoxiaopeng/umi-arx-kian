@@ -75,6 +75,13 @@ D435 画面预处理（训练 / 推理必须一致）
 保存后（夹爪手势或键盘 S）: 缓动回 init，再重新进入拖拽模式。
 左右臂共用同一组 --init_delta / --init_gripper_delta（各自相对 home）。
 
+数据管理（网页 VIEW / --viewer_only / hub「数据管理」）:
+  回看 scrub、删除 episode；可用「标起点 / 标终点 / 应用裁剪」自由裁切
+  已保存 episode（改写 zarr + videos + 可选 intervention sidecar）。
+  快捷键: [ = 标起点, ] = 标终点, T = 应用裁剪。
+  若目录含 intervention/（DAgger），可一键拆出人工示教（去首尾静止）与纯模型
+  子集到旁边的 {name}_human / {name}_policy（也可用 scripts/extract_dagger_split.py）。
+
 输出:
   action (T, 14)；robot{0,1}_*；camera{0,1,2}_rgb；camera1_depth（uint16 mm）
   videos/{ep}/0.mp4, 1.mp4(D435 RGB 已调色), 2.mp4
@@ -1089,6 +1096,398 @@ def schedule_delete_episode(
             _DELETE_LOCK.release()
 
     threading.Thread(target=_worker, name=f"delete-ep{eid}", daemon=True).start()
+    return True
+
+
+def _map_steps_to_video_frames(
+    start_step: int, end_step: int, n_steps: int, n_frames: int
+) -> tuple[int, int]:
+    """把 zarr 半开区间映射到视频帧半开区间。"""
+    n_steps = max(int(n_steps), 1)
+    n_frames = max(int(n_frames), 0)
+    if n_frames <= 0:
+        return 0, 0
+    if n_frames != n_steps and n_steps > 1 and n_frames > 1:
+        v0 = int(round(int(start_step) * (n_frames - 1) / (n_steps - 1)))
+        v1 = int(round((int(end_step) - 1) * (n_frames - 1) / (n_steps - 1))) + 1
+    else:
+        v0 = int(start_step)
+        v1 = int(end_step)
+    v0 = int(np.clip(v0, 0, n_frames))
+    v1 = int(np.clip(v1, v0 + 1 if v0 < n_frames else v0, n_frames))
+    return v0, v1
+
+
+def _trim_one_mp4_ffmpeg(
+    mp4: Path, v0: int, v1: int, fps: float
+) -> bool:
+    """优先用 ffmpeg 按帧裁剪；失败返回 False。"""
+    import shutil as _shutil
+    import subprocess
+
+    if _shutil.which("ffmpeg") is None:
+        return False
+    tmp = mp4.with_suffix(".trim_tmp.mp4")
+    if tmp.exists():
+        tmp.unlink()
+    # trim 用帧号；再编码为浏览器友好的 yuv420p h264
+    vf = f"trim=start_frame={v0}:end_frame={v1},setpts=PTS-STARTPTS"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(mp4),
+        "-vf",
+        vf,
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        "18",
+        str(tmp),
+    ]
+    try:
+        subprocess.run(cmd, check=True, timeout=600)
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"[trim] ffmpeg failed for {mp4.name}: {exc}")
+        if tmp.exists():
+            tmp.unlink()
+        return False
+    if tmp.exists() and tmp.stat().st_size > 0:
+        tmp.replace(mp4)
+        return True
+    if tmp.exists():
+        tmp.unlink()
+    return False
+
+
+def _trim_one_mp4_cv2(mp4: Path, v0: int, v1: int, fps: float) -> bool:
+    cap = cv2.VideoCapture(str(mp4))
+    if not cap.isOpened():
+        print(f"[trim] skip unreadable video {mp4}")
+        return False
+    try:
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        if width <= 0 or height <= 0:
+            print(f"[trim] skip empty video {mp4}")
+            return False
+        if fps <= 1e-3:
+            fps = 30.0
+        tmp = mp4.with_suffix(".trim_tmp.mp4")
+        if tmp.exists():
+            tmp.unlink()
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(tmp), fourcc, float(fps), (width, height))
+        if not writer.isOpened():
+            print(f"[trim] VideoWriter failed for {mp4}")
+            return False
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, v0)
+            for _fi in range(v0, v1):
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                writer.write(frame)
+        finally:
+            writer.release()
+        if tmp.exists() and tmp.stat().st_size > 0:
+            tmp.replace(mp4)
+            return True
+        if tmp.exists():
+            tmp.unlink()
+            print(f"[trim] wrote empty video, kept original: {mp4}")
+        return False
+    finally:
+        cap.release()
+
+
+def _trim_episode_videos(
+    video_dir: Path,
+    *,
+    start_step: int,
+    end_step: int,
+    n_steps: int,
+    progress_cb=None,
+) -> None:
+    """按 zarr 步数比例裁剪 videos/{ep}/*.mp4，原地替换。"""
+    if not video_dir.is_dir():
+        return
+    mp4s = sorted(video_dir.glob("*.mp4"))
+    if not mp4s:
+        return
+    n_steps = max(int(n_steps), 1)
+    start_step = int(start_step)
+    end_step = int(end_step)
+
+    for mi, mp4 in enumerate(mp4s):
+        if progress_cb is not None:
+            progress_cb(
+                {
+                    "phase": "video",
+                    "key": mp4.name,
+                    "key_i": mi + 1,
+                    "n_keys": len(mp4s),
+                    "frac": float(mi) / float(len(mp4s)),
+                    "message": f"裁剪视频 {mp4.name} ({mi + 1}/{len(mp4s)})…",
+                }
+            )
+        cap = cv2.VideoCapture(str(mp4))
+        if not cap.isOpened():
+            print(f"[trim] skip unreadable video {mp4}")
+            continue
+        try:
+            n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        finally:
+            cap.release()
+        if n_frames <= 0:
+            print(f"[trim] skip empty video {mp4}")
+            continue
+        v0, v1 = _map_steps_to_video_frames(start_step, end_step, n_steps, n_frames)
+        if v1 <= v0:
+            print(f"[trim] empty frame range for {mp4.name}; skip")
+            continue
+        if not _trim_one_mp4_ffmpeg(mp4, v0, v1, fps):
+            _trim_one_mp4_cv2(mp4, v0, v1, fps)
+
+    if progress_cb is not None:
+        progress_cb(
+            {
+                "phase": "video",
+                "key": "(done)",
+                "key_i": len(mp4s),
+                "n_keys": len(mp4s),
+                "frac": 1.0,
+                "message": f"视频裁剪完成（{len(mp4s)} 个）",
+            }
+        )
+
+
+def _trim_intervention_sidecar(
+    output_dir: Path, episode_id: int, start: int, end: int
+) -> None:
+    path = Path(output_dir) / "intervention" / f"episode_{episode_id}.npy"
+    if not path.exists():
+        return
+    lab = np.load(path)
+    if lab.ndim != 1:
+        print(f"[trim] unexpected intervention shape {lab.shape} @ {path}")
+        return
+    if end > len(lab) or start < 0 or start >= end:
+        print(
+            f"[trim] intervention len={len(lab)} incompatible with "
+            f"[{start},{end}); skip sidecar"
+        )
+        return
+    np.save(path, np.asarray(lab[start:end], dtype=lab.dtype))
+    print(f"[trim] intervention sidecar ep{episode_id}: {len(lab)} -> {end - start}")
+
+
+def trim_saved_episode(
+    env,
+    episode_id: int,
+    start: int,
+    end: int,
+    progress_cb=None,
+) -> bool:
+    """裁剪已保存 episode：保留本地半开区间 [start, end)。同步改 zarr / 视频 / intervention。"""
+    n_episodes = env.replay_buffer.n_episodes
+    if n_episodes <= 0:
+        print("No saved episode to trim.")
+        return False
+    if episode_id < 0 or episode_id >= n_episodes:
+        print(
+            f"Episode {episode_id} does not exist "
+            f"(valid: 0..{n_episodes - 1})."
+        )
+        return False
+
+    sl = env.replay_buffer.get_episode_slice(episode_id)
+    n_steps = int(sl.stop - sl.start)
+    start = int(start)
+    end = int(end)
+    if start < 0 or end > n_steps or start >= end:
+        print(f"Invalid trim range [{start}, {end}) for ep{episode_id} T={n_steps}")
+        return False
+    if start == 0 and end == n_steps:
+        print(f"Episode {episode_id} already covers [{start}, {end}); nothing to do.")
+        return True
+
+    def _cb(info):
+        if progress_cb is not None and isinstance(info, dict):
+            progress_cb(info)
+
+    keep = end - start
+    print(
+        f"Trimming saved episode {episode_id}: keep [{start}, {end}) "
+        f"({keep}/{n_steps} steps)…"
+    )
+    env.replay_buffer.trim_episode(episode_id, start, end, progress_cb=_cb)
+
+    out_dir = Path(getattr(env, "output_dir", env.video_dir.parent))
+    _trim_intervention_sidecar(out_dir, episode_id, start, end)
+
+    if progress_cb is not None:
+        progress_cb(
+            {
+                "phase": "video",
+                "key": "videos",
+                "key_i": 0,
+                "n_keys": 1,
+                "frac": 0.95,
+                "message": f"裁剪 ep{episode_id} · 视频…",
+            }
+        )
+    video_dir = env.video_dir.joinpath(str(episode_id))
+    _trim_episode_videos(
+        video_dir,
+        start_step=start,
+        end_step=end,
+        n_steps=n_steps,
+        progress_cb=_cb,
+    )
+
+    new_sl = env.replay_buffer.get_episode_slice(episode_id)
+    new_len = int(new_sl.stop - new_sl.start)
+    print(
+        f"Trimmed saved episode {episode_id}: {n_steps} -> {new_len} steps "
+        f"(kept [{start}, {end}))."
+    )
+    return True
+
+
+def schedule_trim_episode(
+    env,
+    episode_id: int,
+    start: int,
+    end: int,
+    *,
+    web_state=None,
+    hold_robot: bool = False,
+    done_mode: str = "READY",
+) -> bool:
+    """后台裁剪一条 episode；与删除共用锁，避免并发改 zarr。"""
+    if env is None:
+        if web_state is not None:
+            web_state.update(message="尚未加载数据目录")
+        return False
+    if not _DELETE_LOCK.acquire(blocking=False):
+        msg = "正在处理数据（删除/裁剪），请稍候…"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+
+    try:
+        n_episodes = int(env.replay_buffer.n_episodes)
+        eid = int(episode_id)
+        sl = env.replay_buffer.get_episode_slice(eid)
+        n_steps = int(sl.stop - sl.start)
+        start_i = int(start)
+        end_i = int(end)
+        if n_episodes <= 0 or eid < 0 or eid >= n_episodes:
+            raise IndexError(f"invalid episode_id {eid}")
+        if start_i < 0 or end_i > n_steps or start_i >= end_i:
+            raise ValueError(
+                f"invalid trim range [{start_i}, {end_i}) for T={n_steps}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Trim pre-check failed: {exc}")
+        if web_state is not None:
+            web_state.update(message=f"裁剪失败: {exc}", delete_pending=None)
+        _DELETE_LOCK.release()
+        return False
+
+    keep = end_i - start_i
+    if web_state is not None:
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            delete_pending=None,
+            delete_progress={
+                "episode_id": eid,
+                "phase": "start",
+                "key": "",
+                "key_i": 0,
+                "n_keys": 0,
+                "frac": 0.0,
+                "message": (
+                    f"正在裁剪 ep{eid} → 保留 [{start_i},{end_i}) "
+                    f"共 {keep} 步…"
+                ),
+            },
+            message=(
+                f"正在裁剪 ep{eid} → 保留 [{start_i},{end_i}) 共 {keep} 步…"
+            ),
+        )
+
+    def _on_progress(info: dict) -> None:
+        if web_state is None or not isinstance(info, dict):
+            return
+        payload = dict(info)
+        payload.setdefault("episode_id", eid)
+        msg = str(payload.get("message") or f"正在裁剪 ep{eid}…")
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            delete_progress=payload,
+            message=msg,
+        )
+
+    def _worker() -> None:
+        ok = False
+        err = ""
+        try:
+            if hold_robot and hasattr(env, "set_end_control"):
+                try:
+                    env.set_end_control()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"trim hold set_end_control warning: {exc}")
+            print(
+                f"Trimming episode {eid} [{start_i},{end_i}) (background)…"
+            )
+            ok = bool(
+                trim_saved_episode(
+                    env, eid, start_i, end_i, progress_cb=_on_progress
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            print(f"Trim episode {eid} failed: {exc}")
+            ok = False
+        finally:
+            try:
+                n_left = int(env.replay_buffer.n_episodes)
+            except Exception:
+                n_left = n_episodes
+            if web_state is not None:
+                web_state.update(
+                    mode=done_mode,
+                    deleting=False,
+                    delete_pending=None,
+                    delete_progress=None,
+                    n_episodes=n_left,
+                    message=(
+                        f"已裁剪 ep{eid} → [{start_i},{end_i}) · {keep} 步"
+                        if ok
+                        else (
+                            f"裁剪 ep{eid} 失败: {err}"
+                            if err
+                            else f"裁剪 ep{eid} 失败"
+                        )
+                    ),
+                )
+            _DELETE_LOCK.release()
+
+    threading.Thread(
+        target=_worker, name=f"trim-ep{eid}", daemon=True
+    ).start()
     return True
 
 
@@ -2117,12 +2516,27 @@ def open_offline_dataset(path: str | Path) -> OfflineDatasetEnv:
 
 def apply_manage_dataset(web_state, env: OfflineDatasetEnv, *, message: str = "") -> None:
     """把数据管理页切到给定 OfflineDatasetEnv。"""
+    from utils.dagger_extract import inspect_intervention
+
     web_state.env = env
     web_state.output_dir = Path(env.output_dir)
     web_state.viewer_only = True
     if hasattr(web_state, "clear_live_series"):
         web_state.clear_live_series()
     n_ep = int(env.replay_buffer.n_episodes)
+    try:
+        dagger_stats = inspect_intervention(env.output_dir)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[dataset] intervention inspect failed: {exc}")
+        dagger_stats = {"has_intervention": False, "error": str(exc)}
+    has_inter = bool(dagger_stats.get("has_intervention"))
+    extra = ""
+    if has_inter:
+        extra = (
+            f" · DAgger intervention"
+            f"（human_eps={dagger_stats.get('n_human_eps', '?')}"
+            f" policy={dagger_stats.get('n_policy_only', '?')}）"
+        )
     web_state.update(
         mode="VIEW",
         viewer_only=True,
@@ -2132,7 +2546,10 @@ def apply_manage_dataset(web_state, env: OfflineDatasetEnv, *, message: str = ""
         n_episodes=n_ep,
         n_steps=0,
         t_elapsed=0.0,
-        message=message or f"已加载 {env.output_dir} · {n_ep} episodes",
+        has_intervention=has_inter,
+        dagger_stats=dagger_stats,
+        message=message
+        or f"已加载 {env.output_dir} · {n_ep} episodes{extra}",
     )
 
 
@@ -2153,6 +2570,273 @@ def handle_load_dataset_cmd(web_state, cmd: dict, *, default_output: str) -> boo
     apply_manage_dataset(web_state, env)
     print(f"[dataset] loaded {env.output_dir} ({env.replay_buffer.n_episodes} eps)")
     return True
+
+
+def schedule_dagger_split(
+    src_dir: str | Path,
+    *,
+    what: str = "both",
+    human_out: str | Path | None = None,
+    policy_out: str | Path | None = None,
+    overwrite: bool = False,
+    trim_still: bool = True,
+    web_state=None,
+    done_mode: str = "VIEW",
+) -> bool:
+    """后台把 DAgger 数据拆成人工示教 / 纯模型目录。"""
+    from utils.dagger_extract import default_split_paths, extract_dagger_split
+
+    src = Path(src_dir).expanduser().resolve()
+    if not (src / "replay_buffer.zarr").exists():
+        msg = f"缺少 replay_buffer.zarr: {src}"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+    if not (src / "intervention").is_dir():
+        msg = f"缺少 intervention/: {src}（非 DAgger 数据？）"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+
+    if not _DELETE_LOCK.acquire(blocking=False):
+        msg = "正在处理数据（删除/裁剪/拆分），请稍候…"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+
+    d_h, d_p = default_split_paths(src)
+    human_path = Path(human_out).expanduser().resolve() if human_out else d_h
+    policy_path = Path(policy_out).expanduser().resolve() if policy_out else d_p
+    what_s = str(what).lower().strip() or "both"
+
+    if web_state is not None:
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            delete_pending=None,
+            delete_progress={
+                "phase": "start",
+                "frac": 0.0,
+                "message": f"DAgger 拆分（{what_s}）启动…",
+            },
+            message=f"DAgger 拆分（{what_s}）启动…",
+        )
+
+    def _on_progress(info: dict) -> None:
+        if web_state is None or not isinstance(info, dict):
+            return
+        payload = dict(info)
+        msg = str(payload.get("message") or "DAgger 拆分中…")
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            delete_progress=payload,
+            message=msg,
+        )
+
+    def _worker() -> None:
+        ok = False
+        err = ""
+        result = None
+        try:
+            print(
+                f"[dagger-split] {src} what={what_s} "
+                f"human={human_path} policy={policy_path} "
+                f"overwrite={overwrite} trim_still={trim_still}"
+            )
+            result = extract_dagger_split(
+                src,
+                dst_human=human_path,
+                dst_policy=policy_path,
+                what=what_s,
+                overwrite=bool(overwrite),
+                trim_still=bool(trim_still),
+                progress_cb=_on_progress,
+            )
+            ok = True
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            print(f"[dagger-split] failed: {exc}")
+            ok = False
+        finally:
+            if web_state is not None:
+                if ok and isinstance(result, dict):
+                    parts = []
+                    if result.get("human"):
+                        h = result["human"]
+                        parts.append(
+                            f"human {h['n_episodes']}ep/{h['n_steps']}steps → {h['dst']}"
+                        )
+                    if result.get("policy"):
+                        p = result["policy"]
+                        parts.append(
+                            f"policy {p['n_episodes']}ep/{p['n_steps']}steps → {p['dst']}"
+                        )
+                    msg = "拆分完成 · " + (" · ".join(parts) if parts else "无输出")
+                    if result.get("unlabeled_episodes"):
+                        msg += f" · 跳过无标签 ep{result['unlabeled_episodes']}"
+                else:
+                    msg = f"拆分失败: {err}" if err else "拆分失败"
+                web_state.update(
+                    mode=done_mode,
+                    deleting=False,
+                    delete_pending=None,
+                    delete_progress=None,
+                    message=msg,
+                )
+            _DELETE_LOCK.release()
+
+    threading.Thread(
+        target=_worker, name=f"dagger-split-{what_s}", daemon=True
+    ).start()
+    return True
+
+
+def handle_dagger_split_web_cmd(
+    web_state,
+    cmd: dict,
+    *,
+    done_mode: str = "VIEW",
+) -> bool:
+    """处理 dagger_split_request / dagger_split_confirm。"""
+    action = cmd.get("action")
+    env = web_state.env if web_state is not None else None
+    if env is None:
+        if web_state is not None:
+            web_state.update(message="尚未加载数据目录")
+        return False
+    src = Path(env.output_dir)
+
+    if action == "dagger_split_request":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+        what = str(cmd.get("what", "both")).lower()
+        if web_state is not None:
+            web_state.update(
+                message=f"confirm dagger split ({what}) from {src.name}",
+            )
+        print(f"Confirm DAgger split ({what}) from {src}? (web Yes)")
+        return True
+
+    if action == "dagger_split_confirm":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+        what = str(cmd.get("what", "both")).lower()
+        human_out = cmd.get("human_out") or None
+        policy_out = cmd.get("policy_out") or None
+        overwrite = bool(cmd.get("overwrite", False))
+        trim_still = bool(cmd.get("trim_still", True))
+        return bool(
+            schedule_dagger_split(
+                src,
+                what=what,
+                human_out=human_out,
+                policy_out=policy_out,
+                overwrite=overwrite,
+                trim_still=trim_still,
+                web_state=web_state,
+                done_mode=done_mode,
+            )
+        )
+    return False
+
+
+def handle_trim_web_cmd(
+    web_state,
+    cmd: dict,
+    *,
+    done_mode: str = "VIEW",
+    hold_robot: bool = False,
+    prep_hold_fn=None,
+) -> bool:
+    """处理 trim_request / trim_confirm。成功调度或接受请求返回 True。"""
+    action = cmd.get("action")
+    env = web_state.env if web_state is not None else None
+
+    if action == "trim_request":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+        if env is None:
+            if web_state is not None:
+                web_state.update(message="尚未加载数据目录")
+            return False
+        try:
+            eid = int(cmd.get("episode_id"))
+            start = int(cmd.get("start"))
+            end = int(cmd.get("end"))
+        except (TypeError, ValueError):
+            if web_state is not None:
+                web_state.update(message="裁剪参数无效（需要 episode_id/start/end）")
+            return False
+        n = int(env.replay_buffer.n_episodes)
+        if eid < 0 or eid >= n:
+            if web_state is not None:
+                web_state.update(message=f"invalid episode_id {eid}")
+            return False
+        sl = env.replay_buffer.get_episode_slice(eid)
+        T = int(sl.stop - sl.start)
+        if start < 0 or end > T or start >= end:
+            if web_state is not None:
+                web_state.update(
+                    message=f"裁剪区间无效 [{start},{end}) · ep{eid} 长度 {T}"
+                )
+            return False
+        if web_state is not None:
+            web_state.update(
+                delete_pending=eid,
+                message=(
+                    f"confirm trim ep{eid} keep [{start},{end}) "
+                    f"({end - start}/{T} steps)"
+                ),
+            )
+        print(
+            f"Confirm trim episode {eid} keep [{start}, {end}) "
+            f"({end - start}/{T})? (web Yes)"
+        )
+        return True
+
+    if action == "trim_confirm":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+        if env is None:
+            return False
+        try:
+            eid = int(cmd.get("episode_id", getattr(web_state, "delete_pending", -1)))
+            start = int(cmd.get("start"))
+            end = int(cmd.get("end"))
+        except (TypeError, ValueError):
+            if web_state is not None:
+                web_state.update(message="裁剪确认参数无效")
+            return False
+        if prep_hold_fn is not None:
+            try:
+                prep_hold_fn()
+            except Exception as exc:  # noqa: BLE001
+                print(f"trim prep_hold warning: {exc}")
+        return bool(
+            schedule_trim_episode(
+                env,
+                eid,
+                start,
+                end,
+                web_state=web_state,
+                hold_robot=hold_robot,
+                done_mode=done_mode,
+            )
+        )
+
+    return False
 
 
 def run_viewer_only(
@@ -2199,7 +2883,8 @@ def run_viewer_only(
         f"{env.replay_buffer.n_episodes if env is not None else 0}"
     )
     print(f"  web        : http://{web_host}:{web_port}/")
-    print("  controls   : browse / scrub / delete / load other folder")
+    print("  controls   : browse / scrub / delete / trim / load other folder")
+    print("  trim       : web Mark In/Out → Apply（[ ] T）")
     print("  quit       : Ctrl+C in this terminal, or Q on the page")
     print("=" * 60)
 
@@ -2262,11 +2947,21 @@ def run_viewer_only(
                             done_mode="VIEW",
                         )
                     continue
+                if action in ("trim_request", "trim_confirm"):
+                    handle_trim_web_cmd(
+                        web_state, cmd, done_mode="VIEW", hold_robot=False
+                    )
+                    continue
+                if action in ("dagger_split_request", "dagger_split_confirm"):
+                    handle_dagger_split_web_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
                 if action in ("drag_toggle", "start", "save", "drop"):
                     web_state.update(
                         message="viewer_only: collect controls disabled"
                     )
-            # 删除线程占用 zarr 时不要改 mode / 读 n_episodes（否则进度被冲掉且有竞态）
+            # 删除/裁剪/拆分线程占用 zarr 时不要改 mode / 读 n_episodes
             if is_delete_busy() or bool(getattr(web_state, "deleting", False)):
                 web_state.update(mode="DELETING", deleting=True, viewer_only=True)
             else:
@@ -2311,6 +3006,8 @@ def _hub_reset_state(web_state, output: str, message: str = "") -> None:
         n_episodes=n_ep,
         n_steps=0,
         t_elapsed=0.0,
+        has_intervention=False,
+        dagger_stats=None,
         message=message
         or "选择模式：数据采集（需已启动 ZMQ server）或 数据管理",
     )
@@ -2531,12 +3228,22 @@ def run_web_hub(
                             done_mode="VIEW",
                         )
                     continue
+                if action in ("trim_request", "trim_confirm"):
+                    handle_trim_web_cmd(
+                        web_state, cmd, done_mode="VIEW", hold_robot=False
+                    )
+                    continue
+                if action in ("dagger_split_request", "dagger_split_confirm"):
+                    handle_dagger_split_web_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
                 if is_delete_busy() and action in (
                     "load_dataset",
                     "back_hub",
                     "enter_collect",
                 ):
-                    web_state.update(message="正在删除中，请稍候…")
+                    web_state.update(message="正在处理数据，请稍候…")
                     continue
                 if action in ("drag_toggle", "start", "save", "drop", "enter_collect"):
                     web_state.update(
@@ -3318,6 +4025,48 @@ def run_collect_session(
                                 else:
                                     print(f"Episode {eid} does not exist.")
                             continue
+                        if action in ("trim_request", "trim_confirm"):
+                            def _prep_hold_for_trim() -> None:
+                                nonlocal zero_force_active
+                                if zero_force_active:
+                                    leave_drag_stay_pose(env)
+                                    zero_force_active = False
+                                    if grip_detector is not None:
+                                        grip_detector.reset()
+                                elif hasattr(env, "set_end_control"):
+                                    try:
+                                        env.set_end_control()
+                                    except Exception as exc:  # noqa: BLE001
+                                        print(
+                                            f"set_end_control before trim: {exc}"
+                                        )
+
+                            handle_trim_web_cmd(
+                                web_state,
+                                cmd,
+                                done_mode=(
+                                    "READY" if no_zero_force else "IDLE"
+                                ),
+                                hold_robot=False,
+                                prep_hold_fn=(
+                                    _prep_hold_for_trim
+                                    if action == "trim_confirm"
+                                    else None
+                                ),
+                            )
+                            continue
+                        if action in (
+                            "dagger_split_request",
+                            "dagger_split_confirm",
+                        ):
+                            handle_dagger_split_web_cmd(
+                                web_state,
+                                cmd,
+                                done_mode=(
+                                    "READY" if no_zero_force else "IDLE"
+                                ),
+                            )
+                            continue
                         if is_delete_busy() and action not in (
                             "quit",
                             "estop",
@@ -3325,7 +4074,7 @@ def run_collect_session(
                         ):
                             if web_state is not None:
                                 web_state.update(
-                                    message="正在删除中，请稍候…"
+                                    message="正在处理数据，请稍候…"
                                 )
                             continue
                         if delete_mode == "confirm" and action not in (

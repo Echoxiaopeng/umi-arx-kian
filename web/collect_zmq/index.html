@@ -580,6 +580,17 @@
       white-space: nowrap;
     }
     .path-row button { flex: 0 0 auto; padding: 8px 14px; }
+    .path-row input[type="text"] {
+      flex: 1 1 240px;
+      min-width: 160px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: #121820;
+      color: #c5d0e0;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: 0.82rem;
+    }
 
     .fs-modal {
       max-width: 640px;
@@ -730,7 +741,7 @@
         <button type="button" id="btnEnterManage" class="hub-manage">数据管理</button>
         <button type="button" id="btnHubQuit" class="danger">退出</button>
       </div>
-      <p class="hub-note" id="hubNote">数采需要本机已启动 ZMQ robot server。管理页不连臂，可回看 / 删除已有 episode，也可切换到其它数据目录。</p>
+      <p class="hub-note" id="hubNote">数采需要本机已启动 ZMQ robot server。管理页不连臂，可回看 / 删除 / 裁剪已有 episode，也可切换到其它数据目录。</p>
       <div class="hub-msg" id="hubMsg"></div>
       <div class="hub-log-wrap" id="hubLogWrap">
         <h3>连接日志</h3>
@@ -808,6 +819,44 @@
         <button id="btnBrowseDataset" type="button" class="primary">浏览文件夹…</button>
         <button id="btnResetDataset" type="button" title="回到启动时的 -o 目录">默认目录</button>
       </div>
+      <div id="daggerSplitBox" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px">
+          <strong style="font-size:0.9rem">DAgger 拆分</strong>
+          <span class="msg" id="daggerStatsLabel" style="margin:0">—</span>
+        </div>
+        <div class="path-row" style="margin-top:4px">
+          <label>人工示教</label>
+          <input id="daggerHumanOut" type="text" style="flex:1;min-width:180px" placeholder="{dir}_human" />
+        </div>
+        <div class="path-row" style="margin-top:4px">
+          <label>纯模型</label>
+          <input id="daggerPolicyOut" type="text" style="flex:1;min-width:180px" placeholder="{dir}_policy" />
+        </div>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px">
+          <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
+            <input id="daggerOverwrite" type="checkbox" /> 覆盖已有输出
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
+            <input id="daggerTrimStill" type="checkbox" checked /> 去掉人工段开头静止
+          </label>
+        </div>
+        <div class="btns" style="margin-top:8px;flex-wrap:wrap">
+          <button id="btnDaggerHuman" type="button" class="ok" title="提取 intervention=1 段并去静止">提取人工示教</button>
+          <button id="btnDaggerPolicy" type="button" title="提取整条全是模型输出的 episode">提取纯模型</button>
+          <button id="btnDaggerBoth" type="button" class="primary" title="两者都提取到旁边目录">全部拆分</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-bg" id="daggerModal">
+      <div class="modal">
+        <h3>DAgger 拆分？</h3>
+        <p id="daggerText">将提取人工示教 / 纯模型到指定目录。</p>
+        <div class="btns">
+          <button id="daggerYes" class="ok">确认拆分</button>
+          <button id="daggerNo">取消</button>
+        </div>
+      </div>
     </div>
 
     <div class="panel grow" id="episodePanel">
@@ -820,6 +869,13 @@
             <button id="btnDelete" class="danger" disabled>Delete</button>
             <button id="btnLiveView">Follow LIVE</button>
           </div>
+          <div class="btns" style="margin-top:8px;flex:0 0 auto;flex-wrap:wrap">
+            <button id="btnTrimIn" type="button" disabled title="把当前 scrub 帧标为保留起点（含）">标起点 [</button>
+            <button id="btnTrimOut" type="button" disabled title="把当前 scrub 帧标为保留终点（含）">标终点 ]</button>
+            <button id="btnTrimClear" type="button" disabled title="清除裁剪标记">清除</button>
+            <button id="btnTrimApply" type="button" class="ok" disabled title="裁掉标记外的头尾，原地改 zarr/视频">应用裁剪</button>
+          </div>
+          <div class="msg" id="trimRangeLabel" style="margin-top:4px">裁剪范围：未标记</div>
         </div>
         <div class="viewer-main">
           <div class="viewer-toolbar">
@@ -866,6 +922,17 @@
     </div>
   </div>
 
+  <div class="modal-bg" id="trimModal">
+    <div class="modal">
+      <h3>裁剪 episode？</h3>
+      <p id="trimText">将保留 [start, end]，删除头尾。此操作会改写 zarr 与视频，不可撤销。</p>
+      <div class="btns">
+        <button id="trimYes" class="ok">确认裁剪</button>
+        <button id="trimNo">取消</button>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-bg" id="fsModal">
     <div class="modal fs-modal">
       <h3>选择数据文件夹</h3>
@@ -897,6 +964,11 @@
     let hubMode = false;
     let lastRecording = false;
     let lastReplaying = false;
+    // 裁剪标记：相对当前 episode 的 inclusive 帧号；应用时保留 [in, out+1)
+    let trimIn = null;
+    let trimOut = null;
+    let pendingTrim = null; // {episode_id, start, end}
+    let pendingDagger = null; // {what, human_out, policy_out, overwrite, trim_still}
     let lastDeleting = false;
     let lastUiMode = "";
     let lastOutputDir = "";
@@ -1017,7 +1089,7 @@
       DRAG: "拖拽中",
       REC: "录制中",
       SAVING: "保存中",
-      DELETING: "删除中",
+      DELETING: "处理中",
       REPLAY: "轨迹回放",
       DEL: "删除确认",
       VIEW: "数据管理",
@@ -1134,6 +1206,80 @@
       requestAnimationFrame(() => resizeChart());
     }
 
+    function defaultDaggerOutPaths(srcPath) {
+      const p = String(srcPath || "").replace(/\/+$/, "");
+      if (!p) return { human: "", policy: "" };
+      return { human: p + "_human", policy: p + "_policy" };
+    }
+
+    function syncDaggerSplitUi(s) {
+      const box = $("daggerSplitBox");
+      if (!box) return;
+      const show =
+        !!(s && s.viewer_only) &&
+        !!(s && s.has_intervention) &&
+        !hubMode &&
+        !!String(s.output_dir || "").trim();
+      box.style.display = show ? "" : "none";
+      if (!show) return;
+      const st = (s && s.dagger_stats) || {};
+      if ($("daggerStatsLabel")) {
+        $("daggerStatsLabel").textContent =
+          `labeled ${st.n_labeled ?? "?"} · human_eps ${st.n_human_eps ?? "?"} · ` +
+          `policy ${st.n_policy_only ?? "?"} · unlabeled ${st.n_unlabeled ?? 0}`;
+      }
+      const defs = defaultDaggerOutPaths(s.output_dir);
+      if ($("daggerHumanOut") && !$("daggerHumanOut").dataset.touched) {
+        $("daggerHumanOut").value = defs.human;
+      }
+      if ($("daggerPolicyOut") && !$("daggerPolicyOut").dataset.touched) {
+        $("daggerPolicyOut").value = defs.policy;
+      }
+      const busy = !!(s.mode === "DELETING" || s.deleting);
+      ["btnDaggerHuman", "btnDaggerPolicy", "btnDaggerBoth"].forEach((id) => {
+        if ($(id)) $(id).disabled = busy;
+      });
+    }
+
+    function openDaggerSplitConfirm(what) {
+      if (status.mode === "DELETING" || status.deleting) {
+        setMsg("正在处理数据，请稍候…");
+        return;
+      }
+      if (!status.has_intervention) {
+        setMsg("当前目录没有 intervention/，无法拆分");
+        return;
+      }
+      const human =
+        ($("daggerHumanOut") && $("daggerHumanOut").value.trim()) ||
+        defaultDaggerOutPaths(status.output_dir).human;
+      const policy =
+        ($("daggerPolicyOut") && $("daggerPolicyOut").value.trim()) ||
+        defaultDaggerOutPaths(status.output_dir).policy;
+      const overwrite = !!($("daggerOverwrite") && $("daggerOverwrite").checked);
+      const trimStill = !($("daggerTrimStill") && !$("daggerTrimStill").checked);
+      pendingDagger = {
+        what,
+        human_out: human,
+        policy_out: policy,
+        overwrite,
+        trim_still: trimStill,
+      };
+      const whatLabel =
+        what === "human"
+          ? "仅人工示教（去静止）"
+          : what === "policy"
+            ? "仅纯模型整条 episode"
+            : "人工示教 + 纯模型";
+      let text = `从 ${status.output_dir || "当前目录"} 拆分：${whatLabel}。\n`;
+      if (what === "human" || what === "both") text += `人工 → ${human}\n`;
+      if (what === "policy" || what === "both") text += `模型 → ${policy}\n`;
+      text += overwrite ? "将覆盖已有输出目录。" : "若输出目录已存在会失败（可勾选覆盖）。";
+      if ($("daggerText")) $("daggerText").textContent = text;
+      if ($("daggerModal")) $("daggerModal").classList.add("show");
+      postCmd("dagger_split_request", { what }).catch((e) => setMsg(e.message));
+    }
+
     function syncDatasetPathLabel(s) {
       const label = $("datasetPathLabel");
       const dir = (s && s.output_dir) || "";
@@ -1156,12 +1302,24 @@
       if (dir) lastOutputDir = dir;
     }
 
+    function resetDaggerPathInputs() {
+      if ($("daggerHumanOut")) {
+        delete $("daggerHumanOut").dataset.touched;
+        $("daggerHumanOut").value = "";
+      }
+      if ($("daggerPolicyOut")) {
+        delete $("daggerPolicyOut").dataset.touched;
+        $("daggerPolicyOut").value = "";
+      }
+    }
+
     async function loadDatasetPath(path) {
       const p = (path || "").trim();
       setMsg(p ? `正在加载 ${p}…` : "正在加载默认目录…");
       stopPlay();
       selectedEp = null;
       series = null;
+      resetDaggerPathInputs();
       try {
         await postCmd("load_dataset", { path: p });
         await new Promise((r) => setTimeout(r, 150));
@@ -1330,11 +1488,16 @@
       if (s.message) setMsg(s.message);
       setDeleteProgress(s);
       syncDatasetPathLabel(s);
+      syncDaggerSplitUi(s);
 
       if (hubMode) return;
 
       if (viewerOnly) {
-        $("btnDelete").disabled = selectedEp === null || selectedEp === "live";
+        $("btnDelete").disabled =
+          selectedEp === null ||
+          selectedEp === "live" ||
+          mode === "DELETING" ||
+          !!s.deleting;
         return;
       }
 
@@ -1363,10 +1526,16 @@
         if ($(id)) $(id).disabled = rec || busy;
       });
       $("btnDelete").disabled = selectedEp === null || selectedEp === "live" || busy;
+      const trimEpOk =
+        selectedEp != null && selectedEp !== "live" && !busy;
+      setTrimControlsEnabled(trimEpOk);
+      if ($("btnTrimIn")) $("btnTrimIn").disabled = !trimEpOk;
+      if ($("btnTrimOut")) $("btnTrimOut").disabled = !trimEpOk;
 
       // 按下 C 进入录制：强制切回实时相机画面
       if (rec && !saving && !lastRecording) {
         selectedEp = "live";
+        clearTrimMarks({ refreshChart: false });
         document.querySelectorAll(".ep-list li").forEach((li) => li.classList.remove("active"));
         $("btnDelete").disabled = true;
         showLiveStream({ force: true });
@@ -1383,10 +1552,16 @@
       }
       lastRecording = rec;
 
-      // 删除结束：强制刷新 episode 列表
+      // 删除/裁剪结束：强制刷新 episode 列表，并重载当前 episode
       if (lastDeleting && !deleting) {
-        pollStatus(true);
-        setMsg(s.message || "删除完成");
+        const keepEp = selectedEp;
+        const msg = s.message || "处理完成";
+        pollStatus(true).then(() => {
+          setMsg(msg);
+          if (keepEp != null && keepEp !== "live") {
+            selectEpisode(Number(keepEp));
+          }
+        });
       }
       lastDeleting = deleting;
 
@@ -1592,6 +1767,7 @@
           }
           annotations.push(...cursorAnnotations(xi));
         }
+        shapes.push(...trimMarkerShapes());
         layout = {
           title: { text: title, font: { size: chartFontSize() + 2, color: "#8b9bb4" } },
           paper_bgcolor: "#121820",
@@ -1682,6 +1858,7 @@
           });
           annotations.push(...cursorAnnotations(frameIdx));
         }
+        shapes.push(...trimMarkerShapes());
         const yTitle = {
           pos: "pos (m)",
           gripper: "m",
@@ -1777,32 +1954,133 @@
       return Math.max(0, Math.min(max, Math.round(x)));
     }
 
-    function cursorShapes(step) {
-      const line = { color: "#f0b429", width: chartDragging ? 2.5 : 1.5, dash: "dot" };
-      if (chartChannel === "all") {
-        return ["x", "x2", "x3", "x4"].map((xref) => ({
-          type: "line",
-          xref,
-          yref: "paper",
-          x0: step,
-          x1: step,
-          y0: 0,
-          y1: 1,
-          line,
-        }));
-      }
-      return [
-        {
-          type: "line",
+    function trimMarkerShapes() {
+      const xrefs =
+        chartChannel === "all" ? ["x", "x2", "x3", "x4"] : ["x"];
+      const out = [];
+      const addLine = (step, color, width = 2) => {
+        if (step == null || !Number.isFinite(Number(step))) return;
+        xrefs.forEach((xref) => {
+          out.push({
+            type: "line",
+            xref,
+            yref: "paper",
+            x0: Number(step),
+            x1: Number(step),
+            y0: 0,
+            y1: 1,
+            line: { color, width, dash: "solid" },
+          });
+        });
+      };
+      // 保留区浅色底（单通道时够用；all 模式只画在主 x）
+      if (
+        trimIn != null &&
+        trimOut != null &&
+        Number(trimOut) >= Number(trimIn) &&
+        chartChannel !== "all"
+      ) {
+        out.push({
+          type: "rect",
           xref: "x",
           yref: "paper",
-          x0: step,
-          x1: step,
+          x0: Number(trimIn),
+          x1: Number(trimOut),
           y0: 0,
           y1: 1,
-          line,
-        },
-      ];
+          fillcolor: "rgba(62, 207, 142, 0.12)",
+          line: { width: 0 },
+          layer: "below",
+        });
+      }
+      addLine(trimIn, "#3ecf8e", 2);
+      addLine(trimOut, "#ff7a59", 2);
+      return out;
+    }
+
+    function updateTrimRangeLabel() {
+      const el = $("trimRangeLabel");
+      if (!el) return;
+      const max = Number($("scrub").max) || 0;
+      const hasEp =
+        selectedEp != null && selectedEp !== "live" && Number.isFinite(Number(selectedEp));
+      if (!hasEp) {
+        el.textContent = "裁剪范围：先选择 episode";
+        return;
+      }
+      if (trimIn == null && trimOut == null) {
+        el.textContent = "裁剪范围：未标记（拖 scrub → 标起点 / 标终点）";
+        return;
+      }
+      const a = trimIn != null ? trimIn : "?";
+      const b = trimOut != null ? trimOut : "?";
+      if (trimIn != null && trimOut != null) {
+        if (trimOut < trimIn) {
+          el.textContent = `裁剪范围：无效 [${a}, ${b}]（终点需 ≥ 起点）`;
+        } else {
+          const keep = trimOut - trimIn + 1;
+          el.textContent =
+            `裁剪范围：保留 [${a}, ${b}] 共 ${keep} / ${max + 1} 步 · 将删掉头尾`;
+        }
+      } else {
+        el.textContent = `裁剪范围：起点=${a} 终点=${b}（两端都标完后再应用）`;
+      }
+      const canApply =
+        hasEp &&
+        trimIn != null &&
+        trimOut != null &&
+        Number(trimOut) >= Number(trimIn) &&
+        !(status.mode === "DELETING" || status.deleting);
+      if ($("btnTrimApply")) $("btnTrimApply").disabled = !canApply;
+      if ($("btnTrimClear")) {
+        $("btnTrimClear").disabled = trimIn == null && trimOut == null;
+      }
+    }
+
+    function setTrimControlsEnabled(on) {
+      ["btnTrimIn", "btnTrimOut"].forEach((id) => {
+        if ($(id)) $(id).disabled = !on;
+      });
+      updateTrimRangeLabel();
+    }
+
+    function clearTrimMarks({ refreshChart = true } = {}) {
+      trimIn = null;
+      trimOut = null;
+      updateTrimRangeLabel();
+      if (refreshChart && series) {
+        const step = Number($("scrub").value) || 0;
+        plotSeries(series, series._title || "Episode", step);
+      }
+    }
+
+    function cursorShapes(step) {
+      const line = { color: "#f0b429", width: chartDragging ? 2.5 : 1.5, dash: "dot" };
+      const base =
+        chartChannel === "all"
+          ? ["x", "x2", "x3", "x4"].map((xref) => ({
+              type: "line",
+              xref,
+              yref: "paper",
+              x0: step,
+              x1: step,
+              y0: 0,
+              y1: 1,
+              line,
+            }))
+          : [
+              {
+                type: "line",
+                xref: "x",
+                yref: "paper",
+                x0: step,
+                x1: step,
+                y0: 0,
+                y1: 1,
+                line,
+              },
+            ];
+      return base.concat(trimMarkerShapes());
     }
 
     function sampleAtStep(step) {
@@ -2092,20 +2370,25 @@
       }
       stopPlay();
       selectedEp = id;
+      clearTrimMarks({ refreshChart: false });
       document.querySelectorAll(".ep-list li").forEach((li) => {
         li.classList.toggle("active", Number(li.dataset.id) === id);
       });
       $("btnDelete").disabled = false;
+      setTrimControlsEnabled(true);
       $("viewerMsg").textContent = `Loading episode ${id}…`;
       if ($("videoHeading")) $("videoHeading").textContent = `Episode ${id}`;
       try {
         const r = await fetch(`/api/episodes/${id}/series?max_points=2000`);
         const data = await r.json();
         if (!r.ok) throw new Error(data.error || r.statusText);
+        data._title = `Episode ${id}`;
+        series = data;
         plotSeries(data, `Episode ${id}`, 0);
         $("scrub").value = "0";
         await loadFrame(0);
         $("viewerMsg").textContent = `Episode ${id} · ${data.n_steps} steps`;
+        updateTrimRangeLabel();
       } catch (e) {
         $("viewerMsg").textContent = "Failed: " + e.message;
       }
@@ -2113,6 +2396,8 @@
 
     async function followLive() {
       selectedEp = "live";
+      clearTrimMarks({ refreshChart: false });
+      setTrimControlsEnabled(false);
       document.querySelectorAll(".ep-list li").forEach((li) => li.classList.remove("active"));
       $("btnDelete").disabled = true;
       $("viewerMsg").textContent = viewerOnly
@@ -2261,6 +2546,54 @@
         loadDatasetPath(fallback);
       };
     }
+    if ($("daggerHumanOut")) {
+      $("daggerHumanOut").addEventListener("input", () => {
+        $("daggerHumanOut").dataset.touched = "1";
+      });
+    }
+    if ($("daggerPolicyOut")) {
+      $("daggerPolicyOut").addEventListener("input", () => {
+        $("daggerPolicyOut").dataset.touched = "1";
+      });
+    }
+    if ($("btnDaggerHuman")) {
+      $("btnDaggerHuman").onclick = () => openDaggerSplitConfirm("human");
+    }
+    if ($("btnDaggerPolicy")) {
+      $("btnDaggerPolicy").onclick = () => openDaggerSplitConfirm("policy");
+    }
+    if ($("btnDaggerBoth")) {
+      $("btnDaggerBoth").onclick = () => openDaggerSplitConfirm("both");
+    }
+    if ($("daggerNo")) {
+      $("daggerNo").onclick = () => {
+        if ($("daggerModal")) $("daggerModal").classList.remove("show");
+        pendingDagger = null;
+        postCmd("delete_cancel").catch(() => {});
+      };
+    }
+    if ($("daggerYes")) {
+      $("daggerYes").onclick = async () => {
+        if (!pendingDagger) {
+          if ($("daggerModal")) $("daggerModal").classList.remove("show");
+          return;
+        }
+        if (status.mode === "DELETING" || status.deleting) {
+          if ($("daggerModal")) $("daggerModal").classList.remove("show");
+          setMsg("正在处理数据，请稍候…");
+          return;
+        }
+        const payload = { ...pendingDagger };
+        if ($("daggerModal")) $("daggerModal").classList.remove("show");
+        try {
+          await postCmd("dagger_split_confirm", payload);
+          setMsg(`正在拆分（${payload.what}）…`);
+        } catch (e) {
+          setMsg(e.message);
+        }
+        pendingDagger = null;
+      };
+    }
     if ($("fsCancel")) $("fsCancel").onclick = () => closeFsModal();
     if ($("fsUp")) {
       $("fsUp").onclick = () => {
@@ -2331,6 +2664,9 @@
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
       const k = (ev.key || "").toLowerCase();
       const modalOpen = $("delModal").classList.contains("show");
+      const trimModalOpen = $("trimModal") && $("trimModal").classList.contains("show");
+      const daggerModalOpen =
+        $("daggerModal") && $("daggerModal").classList.contains("show");
       const fsOpen = $("fsModal") && $("fsModal").classList.contains("show");
 
       if (fsOpen) {
@@ -2351,6 +2687,28 @@
         return;
       }
 
+      if (trimModalOpen) {
+        if (k === "y" || k === "enter") {
+          ev.preventDefault();
+          if ($("trimYes")) $("trimYes").click();
+        } else if (k === "n" || k === "escape") {
+          ev.preventDefault();
+          if ($("trimNo")) $("trimNo").click();
+        }
+        return;
+      }
+
+      if (daggerModalOpen) {
+        if (k === "y" || k === "enter") {
+          ev.preventDefault();
+          if ($("daggerYes")) $("daggerYes").click();
+        } else if (k === "n" || k === "escape") {
+          ev.preventDefault();
+          if ($("daggerNo")) $("daggerNo").click();
+        }
+        return;
+      }
+
       if (modalOpen) {
         if (k === "y" || k === "enter") {
           ev.preventDefault();
@@ -2360,6 +2718,29 @@
           $("delNo").click();
         }
         return;
+      }
+
+      // 数据管理快捷键：[ = 标起点，] = 标终点，T = 应用裁剪
+      if (
+        (viewerOnly || selectedEp != null) &&
+        selectedEp != null &&
+        selectedEp !== "live"
+      ) {
+        if (ev.key === "[") {
+          ev.preventDefault();
+          if ($("btnTrimIn") && !$("btnTrimIn").disabled) $("btnTrimIn").click();
+          return;
+        }
+        if (ev.key === "]") {
+          ev.preventDefault();
+          if ($("btnTrimOut") && !$("btnTrimOut").disabled) $("btnTrimOut").click();
+          return;
+        }
+        if (k === "t" && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+          ev.preventDefault();
+          if ($("btnTrimApply") && !$("btnTrimApply").disabled) $("btnTrimApply").click();
+          return;
+        }
       }
 
       if (k === "q") {
@@ -2429,6 +2810,99 @@
       }
     });
 
+    function markTrimBound(which) {
+      if (selectedEp == null || selectedEp === "live") return;
+      if (status.mode === "DELETING" || status.deleting) {
+        setMsg("正在处理数据，请稍候…");
+        return;
+      }
+      const step = Number($("scrub").value) || 0;
+      if (which === "in") trimIn = step;
+      else trimOut = step;
+      updateTrimRangeLabel();
+      if (series) {
+        plotSeries(series, series._title || `Episode ${selectedEp}`, step);
+      }
+      setMsg(
+        which === "in"
+          ? `已标起点 frame=${step}`
+          : `已标终点 frame=${step}`
+      );
+    }
+
+    if ($("btnTrimIn")) $("btnTrimIn").onclick = () => markTrimBound("in");
+    if ($("btnTrimOut")) $("btnTrimOut").onclick = () => markTrimBound("out");
+    if ($("btnTrimClear")) {
+      $("btnTrimClear").onclick = () => {
+        clearTrimMarks({ refreshChart: true });
+        setMsg("已清除裁剪标记");
+      };
+    }
+    if ($("btnTrimApply")) {
+      $("btnTrimApply").onclick = () => {
+        if (selectedEp == null || selectedEp === "live") return;
+        if (status.mode === "DELETING" || status.deleting) {
+          setMsg("正在处理数据，请稍候…");
+          return;
+        }
+        if (trimIn == null || trimOut == null || trimOut < trimIn) {
+          setMsg("请先标记有效的起点与终点（终点 ≥ 起点）");
+          return;
+        }
+        const start = Number(trimIn);
+        const end = Number(trimOut) + 1; // inclusive out → half-open
+        const max = Number($("scrub").max) || 0;
+        const T = max + 1;
+        if (start === 0 && end === T) {
+          setMsg("当前标记覆盖整段，无需裁剪");
+          return;
+        }
+        pendingTrim = {
+          episode_id: Number(selectedEp),
+          start,
+          end,
+        };
+        $("trimText").textContent =
+          `裁剪 episode ${selectedEp}：保留帧 [${start}, ${trimOut}]（共 ${end - start} / ${T} 步），` +
+          `删除头 ${start} 步与尾 ${T - end} 步。将改写 zarr / 视频` +
+          (status.viewer_only ? "" : "") +
+          "，不可撤销。";
+        $("trimModal").classList.add("show");
+        postCmd("trim_request", pendingTrim).catch((e) => setMsg(e.message));
+      };
+    }
+    if ($("trimNo")) {
+      $("trimNo").onclick = () => {
+        $("trimModal").classList.remove("show");
+        pendingTrim = null;
+        postCmd("delete_cancel").catch(() => {});
+      };
+    }
+    if ($("trimYes")) {
+      $("trimYes").onclick = async () => {
+        if (!pendingTrim) {
+          $("trimModal").classList.remove("show");
+          return;
+        }
+        if (status.mode === "DELETING" || status.deleting) {
+          $("trimModal").classList.remove("show");
+          setMsg("正在处理数据，请稍候…");
+          return;
+        }
+        const payload = { ...pendingTrim };
+        $("trimModal").classList.remove("show");
+        try {
+          await postCmd("trim_confirm", payload);
+          setMsg(
+            `正在裁剪 ep${payload.episode_id} → [${payload.start},${payload.end})…`
+          );
+        } catch (e) {
+          setMsg(e.message);
+        }
+        pendingTrim = null;
+      };
+    }
+
     $("btnDelete").onclick = () => {
       if (selectedEp == null || selectedEp === "live") return;
       if (status.mode === "DELETING" || status.deleting) {
@@ -2451,8 +2925,7 @@
     $("delYes").onclick = async () => {
       const id = selectedEp;
       if (status.mode === "DELETING" || status.deleting) {
-        $("delModal").classList.remove("show");
-        setMsg("正在删除中，请稍候…");
+        $("delModal").classList.remove("show");        setMsg("正在删除中，请稍候…");
         return;
       }
       $("delModal").classList.remove("show");

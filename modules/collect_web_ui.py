@@ -148,6 +148,9 @@ class SharedCollectState:
         self.message: str = ""
         self.frequency: float = 60.0
         self.viewer_only: bool = False
+        # DAgger：当前目录是否含 intervention/ sidecar
+        self.has_intervention: bool = False
+        self.dagger_stats: Optional[dict] = None
         self._jpeg: bytes = b""
         self._live_series: list[dict] = []
         self.logs: list[str] = []
@@ -246,6 +249,14 @@ class SharedCollectState:
                 "frequency": self.frequency,
                 "live_n": len(self._live_series),
                 "viewer_only": bool(getattr(self, "viewer_only", False)),
+                "has_intervention": bool(
+                    getattr(self, "has_intervention", False)
+                ),
+                "dagger_stats": (
+                    dict(self.dagger_stats)
+                    if isinstance(getattr(self, "dagger_stats", None), dict)
+                    else None
+                ),
                 "output_dir": str(out_dir) if out_dir is not None else "",
                 "repo_root": str(_REPO_ROOT),
                 "logs": list(self.logs),

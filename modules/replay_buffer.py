@@ -761,6 +761,156 @@ class ReplayBuffer:
             if len(new_ends_arr) > 0:
                 self.episode_ends[:] = new_ends_arr
 
+    def trim_episode(
+        self,
+        idx: int,
+        start_local: int,
+        end_local: int,
+        progress_cb=None,
+    ):
+        """保留 episode ``idx`` 的半开区间 ``[start_local, end_local)``，删掉头/尾。
+
+        ``start_local`` / ``end_local`` 相对该 episode 起点（0 .. T）。
+        progress_cb 签名与 ``delete_episode`` 相同。
+        """
+        n = int(self.n_episodes)
+        if idx < 0 or idx >= n:
+            raise IndexError(f"episode {idx} out of range 0..{n - 1}")
+
+        ends = np.asarray(self.episode_ends[:], dtype=np.int64).copy()
+        ep_start = 0 if idx == 0 else int(ends[idx - 1])
+        ep_end = int(ends[idx])
+        T = int(ep_end - ep_start)
+        start_local = int(start_local)
+        end_local = int(end_local)
+        if start_local < 0 or end_local > T or start_local >= end_local:
+            raise ValueError(
+                f"invalid trim range [{start_local}, {end_local}) for episode "
+                f"length T={T}"
+            )
+        if start_local == 0 and end_local == T:
+            if progress_cb is not None:
+                progress_cb(
+                    {
+                        "phase": "zarr",
+                        "key": "(noop)",
+                        "key_i": 0,
+                        "n_keys": 0,
+                        "frac": 1.0,
+                        "message": f"ep{idx} 无需裁剪（已是全长）",
+                    }
+                )
+            return
+
+        remove_head = start_local
+        remove_tail = T - end_local
+        is_zarr = self.backend == "zarr"
+        expected_n = int(ends[-1]) if len(ends) > 0 else 0
+
+        items = sorted(
+            self.data.items(),
+            key=lambda kv: -self._array_nbytes(kv[1]),
+        )
+        weights = [max(self._array_nbytes(v), 1) for _, v in items]
+        total_w = float(sum(weights)) * (
+            (1.0 if remove_tail > 0 else 0.0) + (1.0 if remove_head > 0 else 0.0)
+        )
+        if total_w <= 0:
+            total_w = 1.0
+        done_w = 0.0
+        n_keys = len(items)
+        pass_i = 0
+        n_passes = int(remove_tail > 0) + int(remove_head > 0)
+
+        def _run_remove(abs_start: int, abs_end: int, *, label: str) -> None:
+            nonlocal done_w, pass_i, expected_n
+            if abs_end <= abs_start:
+                return
+            pass_i += 1
+            for key_i, (key, value) in enumerate(items):
+                w = float(weights[key_i])
+
+                def _on_key_frac(
+                    frac,
+                    *,
+                    _key=key,
+                    _key_i=key_i,
+                    _w=w,
+                    _done=done_w,
+                    _label=label,
+                    _pass=pass_i,
+                ):
+                    if progress_cb is None:
+                        return
+                    overall = (_done + _w * float(frac)) / total_w
+                    pct = int(round(overall * 100))
+                    progress_cb(
+                        {
+                            "phase": "zarr",
+                            "key": str(_key),
+                            "key_i": int(_key_i) + 1,
+                            "n_keys": int(n_keys),
+                            "frac": float(overall),
+                            "message": (
+                                f"裁剪 ep{idx} · {_label} {_pass}/{n_passes} · "
+                                f"{_key} {_key_i + 1}/{n_keys} · {pct}%"
+                            ),
+                        }
+                    )
+
+                if progress_cb is not None:
+                    _on_key_frac(0.0)
+                self._remove_time_slice(
+                    value,
+                    abs_start,
+                    abs_end,
+                    expected_n=expected_n,
+                    is_zarr=is_zarr,
+                    progress_cb=_on_key_frac,
+                )
+                done_w += w
+
+            removed = int(abs_end - abs_start)
+            for i in range(idx, n):
+                ends[i] = int(ends[i]) - removed
+            expected_n -= removed
+
+        # 先删尾再删头，避免头删后尾部绝对下标错位
+        if remove_tail > 0:
+            _run_remove(
+                ep_start + end_local,
+                ep_end,
+                label="去尾",
+            )
+            ep_end = ep_start + end_local
+        if remove_head > 0:
+            _run_remove(
+                ep_start,
+                ep_start + remove_head,
+                label="去头",
+            )
+
+        if is_zarr:
+            if len(ends) > 0:
+                self.episode_ends[:] = ends
+        else:
+            self.episode_ends[:] = ends
+
+        if progress_cb is not None:
+            progress_cb(
+                {
+                    "phase": "zarr",
+                    "key": "(done)",
+                    "key_i": n_keys,
+                    "n_keys": n_keys,
+                    "frac": 1.0,
+                    "message": (
+                        f"已裁剪 ep{idx} → 保留 [{start_local},{end_local}) "
+                        f"共 {end_local - start_local} 步"
+                    ),
+                }
+            )
+
     def pop_episode(self):
         assert self.n_episodes > 0
         episode = self.get_episode(self.n_episodes - 1, copy=True)
