@@ -15,7 +15,8 @@ Still uses this repo's ZMQ/camera stack (not ROS2).
 Example (policy server must be started with ``--rtc``)::
 
 # 效果不错，很平滑。
-conda activate umi-arx 
+# C→S → data_local/kai0_eval/model_traj/replay_buffer.zarr（采集同款，无 videos）
+conda activate umi-arx
 python scripts/eval_arx5_kai0_bimanual_rtc_v2.py \
   --policy-ip 127.0.0.1 --policy-port 8000 \
   --robot-ports 8765,8766 --camera-reorder 0,1 \
@@ -24,8 +25,8 @@ python scripts/eval_arx5_kai0_bimanual_rtc_v2.py \
   --min-smooth-steps 10 --latency-k 8 \
   --dispatch tick \
   --gripper-close-threshold 0.03 \
-  --chunk-size 50
-
+  --chunk-size 50 \
+  --output data_local/kai0_eval
 
 ``--dispatch schedule`` (default): timed ZMQ waypoints via interpolator.
 ``--dispatch tick``: ROS-style immediate SET_JOINT_POSITION each control tick.
@@ -39,23 +40,33 @@ DAgger (``--dagger``)::
       --robot-ports 8765,8766 --camera-reorder 0,1 \\
       --frequency 20 --inference-rate 4 --dispatch tick \\
       --dagger --output data_local/kai0_dagger
+    # traj also under data_local/kai0_dagger/model_traj/
 
 Controls (--dagger): C=start episode+policy, D=drag intervene, R=resume policy,
   S=save episode then return to init, B=abort episode, Q=quit (aborts open episode).
 
 Live dashboard (default on): http://127.0.0.1:8090/  (--no-web to disable).
+
+Model trajectory dump (default on): each C→S episode appends to
+``{output}/model_traj/replay_buffer.zarr`` in collect-style layout
+(``timestamp``, ``action``, ``camera*_rgb``, robot joints, plus
+``buffer_act`` / ``ctrl_mode``). Raw infer chunks go to
+``model_traj/infer/episode_XXXX.npz``. No ``videos/`` (RGB is in zarr).
+Disable with ``--no-save-model-traj``; skip images with ``--no-save-traj-images``.
 """
 
 from __future__ import annotations
 
 from collections import deque
 import importlib.util
+import json
 from multiprocessing.managers import SharedMemoryManager
 import os
 from pathlib import Path
 import sys
 import threading
 import time
+from typing import Any
 
 import click
 import cv2
@@ -78,6 +89,7 @@ from modules.eval_kai0_web_ui import (  # noqa: E402
     obs_to_jpeg,
     start_eval_web_ui,
 )
+from modules.replay_buffer import ReplayBuffer  # noqa: E402
 from openpi_client.websocket_client_policy import WebsocketClientPolicy  # noqa: E402
 from utils.kai0_dagger_drag import abort_episode  # noqa: E402
 from utils.kai0_dagger_drag import enter_drag_mode  # noqa: E402
@@ -117,6 +129,289 @@ class _DelayTracker:
         median_rtt = float(np.median(np.asarray(self._buf, dtype=np.float64)))
         self.pred_delay_steps = int(max(0, round(median_rtt * float(control_hz))))
         return self.pred_delay_steps
+
+
+_CTRL_MODE_TO_U8 = {
+    "POLICY": np.uint8(0),
+    "DRAG": np.uint8(1),
+    "HOLD": np.uint8(2),
+    "EMPTY": np.uint8(3),
+}
+
+
+def _obs_cam_rgb(obs: dict, cam_index: int) -> np.ndarray:
+    """Latest RGB frame for camera{i} as uint8 HxWx3 (RGB)."""
+    key = f"camera{cam_index}_rgb"
+    if key not in obs:
+        return np.zeros((224, 224, 3), dtype=np.uint8)
+    frame = np.asarray(obs[key][-1])
+    if frame.dtype != np.uint8:
+        if np.issubdtype(frame.dtype, np.floating) and float(np.nanmax(frame)) <= 1.5:
+            frame = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
+        else:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+    if frame.ndim == 2:
+        frame = np.stack([frame, frame, frame], axis=-1)
+    elif frame.ndim == 3 and frame.shape[-1] == 1:
+        frame = np.repeat(frame, 3, axis=-1)
+    return np.ascontiguousarray(frame[..., :3])
+
+
+def _obs_timestamp(obs: dict | None) -> float:
+    if obs is None or "timestamp" not in obs:
+        return float(time.time())
+    ts = np.asarray(obs["timestamp"], dtype=np.float64).reshape(-1)
+    if ts.size == 0:
+        return float(time.time())
+    return float(ts[-1])
+
+
+class ModelTrajRecorder:
+    """Collect-style zarr dump (no videos/) + infer-chunk sidecar npz."""
+
+    def __init__(
+        self,
+        out_dir: Path,
+        *,
+        meta: dict[str, Any] | None = None,
+        enabled: bool = True,
+        save_images: bool = True,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.save_images = bool(save_images) and self.enabled
+        self.out_dir = Path(out_dir)
+        self.infer_dir = self.out_dir / "infer"
+        self.zarr_path = self.out_dir / "replay_buffer.zarr"
+        self.meta: dict[str, Any] = dict(meta or {})
+        self._lock = threading.Lock()
+        self._active = False
+        self._episode_id: int | None = None
+        self._t0 = 0.0
+        self._replay: ReplayBuffer | None = None
+        self._clear_buffers()
+        if self.enabled:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            self.infer_dir.mkdir(parents=True, exist_ok=True)
+            self._replay = ReplayBuffer.create_from_path(
+                zarr_path=str(self.zarr_path.resolve()), mode="a"
+            )
+            run_meta_path = self.out_dir / "run.meta.json"
+            if not run_meta_path.is_file():
+                run_meta_path.write_text(
+                    json.dumps(self.meta, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+
+    def _clear_buffers(self) -> None:
+        self._infer_t: list[float] = []
+        self._infer_id: list[int] = []
+        self._infer_rtt: list[float] = []
+        self._infer_delay: list[int] = []
+        self._infer_exec_h: list[int] = []
+        self._raw_chunks: list[np.ndarray] = []
+        self._timestamp: list[float] = []
+        self._ctrl_step: list[int] = []
+        self._state: list[np.ndarray] = []
+        self._buffer_act: list[np.ndarray] = []
+        self._action: list[np.ndarray] = []
+        self._ctrl_mode: list[np.uint8] = []
+        self._cam0: list[np.ndarray] = []
+        self._cam1: list[np.ndarray] = []
+        self._cam2: list[np.ndarray] = []
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def start_episode(self, episode_id: int | None = None) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self._clear_buffers()
+            self._active = True
+            self._t0 = time.time()
+            # Prefer next id in the traj zarr so numbering stays continuous.
+            if self._replay is not None:
+                self._episode_id = int(self._replay.n_episodes)
+            elif episode_id is None:
+                self._episode_id = 0
+            else:
+                self._episode_id = int(episode_id)
+
+    def record_infer(
+        self,
+        *,
+        actions: np.ndarray,
+        infer_id: int,
+        rtt_s: float,
+        delay_steps: int,
+        exec_h: int,
+        obs: dict | None = None,
+        t_mono: float | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        chunk = np.asarray(actions, dtype=np.float32)
+        t_wall = _obs_timestamp(obs) if obs is not None else float(time.time())
+        with self._lock:
+            if not self._active:
+                return
+            # Prefer wall/obs time for alignment with ctrl timestamps.
+            self._infer_t.append(
+                float(t_wall if t_mono is None else t_mono)
+            )
+            self._infer_id.append(int(infer_id))
+            self._infer_rtt.append(float(rtt_s))
+            self._infer_delay.append(int(delay_steps))
+            self._infer_exec_h.append(int(exec_h))
+            self._raw_chunks.append(chunk.copy())
+
+    def record_ctrl(
+        self,
+        *,
+        step: int,
+        state14: np.ndarray,
+        buffer_act14: np.ndarray,
+        guarded14: np.ndarray,
+        mode: str = "POLICY",
+        obs: dict | None = None,
+        t_mono: float | None = None,  # noqa: ARG002
+    ) -> None:
+        if not self.enabled:
+            return
+        # Copy image buffers outside the lock (get_obs may reuse arrays).
+        cam0 = cam1 = cam2 = None
+        if self.save_images and obs is not None:
+            cam0 = _obs_cam_rgb(obs, 0).copy()
+            cam1 = _obs_cam_rgb(obs, 1).copy()
+            cam2 = _obs_cam_rgb(obs, 2).copy()
+        ts = _obs_timestamp(obs)
+        with self._lock:
+            if not self._active:
+                return
+            self._timestamp.append(float(ts))
+            self._ctrl_step.append(int(step))
+            self._state.append(
+                np.asarray(state14, dtype=np.float32).reshape(ACTION_DIM).copy()
+            )
+            self._buffer_act.append(
+                np.asarray(buffer_act14, dtype=np.float32)
+                .reshape(ACTION_DIM)
+                .copy()
+            )
+            self._action.append(
+                np.asarray(guarded14, dtype=np.float32)
+                .reshape(ACTION_DIM)
+                .copy()
+            )
+            self._ctrl_mode.append(
+                _CTRL_MODE_TO_U8.get(str(mode).upper(), np.uint8(255))
+            )
+            if cam0 is not None and cam1 is not None and cam2 is not None:
+                self._cam0.append(cam0)
+                self._cam1.append(cam1)
+                self._cam2.append(cam2)
+
+    def discard_episode(self) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self._active = False
+            self._clear_buffers()
+            self._episode_id = None
+
+    def finish_episode(self) -> Path | None:
+        """Flush to collect-style zarr (+ infer sidecar). Returns zarr path."""
+        if not self.enabled or self._replay is None:
+            return None
+        with self._lock:
+            if not self._active:
+                return None
+            n_infer = len(self._raw_chunks)
+            n_ctrl = len(self._action)
+            if n_infer == 0 and n_ctrl == 0:
+                self._active = False
+                self._clear_buffers()
+                self._episode_id = None
+                return None
+
+            ep_id = int(
+                self._replay.n_episodes
+                if self._episode_id is None
+                else self._episode_id
+            )
+            meta = dict(self.meta)
+            meta.update(
+                {
+                    "episode_id": ep_id,
+                    "n_infer": n_infer,
+                    "n_ctrl": n_ctrl,
+                    "save_images": bool(self.save_images),
+                    "t_start": float(self._t0),
+                    "t_end": float(time.time()),
+                    "layout": "collect_zarr_no_video",
+                    "action_space": "joint14_guarded",
+                    "ctrl_mode": {
+                        "0": "POLICY",
+                        "1": "DRAG",
+                        "2": "HOLD",
+                        "3": "EMPTY",
+                    },
+                }
+            )
+
+            if n_ctrl > 0:
+                state = np.stack(self._state, axis=0)
+                episode: dict[str, np.ndarray] = {
+                    "timestamp": np.asarray(self._timestamp, dtype=np.float64),
+                    "action": np.stack(self._action, axis=0).astype(np.float32),
+                    "buffer_act": np.stack(self._buffer_act, axis=0).astype(
+                        np.float32
+                    ),
+                    "state": state,
+                    "ctrl_step": np.asarray(self._ctrl_step, dtype=np.int32),
+                    "ctrl_mode": np.asarray(self._ctrl_mode, dtype=np.uint8),
+                    # Collect-compatible joint views (from measured state14).
+                    "robot0_joint_pos": state[:, 0:6].astype(np.float32),
+                    "robot0_gripper_width": state[:, 6:7].astype(np.float32),
+                    "robot1_joint_pos": state[:, 7:13].astype(np.float32),
+                    "robot1_gripper_width": state[:, 13:14].astype(np.float32),
+                }
+                if self.save_images and len(self._cam0) == n_ctrl:
+                    episode["camera0_rgb"] = np.stack(self._cam0, axis=0)
+                    episode["camera1_rgb"] = np.stack(self._cam1, axis=0)
+                    episode["camera2_rgb"] = np.stack(self._cam2, axis=0)
+                self._replay.add_episode(episode, compressors="disk")
+                ep_id = int(self._replay.n_episodes - 1)
+                meta["episode_id"] = ep_id
+
+            if n_infer > 0:
+                raw_chunks = np.empty(n_infer, dtype=object)
+                for i, chunk in enumerate(self._raw_chunks):
+                    raw_chunks[i] = chunk
+                infer_path = self.infer_dir / f"episode_{ep_id:04d}.npz"
+                np.savez_compressed(
+                    infer_path,
+                    raw_chunks=raw_chunks,
+                    infer_t=np.asarray(self._infer_t, dtype=np.float64),
+                    infer_id=np.asarray(self._infer_id, dtype=np.int32),
+                    infer_rtt=np.asarray(self._infer_rtt, dtype=np.float64),
+                    infer_delay=np.asarray(self._infer_delay, dtype=np.int32),
+                    infer_exec_h=np.asarray(self._infer_exec_h, dtype=np.int32),
+                    meta_json=json.dumps(meta, ensure_ascii=False),
+                )
+                meta["infer_sidecar"] = str(infer_path.name)
+
+            meta_path = self.out_dir / f"episode_{ep_id:04d}.meta.json"
+            meta_path.write_text(
+                json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+            self._active = False
+            self._clear_buffers()
+            self._episode_id = None
+            return self.zarr_path
 
 
 def _tighten_grippers(
@@ -276,6 +571,7 @@ def run_rtc_v2(
     home_duration: float = 5.0,
     web_state: SharedEvalState | None = None,
     web_cmds: CommandQueue | None = None,
+    traj_recorder: ModelTrajRecorder | None = None,
 ) -> None:
     """Official-style: infer thread fills buffer; control pops 1 action / tick."""
     dt = 1.0 / float(frequency)
@@ -295,6 +591,9 @@ def run_rtc_v2(
     step_count = 0
     empty_streak = 0
     last_infer_log = 0.0
+    recorder = traj_recorder or ModelTrajRecorder(
+        Path("."), enabled=False
+    )
 
     def _hold() -> None:
         _v1.hold_current(env, immediate=use_immediate)
@@ -350,6 +649,14 @@ def run_rtc_v2(
                     min_m=int(min_smooth_steps),
                 )
                 infer_count += 1
+                recorder.record_infer(
+                    actions=actions,
+                    infer_id=infer_count,
+                    rtt_s=rtt,
+                    delay_steps=int(delay_tracker.pred_delay_steps),
+                    exec_h=exec_h,
+                    obs=obs,
+                )
                 now = time.monotonic()
                 if now - last_infer_log > 1.0:
                     last_infer_log = now
@@ -402,6 +709,8 @@ def run_rtc_v2(
         chunk_size = action_horizon
         exec_h = int(chunk_size if rtc_execute_horizon is None else rtc_execute_horizon)
         exec_h = max(1, min(exec_h, chunk_size))
+    recorder.meta["chunk_size"] = int(chunk_size)
+    recorder.meta["exec_h"] = int(exec_h)
 
     with prev_chunk_lock:
         rtc_prev_chunk = np.tile(
@@ -483,6 +792,10 @@ def run_rtc_v2(
                     executing = False
                     stop_event.set()
                     buffer.clear()
+                    if recorder.active:
+                        saved = recorder.finish_episode()
+                        if saved is not None:
+                            _log(f"[traj] saved {saved}")
                     if web_state is not None:
                         web_state.update(mode="HOME")
                     try:
@@ -504,6 +817,12 @@ def run_rtc_v2(
                     executing = False
                     buffer.clear()
                     last_commanded = None
+                    if recorder.active:
+                        saved = recorder.finish_episode()
+                        if saved is not None:
+                            _log(f"[traj] saved {saved}")
+                        else:
+                            _log("[traj] empty episode; nothing saved")
                     _hold()
                     _log(
                         "Policy stopped; holding measured joints "
@@ -549,6 +868,8 @@ def run_rtc_v2(
                     else:
                         executing = True
                         empty_streak = 0
+                        if not recorder.active:
+                            recorder.start_episode()
                         mode = "tick" if use_immediate else "schedule"
                         _log(
                             f"Policy execution started (RTC v2 async+buffer, "
@@ -579,10 +900,18 @@ def run_rtc_v2(
                 continue
 
             empty_streak = 0
+            try:
+                measured = _v1.measured_state(env)
+            except Exception:  # noqa: BLE001
+                measured = (
+                    last_commanded
+                    if last_commanded is not None
+                    else np.zeros(ACTION_DIM, dtype=np.float64)
+                )
             anchor = (
                 last_commanded
                 if last_commanded is not None
-                else _v1.measured_state(env)
+                else measured
             )
             guarded = _guard_one(
                 act,
@@ -607,6 +936,14 @@ def run_rtc_v2(
                 )
             last_commanded = guarded
             step_count += 1
+            recorder.record_ctrl(
+                step=step_count,
+                state14=measured,
+                buffer_act14=act,
+                guarded14=guarded,
+                mode="POLICY",
+                obs=obs,
+            )
             if step_count % 40 == 0:
                 print(
                     f"[v2/ctrl] step={step_count} buf={len(buffer)} "
@@ -619,6 +956,10 @@ def run_rtc_v2(
     finally:
         stop_event.set()
         infer_thread.join(timeout=2.0)
+        if recorder.active:
+            saved = recorder.finish_episode()
+            if saved is not None:
+                print(f"[traj] flushed on exit: {saved}", flush=True)
         print(
             f"[v2] session: steps={step_count} infers={infer_count} "
             f"last_delay={delay_tracker.pred_delay_steps}"
@@ -654,6 +995,7 @@ def run_dagger_v2(
     init_duration: float = 2.5,
     web_state: SharedEvalState | None = None,
     web_cmds: CommandQueue | None = None,
+    traj_recorder: ModelTrajRecorder | None = None,
 ) -> None:
     """RTC v2 async buffer + DAgger episode / drag intervene / UMI zarr."""
     dt = 1.0 / float(frequency)
@@ -686,6 +1028,9 @@ def run_dagger_v2(
     resume_hold_ticks = 12  # pure hold portion of soft window
     resume_post_soft_left = 0
     resume_post_soft_total = 12
+    recorder = traj_recorder or ModelTrajRecorder(
+        Path("."), enabled=False
+    )
 
     def _hold() -> None:
         _v1.hold_current(env, immediate=use_immediate)
@@ -817,6 +1162,14 @@ def run_dagger_v2(
                     min_m=int(min_smooth_steps),
                 )
                 infer_count += 1
+                recorder.record_infer(
+                    actions=actions,
+                    infer_id=infer_count,
+                    rtt_s=rtt,
+                    delay_steps=int(delay_tracker.pred_delay_steps),
+                    exec_h=exec_h,
+                    obs=obs,
+                )
                 now = time.monotonic()
                 if now - last_infer_log > 1.0:
                     last_infer_log = now
@@ -879,6 +1232,7 @@ def run_dagger_v2(
         resume_soft_left = int(resume_soft_total)
         resume_post_soft_left = int(resume_post_soft_total)
         executing = True
+        recorder.start_episode(episode_id=int(episode_id))
         _log(
             f"[DAgger] Episode {episode_id} started (policy, "
             f"soft={resume_soft_left})"
@@ -1011,6 +1365,7 @@ def run_dagger_v2(
         if n_acc == 0:
             _log("[DAgger] Empty episode; aborting instead of save")
             abort_episode(env)
+            recorder.discard_episode()
         else:
             env.end_episode()
             if env.replay_buffer.n_episodes > 0:
@@ -1024,6 +1379,9 @@ def run_dagger_v2(
                 _log(f"[DAgger] Saved episode {ep_id}")
             else:
                 _log("[DAgger] end_episode wrote nothing")
+            saved = recorder.finish_episode()
+            if saved is not None:
+                _log(f"[traj] saved {saved}")
         recording = False
         intervention_labels = []
         last_rotvecs = [None, None]
@@ -1042,6 +1400,7 @@ def run_dagger_v2(
             leave_drag_stay_pose(env)
             drag_mode = False
         abort_episode(env)
+        recorder.discard_episode()
         recording = False
         intervention_labels = []
         last_rotvecs = [None, None]
@@ -1062,6 +1421,7 @@ def run_dagger_v2(
         if recording:
             _log("[DAgger] Quit with active episode — aborting")
             abort_episode(env)
+            recorder.discard_episode()
             recording = False
         try:
             _hold()
@@ -1134,6 +1494,8 @@ def run_dagger_v2(
         chunk_size = action_horizon
         exec_h = int(chunk_size if rtc_execute_horizon is None else rtc_execute_horizon)
         exec_h = max(1, min(exec_h, chunk_size))
+    recorder.meta["chunk_size"] = int(chunk_size)
+    recorder.meta["exec_h"] = int(exec_h)
 
     with prev_chunk_lock:
         rtc_prev_chunk = np.tile(state.astype(np.float32)[None, :], (chunk_size, 1))
@@ -1196,6 +1558,19 @@ def run_dagger_v2(
             # Always record while episode is open (policy / drag / hold).
             if recording and (drag_mode or not executing):
                 _record_tick(obs)
+                try:
+                    measured = _v1.measured_state(env)
+                except Exception:  # noqa: BLE001
+                    measured = np.zeros(ACTION_DIM, dtype=np.float64)
+                step_count += 1
+                recorder.record_ctrl(
+                    step=step_count,
+                    state14=measured,
+                    buffer_act14=measured,
+                    guarded14=measured,
+                    mode="DRAG" if drag_mode else "HOLD",
+                    obs=obs,
+                )
                 t_loop += dt
                 precise_wait(t_loop)
                 continue
@@ -1226,6 +1601,7 @@ def run_dagger_v2(
                 per_arm = (step_lim, step_lim)
 
             act = buffer.pop_next_action()
+            ctrl_mode = "POLICY"
             if soft and per_arm is not None and max(per_arm) <= 0.0:
                 # Pure hold ticks after R: ignore policy targets.
                 try:
@@ -1236,6 +1612,8 @@ def run_dagger_v2(
                         if last_commanded is not None
                         else np.zeros(ACTION_DIM, dtype=np.float64)
                     )
+                act = np.asarray(guarded, dtype=np.float64)
+                ctrl_mode = "HOLD"
                 resume_soft_left -= 1
             elif act is None:
                 empty_streak += 1
@@ -1243,21 +1621,49 @@ def run_dagger_v2(
                     print(f"[dagger] buffer empty x{empty_streak}")
                 # Keep recording / holding pose while waiting for infer.
                 _record_tick(obs)
+                try:
+                    measured = _v1.measured_state(env)
+                except Exception:  # noqa: BLE001
+                    measured = (
+                        last_commanded
+                        if last_commanded is not None
+                        else np.zeros(ACTION_DIM, dtype=np.float64)
+                    )
                 if last_commanded is not None:
                     _dispatch_cmd(last_commanded)
+                step_count += 1
+                recorder.record_ctrl(
+                    step=step_count,
+                    state14=measured,
+                    buffer_act14=measured,
+                    guarded14=(
+                        last_commanded
+                        if last_commanded is not None
+                        else measured
+                    ),
+                    mode="EMPTY",
+                    obs=obs,
+                )
                 t_loop += dt
                 precise_wait(t_loop)
                 continue
             else:
                 empty_streak = 0
+                try:
+                    measured = _v1.measured_state(env)
+                except Exception:  # noqa: BLE001
+                    measured = (
+                        last_commanded
+                        if last_commanded is not None
+                        else np.zeros(ACTION_DIM, dtype=np.float64)
+                    )
                 anchor = (
                     last_commanded
                     if last_commanded is not None
-                    else _v1.measured_state(env)
+                    else measured
                 )
                 if soft and per_arm is not None and max(per_arm) > 0.0:
                     try:
-                        measured = _v1.measured_state(env)
                         if last_commanded is None or float(
                             np.max(np.abs(measured - anchor))
                         ) > 1e-3:
@@ -1281,10 +1687,23 @@ def run_dagger_v2(
                 elif post_soft:
                     resume_post_soft_left -= 1
 
+            try:
+                measured = _v1.measured_state(env)
+            except Exception:  # noqa: BLE001
+                measured = np.asarray(guarded, dtype=np.float64)
+
             _dispatch_cmd(guarded)
             last_commanded = np.asarray(guarded, dtype=np.float64)
             _record_tick(obs)
             step_count += 1
+            recorder.record_ctrl(
+                step=step_count,
+                state14=measured,
+                buffer_act14=act,
+                guarded14=guarded,
+                mode=ctrl_mode,
+                obs=obs,
+            )
             if step_count % 40 == 0:
                 print(
                     f"[dagger/ctrl] step={step_count} buf={len(buffer)} "
@@ -1306,6 +1725,7 @@ def run_dagger_v2(
                 abort_episode(env)
             except Exception:  # noqa: BLE001
                 pass
+            recorder.discard_episode()
         print(
             f"[dagger] session: steps={step_count} infers={infer_count} "
             f"last_delay={delay_tracker.pred_delay_steps}"
@@ -1470,6 +1890,24 @@ def run_dagger_v2(
     default=str(DEFAULT_RUN_LOG),
     show_default=True,
 )
+@click.option(
+    "--save-model-traj/--no-save-model-traj",
+    default=True,
+    show_default=True,
+    help=(
+        "Save collect-style traj zarr (timestamp/action/cameras/joints) under "
+        "{output}/model_traj/replay_buffer.zarr; infer chunks in model_traj/infer/."
+    ),
+)
+@click.option(
+    "--save-traj-images/--no-save-traj-images",
+    default=True,
+    show_default=True,
+    help=(
+        "With --save-model-traj, store per-tick camera0/1/2_rgb in the zarr "
+        "(no videos/ folder)."
+    ),
+)
 def main(
     policy_ip: str,
     policy_port: int,
@@ -1511,6 +1949,8 @@ def main(
     web_host: str,
     web_port: int,
     log_file: str,
+    save_model_traj: bool,  # noqa: FBT001
+    save_traj_images: bool,  # noqa: FBT001
 ) -> None:
     if frequency <= 0 or inference_rate <= 0 or max_joint_speed <= 0:
         raise click.BadParameter("frequency/inference-rate/max-joint-speed must be > 0")
@@ -1623,6 +2063,52 @@ def main(
     if dagger:
         print(f"[DAgger] UMI zarr output -> {output_path}")
 
+    traj_dir = output_path / "model_traj"
+    traj_meta = {
+        "prompt": prompt,
+        "frequency": float(frequency),
+        "inference_rate": float(inference_rate),
+        "chunk_size": int(chunk_size),
+        "rtc_execute_horizon": rtc_execute_horizon,
+        "latency_k": int(latency_k),
+        "min_smooth_steps": int(min_smooth_steps),
+        "smooth": "raw" if rtc_disable_smoothing else "temporal",
+        "dispatch": str(dispatch),
+        "rtc_max_guidance_weight": float(rtc_max_guidance_weight),
+        "rtc_mask_prefix_delay": bool(rtc_mask_prefix_delay),
+        "gripper_min": float(gripper_min),
+        "gripper_max": float(gripper_max),
+        "gripper_tighten": bool(gripper_tighten),
+        "gripper_close_threshold": float(gripper_close_threshold),
+        "gripper_grasp_width": float(gripper_grasp_width),
+        "max_joint_speed": float(max_joint_speed),
+        "dagger": bool(dagger),
+        "policy_ip": policy_ip,
+        "policy_port": int(policy_port),
+        "policy_metadata": {
+            k: (v if isinstance(v, (bool, int, float, str, type(None))) else str(v))
+            for k, v in dict(metadata).items()
+        },
+    }
+    traj_recorder = ModelTrajRecorder(
+        traj_dir,
+        meta=traj_meta,
+        enabled=bool(save_model_traj),
+        save_images=bool(save_traj_images),
+    )
+    if save_model_traj:
+        img_note = (
+            "rgb in zarr, no videos/"
+            if save_traj_images
+            else "images=off"
+        )
+        print(
+            f"[traj] model traj -> {traj_dir}/replay_buffer.zarr "
+            f"(C→S; {img_note}; infer sidecars in traj/infer/)"
+        )
+    else:
+        print("[traj] model traj disabled (--no-save-model-traj)")
+
     web_state: SharedEvalState | None = None
     web_cmds: CommandQueue | None = None
     web_server = None
@@ -1725,6 +2211,7 @@ def main(
                         output_dir=output_path,
                         init_q14=init_q14,
                         init_duration=float(init_duration),
+                        traj_recorder=traj_recorder,
                     )
                 else:
                     run_rtc_v2(
@@ -1733,6 +2220,7 @@ def main(
                         init_q14=init_q14,
                         init_duration=float(init_duration),
                         home_duration=float(home_duration),
+                        traj_recorder=traj_recorder,
                     )
             finally:
                 try:

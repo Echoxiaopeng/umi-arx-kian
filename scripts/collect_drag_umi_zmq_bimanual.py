@@ -50,7 +50,8 @@ D435 画面预处理（训练 / 推理必须一致）
     # 确保分别监听 8765 / 8766
 
 用法:
-    conda activate umi-arx   # 并确保: pip install pyrealsense2
+ # 并确保: pip install pyrealsense2
+    conda activate umi-arx  
     python scripts/collect_drag_umi_zmq_bimanual.py -o data/collect_bimanual --web
 
     # 拖拽手感默认 light（轻）；要防坠可 --drag_profile stable（与 DAgger 同档）

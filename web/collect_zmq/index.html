@@ -1194,8 +1194,9 @@
       }
       // 刚进入管理/数采页面时拉一次 episode 列表
       if (mode !== lastUiMode && (mode === "VIEW" || mode === "IDLE" || mode === "READY" || mode === "DRAG" || mode === "REC")) {
-        if (mode === "VIEW") {
-          // 切到管理页：清空当前选中，避免跨目录残留
+        // 仅从入口等非处理态切入管理页时清空选中；
+        // DELETING→VIEW（裁剪/删除完成）必须保留选定框，否则会忘了刚改的是哪条
+        if (mode === "VIEW" && lastUiMode !== "DELETING") {
           selectedEp = null;
           series = null;
           stopPlay();
@@ -1492,18 +1493,34 @@
 
       if (hubMode) return;
 
+      const deleting = mode === "DELETING" || !!s.deleting;
+      const trimEpOk =
+        selectedEp != null && selectedEp !== "live" && !deleting;
+
+      // 删除/裁剪结束：强制刷新列表并重选当前 episode（保留高亮）
+      if (lastDeleting && !deleting) {
+        const keepEp = selectedEp;
+        const msg = s.message || "处理完成";
+        pollStatus(true).then(() => {
+          setMsg(msg);
+          if (keepEp != null && keepEp !== "live") {
+            selectEpisode(Number(keepEp));
+          }
+        });
+      }
+      lastDeleting = deleting;
+
       if (viewerOnly) {
         $("btnDelete").disabled =
-          selectedEp === null ||
-          selectedEp === "live" ||
-          mode === "DELETING" ||
-          !!s.deleting;
+          selectedEp === null || selectedEp === "live" || deleting;
+        setTrimControlsEnabled(trimEpOk);
+        if ($("btnTrimIn")) $("btnTrimIn").disabled = !trimEpOk;
+        if ($("btnTrimOut")) $("btnTrimOut").disabled = !trimEpOk;
         return;
       }
 
       const rec = !!s.recording;
       const saving = mode === "SAVING";
-      const deleting = mode === "DELETING" || !!s.deleting;
       const replaying = mode === "REPLAY";
       const busy = saving || replaying || deleting;
       const drag = !!s.zero_force_active;
@@ -1526,8 +1543,6 @@
         if ($(id)) $(id).disabled = rec || busy;
       });
       $("btnDelete").disabled = selectedEp === null || selectedEp === "live" || busy;
-      const trimEpOk =
-        selectedEp != null && selectedEp !== "live" && !busy;
       setTrimControlsEnabled(trimEpOk);
       if ($("btnTrimIn")) $("btnTrimIn").disabled = !trimEpOk;
       if ($("btnTrimOut")) $("btnTrimOut").disabled = !trimEpOk;
@@ -1551,19 +1566,6 @@
         $("videoHeading").textContent = "Live preview";
       }
       lastRecording = rec;
-
-      // 删除/裁剪结束：强制刷新 episode 列表，并重载当前 episode
-      if (lastDeleting && !deleting) {
-        const keepEp = selectedEp;
-        const msg = s.message || "处理完成";
-        pollStatus(true).then(() => {
-          setMsg(msg);
-          if (keepEp != null && keepEp !== "live") {
-            selectEpisode(Number(keepEp));
-          }
-        });
-      }
-      lastDeleting = deleting;
 
       // 进入回放：自动 Follow LIVE，下方轨迹图随机械臂同步刷新
       if (replaying && !lastReplaying) {
@@ -1589,7 +1591,13 @@
       (episodes || []).slice().reverse().forEach((ep) => {
         const li = document.createElement("li");
         li.dataset.id = String(ep.id);
-        if (keep === ep.id) li.classList.add("active");
+        if (
+          keep != null &&
+          keep !== "live" &&
+          Number(keep) === Number(ep.id)
+        ) {
+          li.classList.add("active");
+        }
         const dur = ep.duration != null ? `${ep.duration.toFixed(1)}s` : "?s";
         li.innerHTML = `<strong>Ep ${ep.id}</strong><div class="meta">${ep.n_steps} steps · ${dur}${ep.has_video ? " · video" : ""}</div>`;
         li.onclick = () => selectEpisode(ep.id);
