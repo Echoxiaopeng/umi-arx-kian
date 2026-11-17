@@ -441,6 +441,28 @@ def _tighten_grippers(
     return out
 
 
+def _policy_anchor(
+    last_commanded: np.ndarray | None,
+    measured: np.ndarray,
+    *,
+    reanchor_thresh: float = 0.08,
+) -> tuple[np.ndarray, bool, float, float]:
+    """Choose guard anchor; re-pin to measured if tracking lag is large.
+
+    Using only ``last_commanded`` lets the client open-loop ratchet away from a
+    stuck/slow arm (cmd-meas → 0.2+), then the servo catches up in one rush.
+    """
+    measured = np.asarray(measured, dtype=np.float64).reshape(ACTION_DIM)
+    if last_commanded is None:
+        return measured, False, 0.0, 0.0
+    last = np.asarray(last_commanded, dtype=np.float64).reshape(ACTION_DIM)
+    lag_l = float(np.max(np.abs(last[0:6] - measured[0:6])))
+    lag_r = float(np.max(np.abs(last[7:13] - measured[7:13])))
+    if max(lag_l, lag_r) >= float(reanchor_thresh):
+        return measured, True, lag_l, lag_r
+    return last, False, lag_l, lag_r
+
+
 def _guard_one(
     action: np.ndarray,
     current: np.ndarray,
@@ -909,11 +931,15 @@ def run_rtc_v2(
                     if last_commanded is not None
                     else np.zeros(ACTION_DIM, dtype=np.float64)
                 )
-            anchor = (
-                last_commanded
-                if last_commanded is not None
-                else measured
+            anchor, reanchored, lag_l, lag_r = _policy_anchor(
+                last_commanded, measured, reanchor_thresh=0.08
             )
+            if reanchored:
+                print(
+                    f"[v2/WARN] reanchor to measured step={step_count} "
+                    f"lag L={lag_l:.4f} R={lag_r:.4f}",
+                    flush=True,
+                )
             guarded = _guard_one(
                 act,
                 anchor,
@@ -1024,11 +1050,22 @@ def run_dagger_v2(
     empty_streak = 0
     last_infer_log = 0.0
     # Soft resume after drag→policy (R) / after return-to-init→C.
+    # Longer / gentler than before: logs showed soft-hold itself was fine, but
+    # right after exit the first chunk chased mid-trajectory targets at nearly
+    # full max_joint_step → felt like a rush on C.
     resume_soft_left = 0
-    resume_soft_total = 28  # ~1.4s at 20 Hz
-    resume_hold_ticks = 12  # pure hold portion of soft window
+    resume_soft_total = 40  # ~2.0s at 20 Hz
+    resume_hold_ticks = 16  # pure hold portion of soft window
     resume_post_soft_left = 0
-    resume_post_soft_total = 12
+    resume_post_soft_total = 40  # ~2.0s taper (caps at ~0.55× max step)
+    # True while pure-hold ticks run; on exit we flush buffer so we do not
+    # start mid-chunk (popping during hold used to cause a C/R rush).
+    soft_pure_hold_active = False
+    # Jump / tracking warn thresholds (rad); tuned for overcurrent forensics.
+    _warn_cmd_step = max(0.12, float(max_joint_step) * 1.5)
+    _warn_track_err = 0.20
+    _warn_guard_sat = max(1e-4, float(max_joint_step) * 0.9)
+    _last_jump_warn_t = 0.0
     recorder = traj_recorder or ModelTrajRecorder(
         Path("."), enabled=False
     )
@@ -1040,6 +1077,124 @@ def run_dagger_v2(
         print(msg, flush=True)
         if web_state is not None:
             web_state.append_log(msg)
+
+    def _safe_measured() -> np.ndarray | None:
+        try:
+            return np.asarray(_v1.measured_state(env), dtype=np.float64)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _seed_buffer_anchor(state: np.ndarray | None = None) -> None:
+        """After clear(), keep last_action so the next chunk blends from pose.
+
+        Empty-buffer integrate without last_action installs the chunk raw and
+        the first executable step can be far from measured (C-onset rush).
+        """
+        q = state if state is not None else _safe_measured()
+        if q is None:
+            return
+        buffer.last_action = np.asarray(q, dtype=np.float64).copy()
+
+    def _post_soft_step_limit(batches_left: int) -> float:
+        """Gentler than v1: 0.05→0.55 of max_joint_step (not 0.20→1.00)."""
+        total = max(1, int(resume_post_soft_total))
+        left = max(0, int(batches_left))
+        done = total - left
+        t = float(np.clip(done / float(total), 0.0, 1.0))
+        return float(max_joint_step) * (0.05 + 0.50 * t)
+
+    def _arm_max_abs(delta: np.ndarray) -> tuple[float, float]:
+        d = np.asarray(delta, dtype=np.float64).reshape(-1)
+        if d.size < ACTION_DIM:
+            return float(np.max(np.abs(d))) if d.size else 0.0, 0.0
+        return float(np.max(np.abs(d[0:6]))), float(np.max(np.abs(d[7:13])))
+
+    def _diag_snapshot(tag: str, **named: np.ndarray | None) -> None:
+        """One-line pose dump for mode transitions (measured / cmd / act)."""
+        parts = [f"[DAgger/diag] {tag} step={step_count} buf={len(buffer)}"]
+        measured = named.get("measured")
+        if measured is None:
+            measured = _safe_measured()
+        if measured is not None:
+            parts.append(f"meas={_v1._fmt14(measured)}")
+        for key in ("last_cmd", "act", "guarded", "anchor"):
+            arr = named.get(key)
+            if arr is None:
+                continue
+            parts.append(f"{key}={_v1._fmt14(arr)}")
+        # Pairwise arm-max |Δ| for the most useful contrasts.
+        pairs = (
+            ("cmd-meas", named.get("last_cmd"), measured),
+            ("act-meas", named.get("act"), measured),
+            ("grd-meas", named.get("guarded"), measured),
+            ("grd-cmd", named.get("guarded"), named.get("last_cmd")),
+            ("act-grd", named.get("act"), named.get("guarded")),
+            ("act-anc", named.get("act"), named.get("anchor")),
+        )
+        for label, a, b in pairs:
+            if a is None or b is None:
+                continue
+            l_m, r_m = _arm_max_abs(np.asarray(a) - np.asarray(b))
+            parts.append(f"|{label}| L={l_m:.4f} R={r_m:.4f}")
+        _log(" ".join(parts))
+
+    def _warn_if_jump(
+        tag: str,
+        *,
+        prev_cmd: np.ndarray | None,
+        new_cmd: np.ndarray,
+        measured: np.ndarray | None,
+        raw_act: np.ndarray | None = None,
+        min_interval_s: float = 0.2,
+    ) -> None:
+        """Rate-limited WARN when cmd step or tracking looks dangerous."""
+        nonlocal _last_jump_warn_t
+        new_cmd = np.asarray(new_cmd, dtype=np.float64)
+        reasons: list[str] = []
+        if prev_cmd is not None:
+            l_m, r_m = _arm_max_abs(new_cmd - np.asarray(prev_cmd))
+            step = max(l_m, r_m)
+            if step >= _warn_cmd_step:
+                reasons.append(f"cmd_step L={l_m:.4f} R={r_m:.4f}")
+        if measured is not None:
+            l_m, r_m = _arm_max_abs(new_cmd - np.asarray(measured))
+            track = max(l_m, r_m)
+            if track >= _warn_track_err:
+                reasons.append(f"cmd-meas L={l_m:.4f} R={r_m:.4f}")
+            if prev_cmd is not None:
+                l_m, r_m = _arm_max_abs(
+                    np.asarray(prev_cmd) - np.asarray(measured)
+                )
+                if max(l_m, r_m) >= _warn_track_err:
+                    reasons.append(f"track_lag L={l_m:.4f} R={r_m:.4f}")
+        if raw_act is not None and prev_cmd is not None:
+            # How hard the guard clipped this tick.
+            guarded_delta = new_cmd - np.asarray(prev_cmd)
+            raw_delta = np.asarray(raw_act) - np.asarray(prev_cmd)
+            # Compare requested vs allowed step magnitude per arm.
+            for arm, sl in (("L", slice(0, 6)), ("R", slice(7, 13))):
+                req = float(np.max(np.abs(raw_delta[sl])))
+                got = float(np.max(np.abs(guarded_delta[sl])))
+                if req >= _warn_guard_sat and (req - got) > 1e-4:
+                    reasons.append(f"guard_sat_{arm} req={req:.4f} got={got:.4f}")
+        if not reasons:
+            return
+        now = time.monotonic()
+        if now - _last_jump_warn_t < float(min_interval_s):
+            return
+        _last_jump_warn_t = now
+        _log(
+            f"[DAgger/WARN] {tag} step={step_count} "
+            + " ".join(reasons)
+            + f" lim_step={_warn_cmd_step:.3f} lim_track={_warn_track_err:.3f}"
+        )
+        _diag_snapshot(
+            f"WARN:{tag}",
+            measured=measured,
+            last_cmd=prev_cmd,
+            act=raw_act,
+            guarded=new_cmd,
+        )
 
     def _flush_keys() -> None:
         """Drop buffered terminal/web keys (e.g. C pressed during return-to-init)."""
@@ -1055,11 +1210,27 @@ def run_dagger_v2(
 
     def _invalidate_policy_stream() -> None:
         """Stop accepting new cmds; drop buffer + any in-flight infer chunk."""
-        nonlocal executing, action_epoch, last_commanded
+        nonlocal executing, action_epoch, last_commanded, soft_pure_hold_active
+        nonlocal resume_soft_left, resume_post_soft_left
+        was_exec = bool(executing)
+        prev = (
+            None
+            if last_commanded is None
+            else np.asarray(last_commanded, dtype=np.float64).copy()
+        )
         executing = False
         action_epoch += 1
         buffer.clear()
         last_commanded = None
+        soft_pure_hold_active = False
+        resume_soft_left = 0
+        resume_post_soft_left = 0
+        if was_exec:
+            _diag_snapshot(
+                f"invalidate_policy epoch={action_epoch}",
+                measured=_safe_measured(),
+                last_cmd=prev,
+            )
 
     def _get_obs_state() -> tuple[dict, np.ndarray]:
         obs = env.get_obs()
@@ -1174,10 +1345,15 @@ def run_dagger_v2(
                 now = time.monotonic()
                 if now - last_infer_log > 1.0:
                     last_infer_log = now
+                    first = np.asarray(actions[0], dtype=np.float64)
+                    d_l, d_r = _arm_max_abs(first - np.asarray(state))
                     print(
                         f"[dagger/infer] #{infer_count} rtt={rtt:.3f}s "
                         f"delay={delay_tracker.pred_delay_steps} "
-                        f"buf={len(buffer)} first={np.round(actions[0], 3)}"
+                        f"buf={len(buffer)} "
+                        f"|first-state| L={d_l:.4f} R={d_r:.4f} "
+                        f"first={_v1._fmt14(first)}",
+                        flush=True,
                     )
             except Exception as exc:  # noqa: BLE001
                 print(f"[dagger/infer] error: {exc}")
@@ -1191,29 +1367,49 @@ def run_dagger_v2(
     def _start_episode() -> None:
         nonlocal recording, drag_mode, executing, intervention_labels, last_rotvecs
         nonlocal last_commanded, empty_streak, resume_soft_left, resume_post_soft_left
+        nonlocal soft_pure_hold_active
         if motion_busy:
             _log("[DAgger] Ignore C: still returning to init")
             return
         if recording:
             if drag_mode:
                 _log("Already recording in drag; press R to resume policy")
+            elif executing:
+                # Mid-episode C while already in POLICY used to re-arm soft-hold
+                # and snap cmd→measured (caused ~1 rad / 50 ms overcurrent).
+                _log("Already in POLICY; ignore C (D=drag, S=save)")
+                _diag_snapshot(
+                    "ignore_C_while_POLICY",
+                    measured=_safe_measured(),
+                    last_cmd=last_commanded,
+                )
             else:
+                prev_cmd = (
+                    None
+                    if last_commanded is None
+                    else np.asarray(last_commanded, dtype=np.float64).copy()
+                )
                 executing = True
                 empty_streak = 0
                 buffer.clear()
                 _reseed_prev_from_state()
-                # Soft onset when re-enabling policy mid-episode.
-                resume_soft_left = int(resume_soft_total)
-                resume_post_soft_left = int(resume_post_soft_total)
+                # Same as non-dagger: no soft-hold on C (standstill onset caused
+                # chase-of-future-waypoints rush). Soft remains for R after drag.
+                resume_soft_left = 0
+                resume_post_soft_left = 0
+                soft_pure_hold_active = False
                 try:
                     last_commanded = np.asarray(
                         _v1.measured_state(env), dtype=np.float64
                     )
                 except Exception:  # noqa: BLE001
                     last_commanded = None
-                _log(
-                    f"Policy execution resumed "
-                    f"(soft={resume_soft_left})"
+                _seed_buffer_anchor(last_commanded)
+                _log("Policy execution resumed from HOLD (no soft; like eval C)")
+                _diag_snapshot(
+                    "C_resume_from_HOLD",
+                    measured=last_commanded,
+                    last_cmd=prev_cmd,
                 )
             return
         episode_id = env.replay_buffer.n_episodes
@@ -1229,14 +1425,22 @@ def run_dagger_v2(
             last_commanded = np.asarray(_v1.measured_state(env), dtype=np.float64)
         except Exception:  # noqa: BLE001
             last_commanded = None
-        # Gentle onset so a buffered-C / post-init start cannot dump a jump.
-        resume_soft_left = int(resume_soft_total)
-        resume_post_soft_left = int(resume_post_soft_total)
+        _seed_buffer_anchor(last_commanded)
+        # Match non-dagger eval C: start from actions[0] immediately.
+        # Soft-hold on C made us stand still then chase a future waypoint.
+        resume_soft_left = 0
+        resume_post_soft_left = 0
+        soft_pure_hold_active = False
         executing = True
         recorder.start_episode(episode_id=int(episode_id))
         _log(
-            f"[DAgger] Episode {episode_id} started (policy, "
-            f"soft={resume_soft_left})"
+            f"[DAgger] Episode {episode_id} started (policy, no soft on C; "
+            f"soft only after R)"
+        )
+        _diag_snapshot(
+            f"C_start_ep{episode_id}",
+            measured=last_commanded,
+            last_cmd=last_commanded,
         )
 
     def _enter_drag() -> None:
@@ -1250,14 +1454,21 @@ def run_dagger_v2(
         if drag_mode:
             _log("Already in drag mode")
             return
+        _diag_snapshot(
+            "D_enter_before_stop",
+            measured=_safe_measured(),
+            last_cmd=last_commanded,
+        )
         _stop_policy_motion()
         enter_drag_mode(env)
         drag_mode = True
         _log("[DAgger] Drag intervention ON (R=resume, S=save, B=abort)")
+        _diag_snapshot("D_enter_after", measured=_safe_measured())
 
     def _resume_policy() -> None:
         nonlocal drag_mode, executing, last_commanded
         nonlocal resume_soft_left, resume_post_soft_left, empty_streak
+        nonlocal soft_pure_hold_active
         if motion_busy:
             _log("[DAgger] Ignore R: still returning to init")
             return
@@ -1267,6 +1478,7 @@ def run_dagger_v2(
         if not drag_mode:
             _log("Not in drag mode")
             return
+        _diag_snapshot("R_before_leave_drag", measured=_safe_measured())
         leave_drag_stay_pose(env)
         drag_mode = False
         try:
@@ -1281,14 +1493,21 @@ def run_dagger_v2(
         state = _v1.measured_state(env)
         last_commanded = np.asarray(state, dtype=np.float64).copy()
         buffer.clear()
+        _seed_buffer_anchor(last_commanded)
         _reseed_prev_from_state()
         resume_soft_left = int(resume_soft_total)
         resume_post_soft_left = int(resume_post_soft_total)
+        soft_pure_hold_active = False
         empty_streak = 0
         executing = True
         _log(
             f"[DAgger] Resumed policy (soft={resume_soft_left} "
-            f"post={resume_post_soft_left})"
+            f"hold={resume_hold_ticks} post={resume_post_soft_left})"
+        )
+        _diag_snapshot(
+            "R_resume_policy",
+            measured=last_commanded,
+            last_cmd=last_commanded,
         )
 
     def _return_to_init(*, reason: str) -> None:
@@ -1305,6 +1524,15 @@ def run_dagger_v2(
         _log(
             f"[DAgger] Returning to init after {reason}... "
             "(ignore C until finished)"
+        )
+        _diag_snapshot(
+            f"return_init_before:{reason}",
+            measured=_safe_measured(),
+            last_cmd=(
+                None
+                if init_q14 is None
+                else np.asarray(init_q14, dtype=np.float64)
+            ),
         )
         if web_state is not None:
             web_state.update(mode="INIT")
@@ -1330,8 +1558,17 @@ def run_dagger_v2(
             buffer.clear()
             _reseed_prev_from_state()
             _log("[DAgger] At init; press C to start next episode")
+            _diag_snapshot(
+                f"return_init_after:{reason}",
+                measured=last_commanded,
+                last_cmd=np.asarray(init_q14, dtype=np.float64),
+            )
         except Exception as exc:  # noqa: BLE001
             _log(f"[DAgger] return-to-init failed: {exc}")
+            _diag_snapshot(
+                f"return_init_FAILED:{reason}",
+                measured=_safe_measured(),
+            )
             try:
                 _hold()
             except Exception:  # noqa: BLE001
@@ -1452,9 +1689,13 @@ def run_dagger_v2(
             jpeg=obs_to_jpeg(obs),
         )
 
-    def _dispatch_cmd(guarded: np.ndarray) -> None:
+    def _dispatch_cmd(
+        guarded: np.ndarray, *, duration_s: float | None = None
+    ) -> None:
         if use_immediate:
-            _v1.command_joint_immediate(env, guarded, duration_s=dt)
+            # duration_s=0 → snap-hold (soft-hold / freeze). Default = one ctrl dt.
+            dur = float(dt if duration_s is None else duration_s)
+            _v1.command_joint_immediate(env, guarded, duration_s=dur)
         else:
             target_t = max(time.time() + 0.02, t_loop + 0.02)
             _v1.command_joint_actions(
@@ -1594,17 +1835,26 @@ def run_dagger_v2(
                 )
                 step_lim = max(per_arm) if max(per_arm) > 0 else 1e-6
             elif post_soft:
-                step_lim = _v1.resume_post_soft_step_limit(
-                    max_joint_step,
-                    resume_post_soft_left,
-                    total_batches=resume_post_soft_total,
-                )
+                step_lim = _post_soft_step_limit(resume_post_soft_left)
                 per_arm = (step_lim, step_lim)
 
-            act = buffer.pop_next_action()
+            pure_hold = soft and per_arm is not None and max(per_arm) <= 0.0
             ctrl_mode = "POLICY"
-            if soft and per_arm is not None and max(per_arm) <= 0.0:
-                # Pure hold ticks after R: ignore policy targets.
+            # Avoid gripper snap-shut during onset (felt like a jerk with arm move).
+            tighten_now = bool(gripper_tighten) and not (soft or post_soft)
+            prev_cmd_for_warn = (
+                None
+                if last_commanded is None
+                else np.asarray(last_commanded, dtype=np.float64).copy()
+            )
+            dispatch_duration: float | None = None
+
+            if pure_hold:
+                # Hold still — do NOT pop the buffer. Popping here discarded
+                # actions[0..N] near the current pose and left mid-chunk
+                # targets, which caused a rush when soft-hold ended.
+                entering_soft_hold = not soft_pure_hold_active
+                soft_pure_hold_active = True
                 try:
                     guarded = _v1.measured_state(env)
                 except Exception:  # noqa: BLE001
@@ -1615,40 +1865,83 @@ def run_dagger_v2(
                     )
                 act = np.asarray(guarded, dtype=np.float64)
                 ctrl_mode = "HOLD"
-                resume_soft_left -= 1
-            elif act is None:
-                empty_streak += 1
-                if empty_streak in {1, 20, 50} or empty_streak % 100 == 0:
-                    print(f"[dagger] buffer empty x{empty_streak}")
-                # Keep recording / holding pose while waiting for infer.
-                _record_tick(obs)
-                try:
-                    measured = _v1.measured_state(env)
-                except Exception:  # noqa: BLE001
-                    measured = (
-                        last_commanded
-                        if last_commanded is not None
-                        else np.zeros(ACTION_DIM, dtype=np.float64)
+                # Snap-hold: freeze interpolator at measured (no 50ms drive).
+                dispatch_duration = 0.0
+                if entering_soft_hold:
+                    _diag_snapshot(
+                        "soft_hold_enter",
+                        measured=act,
+                        last_cmd=prev_cmd_for_warn,
+                        guarded=act,
                     )
-                if last_commanded is not None:
-                    _dispatch_cmd(last_commanded)
-                step_count += 1
-                recorder.record_ctrl(
-                    step=step_count,
-                    state14=measured,
-                    buffer_act14=measured,
-                    guarded14=(
-                        last_commanded
-                        if last_commanded is not None
-                        else measured
-                    ),
-                    mode="EMPTY",
-                    obs=obs,
-                )
-                t_loop += dt
-                precise_wait(t_loop)
-                continue
+                    _warn_if_jump(
+                        "soft_hold_enter",
+                        prev_cmd=prev_cmd_for_warn,
+                        new_cmd=act,
+                        measured=act,
+                        min_interval_s=0.0,
+                    )
+                resume_soft_left -= 1
             else:
+                if soft_pure_hold_active:
+                    # Just left pure hold: drop any chunk that aged while we
+                    # stood still, reseed RTC, discard in-flight infer.
+                    soft_pure_hold_active = False
+                    action_epoch += 1
+                    meas_flush = _safe_measured()
+                    buffer.clear()
+                    _seed_buffer_anchor(meas_flush)
+                    _reseed_prev_from_state()
+                    empty_streak = 0
+                    _log(
+                        "[DAgger] soft-hold done; flushed buffer + reseed "
+                        "+ anchor (blend next chunk from measured)"
+                    )
+                    _diag_snapshot(
+                        "soft_hold_exit_flush",
+                        measured=meas_flush,
+                        last_cmd=prev_cmd_for_warn,
+                    )
+                act = buffer.pop_next_action()
+                if act is None:
+                    empty_streak += 1
+                    if empty_streak in {1, 20, 50} or empty_streak % 100 == 0:
+                        print(f"[dagger] buffer empty x{empty_streak}")
+                    # Keep recording / holding pose while waiting for infer.
+                    _record_tick(obs)
+                    try:
+                        measured = _v1.measured_state(env)
+                    except Exception:  # noqa: BLE001
+                        measured = (
+                            last_commanded
+                            if last_commanded is not None
+                            else np.zeros(ACTION_DIM, dtype=np.float64)
+                        )
+                    if last_commanded is not None:
+                        _warn_if_jump(
+                            "empty_hold",
+                            prev_cmd=prev_cmd_for_warn,
+                            new_cmd=last_commanded,
+                            measured=measured,
+                        )
+                        _dispatch_cmd(last_commanded, duration_s=0.0)
+                    step_count += 1
+                    recorder.record_ctrl(
+                        step=step_count,
+                        state14=measured,
+                        buffer_act14=measured,
+                        guarded14=(
+                            last_commanded
+                            if last_commanded is not None
+                            else measured
+                        ),
+                        mode="EMPTY",
+                        obs=obs,
+                    )
+                    t_loop += dt
+                    precise_wait(t_loop)
+                    continue
+
                 empty_streak = 0
                 try:
                     measured = _v1.measured_state(env)
@@ -1658,20 +1951,38 @@ def run_dagger_v2(
                         if last_commanded is not None
                         else np.zeros(ACTION_DIM, dtype=np.float64)
                     )
-                anchor = (
-                    last_commanded
-                    if last_commanded is not None
-                    else measured
+                anchor, reanchored, lag_l, lag_r = _policy_anchor(
+                    last_commanded, measured, reanchor_thresh=0.08
                 )
                 if soft and per_arm is not None and max(per_arm) > 0.0:
+                    # Soft ease-in: always prefer measured if we drifted.
                     try:
                         if last_commanded is None or float(
                             np.max(np.abs(measured - anchor))
                         ) > 1e-3:
                             anchor = measured
-                            last_commanded = np.asarray(measured, dtype=np.float64)
+                            last_commanded = np.asarray(
+                                measured, dtype=np.float64
+                            )
+                            reanchored = False
                     except Exception:  # noqa: BLE001
                         pass
+                if reanchored:
+                    now_ra = time.monotonic()
+                    if now_ra - _last_jump_warn_t >= 0.2:
+                        _last_jump_warn_t = now_ra
+                        _log(
+                            f"[DAgger/WARN] reanchor to measured "
+                            f"step={step_count} lag L={lag_l:.4f} "
+                            f"R={lag_r:.4f} (prevent open-loop cmd ratchet)"
+                        )
+                        _diag_snapshot(
+                            "reanchor",
+                            measured=measured,
+                            last_cmd=prev_cmd_for_warn,
+                            act=act,
+                            anchor=anchor,
+                        )
                 guarded = _guard_one(
                     act,
                     anchor,
@@ -1680,7 +1991,7 @@ def run_dagger_v2(
                     gripper_max=gripper_max,
                     gripper_close_threshold=gripper_close_threshold,
                     gripper_grasp_width=gripper_grasp_width,
-                    gripper_tighten=gripper_tighten,
+                    gripper_tighten=tighten_now,
                     max_joint_step_per_arm=per_arm,
                 )
                 if soft:
@@ -1693,7 +2004,14 @@ def run_dagger_v2(
             except Exception:  # noqa: BLE001
                 measured = np.asarray(guarded, dtype=np.float64)
 
-            _dispatch_cmd(guarded)
+            _warn_if_jump(
+                f"dispatch:{ctrl_mode}",
+                prev_cmd=prev_cmd_for_warn,
+                new_cmd=guarded,
+                measured=measured,
+                raw_act=None if ctrl_mode == "HOLD" else act,
+            )
+            _dispatch_cmd(guarded, duration_s=dispatch_duration)
             last_commanded = np.asarray(guarded, dtype=np.float64)
             _record_tick(obs)
             step_count += 1
@@ -1706,10 +2024,22 @@ def run_dagger_v2(
                 obs=obs,
             )
             if step_count % 40 == 0:
+                track_l = track_r = step_l = step_r = float("nan")
+                if measured is not None and last_commanded is not None:
+                    track_l, track_r = _arm_max_abs(last_commanded - measured)
+                if prev_cmd_for_warn is not None:
+                    step_l, step_r = _arm_max_abs(
+                        np.asarray(guarded) - prev_cmd_for_warn
+                    )
                 print(
                     f"[dagger/ctrl] step={step_count} buf={len(buffer)} "
                     f"delay={delay_tracker.pred_delay_steps} "
-                    f"infers={infer_count} soft={resume_soft_left}"
+                    f"infers={infer_count} soft={resume_soft_left} "
+                    f"mode={ctrl_mode} "
+                    f"dcmd L={step_l:.4f} R={step_r:.4f} "
+                    f"track L={track_l:.4f} R={track_r:.4f} "
+                    f"cmd={_v1._fmt14(guarded)}",
+                    flush=True,
                 )
             t_loop += dt
             precise_wait(t_loop)
