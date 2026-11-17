@@ -35,11 +35,12 @@ Controls: C=start, S=stop/hold, Enter=return to init (after stop), Q=home then q
 
 DAgger (``--dagger``)::
 
-    python scripts/eval_arx5_kai0_bimanual_rtc_v2.py \\
-      --policy-ip 127.0.0.1 --policy-port 8000 \\
-      --robot-ports 8765,8766 --camera-reorder 0,1 \\
-      --frequency 20 --inference-rate 4 --dispatch tick \\
-      --dagger --output data_local/kai0_dagger
+    python scripts/eval_arx5_kai0_bimanual_rtc_v2.py \
+      --policy-ip 127.0.0.1 --policy-port 8000 \
+      --robot-ports 8765,8766 --camera-reorder 0,1 \
+      --frequency 20 --inference-rate 4 --dispatch tick \
+      --dagger --output /media/lenovo/data/kian/kai0_dagger
+
     # traj also under data_local/kai0_dagger/model_traj/
 
 Controls (--dagger): C=start episode+policy, D=drag intervene, R=resume policy,

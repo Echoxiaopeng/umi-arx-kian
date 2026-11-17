@@ -79,6 +79,8 @@ D435 画面预处理（训练 / 推理必须一致）
 数据管理（网页 VIEW / --viewer_only / hub「数据管理」）:
   回看 scrub、删除 episode；可用「标起点 / 标终点 / 应用裁剪」自由裁切
   已保存 episode（改写 zarr + videos + 可选 intervention sidecar）。
+  支持打开 LeRobot v2.1（meta/info.json）并原地裁剪 parquet/视频；
+  zarr 页可「转换为 LeRobot」（默认旁路 {dir}_lerobot，带进度）。
   快捷键: [ = 标起点, ] = 标终点, T = 应用裁剪。
   若目录含 intervention/（DAgger），可一键拆出人工示教（去首尾静止）与纯模型
   子集到旁边的 {name}_human / {name}_policy（也可用 scripts/extract_dagger_split.py）。
@@ -995,6 +997,12 @@ def schedule_delete_episode(
         if web_state is not None:
             web_state.update(message="尚未加载数据目录")
         return False
+    if getattr(env, "dataset_format", "zarr") == "lerobot":
+        msg = "LeRobot 模式暂不支持删除 episode（可用裁剪）"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
     if not _DELETE_LOCK.acquire(blocking=False):
         msg = "正在删除中，请等当前删除完成后再操作"
         print(msg)
@@ -1297,7 +1305,45 @@ def trim_saved_episode(
     end: int,
     progress_cb=None,
 ) -> bool:
-    """裁剪已保存 episode：保留本地半开区间 [start, end)。同步改 zarr / 视频 / intervention。"""
+    """裁剪已保存 episode：保留本地半开区间 [start, end)。
+
+    zarr：改 replay_buffer + videos + intervention。
+    LeRobot：改 parquet + 三路 mp4 + meta。
+    """
+    fmt = getattr(env, "dataset_format", "zarr")
+    if fmt == "lerobot":
+        from modules.lerobot_dataset_io import trim_lerobot_episode
+
+        rb = env.replay_buffer
+        if not getattr(rb, "has_episode", lambda _e: False)(episode_id):
+            print(f"Episode {episode_id} does not exist (lerobot).")
+            return False
+        sl = rb.get_episode_slice(episode_id)
+        n_steps = int(sl.stop - sl.start)
+        start = int(start)
+        end = int(end)
+        if start < 0 or end > n_steps or start >= end:
+            print(
+                f"Invalid trim range [{start}, {end}) for ep{episode_id} T={n_steps}"
+            )
+            return False
+        print(
+            f"Trimming lerobot episode {episode_id}: keep [{start}, {end}) "
+            f"({end - start}/{n_steps} steps)…"
+        )
+        ok = bool(
+            trim_lerobot_episode(
+                Path(env.output_dir),
+                int(episode_id),
+                start,
+                end,
+                progress_cb=progress_cb,
+            )
+        )
+        if ok and hasattr(rb, "refresh"):
+            rb.refresh()
+        return ok
+
     n_episodes = env.replay_buffer.n_episodes
     if n_episodes <= 0:
         print("No saved episode to trim.")
@@ -1388,12 +1434,16 @@ def schedule_trim_episode(
     try:
         n_episodes = int(env.replay_buffer.n_episodes)
         eid = int(episode_id)
+        fmt = getattr(env, "dataset_format", "zarr")
+        if fmt == "lerobot":
+            if n_episodes <= 0 or not env.replay_buffer.has_episode(eid):
+                raise IndexError(f"invalid episode_id {eid}")
+        elif n_episodes <= 0 or eid < 0 or eid >= n_episodes:
+            raise IndexError(f"invalid episode_id {eid}")
         sl = env.replay_buffer.get_episode_slice(eid)
         n_steps = int(sl.stop - sl.start)
         start_i = int(start)
         end_i = int(end)
-        if n_episodes <= 0 or eid < 0 or eid >= n_episodes:
-            raise IndexError(f"invalid episode_id {eid}")
         if start_i < 0 or end_i > n_steps or start_i >= end_i:
             raise ValueError(
                 f"invalid trim range [{start_i}, {end_i}) for T={n_steps}"
@@ -2479,6 +2529,8 @@ def begin_replay_live_series(
 class OfflineDatasetEnv:
     """仅打开已有 replay_buffer.zarr + videos，不启臂 / 相机。"""
 
+    dataset_format = "zarr"
+
     def __init__(self, output_dir: str | Path):
         self.output_dir = Path(output_dir)
         self.video_dir = self.output_dir / "videos"
@@ -2502,21 +2554,35 @@ def resolve_dataset_dir(path: str | Path) -> Path:
     return p
 
 
-def open_offline_dataset(path: str | Path) -> OfflineDatasetEnv:
-    """打开含 replay_buffer.zarr 的数据目录；失败抛 FileNotFoundError / OSError。"""
+def open_offline_dataset(path: str | Path):
+    """打开 zarr 或 LeRobot 数据目录；失败抛 FileNotFoundError / OSError。"""
+    from modules.lerobot_dataset_io import (
+        OfflineLerobotEnv,
+        detect_dataset_format,
+    )
+
     out = resolve_dataset_dir(path)
     if not out.is_dir():
         raise FileNotFoundError(f"目录不存在: {out}")
-    env = OfflineDatasetEnv(out)
-    try:
-        check_episode_alignment(env)
-    except RuntimeError as exc:
-        print(f"[dataset] alignment warning ({out}): {exc}")
-    return env
+    fmt = detect_dataset_format(out)
+    if fmt == "lerobot":
+        env = OfflineLerobotEnv(out)
+        print(f"[dataset] opened lerobot {out} ({env.replay_buffer.n_episodes} eps)")
+        return env
+    if fmt == "zarr":
+        env = OfflineDatasetEnv(out)
+        try:
+            check_episode_alignment(env)
+        except RuntimeError as exc:
+            print(f"[dataset] alignment warning ({out}): {exc}")
+        return env
+    raise FileNotFoundError(
+        f"未识别的数据目录（需要 replay_buffer.zarr 或 meta/info.json）: {out}"
+    )
 
 
-def apply_manage_dataset(web_state, env: OfflineDatasetEnv, *, message: str = "") -> None:
-    """把数据管理页切到给定 OfflineDatasetEnv。"""
+def apply_manage_dataset(web_state, env, *, message: str = "") -> None:
+    """把数据管理页切到给定 OfflineDatasetEnv / OfflineLerobotEnv。"""
     from utils.dagger_extract import inspect_intervention
 
     web_state.env = env
@@ -2525,12 +2591,16 @@ def apply_manage_dataset(web_state, env: OfflineDatasetEnv, *, message: str = ""
     if hasattr(web_state, "clear_live_series"):
         web_state.clear_live_series()
     n_ep = int(env.replay_buffer.n_episodes)
-    try:
-        dagger_stats = inspect_intervention(env.output_dir)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[dataset] intervention inspect failed: {exc}")
-        dagger_stats = {"has_intervention": False, "error": str(exc)}
-    has_inter = bool(dagger_stats.get("has_intervention"))
+    fmt = str(getattr(env, "dataset_format", "zarr") or "zarr")
+    has_inter = False
+    dagger_stats: dict = {"has_intervention": False}
+    if fmt == "zarr":
+        try:
+            dagger_stats = inspect_intervention(env.output_dir)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[dataset] intervention inspect failed: {exc}")
+            dagger_stats = {"has_intervention": False, "error": str(exc)}
+        has_inter = bool(dagger_stats.get("has_intervention"))
     extra = ""
     if has_inter:
         extra = (
@@ -2538,6 +2608,7 @@ def apply_manage_dataset(web_state, env: OfflineDatasetEnv, *, message: str = ""
             f"（human_eps={dagger_stats.get('n_human_eps', '?')}"
             f" policy={dagger_stats.get('n_policy_only', '?')}）"
         )
+    fmt_tag = " · LeRobot" if fmt == "lerobot" else " · zarr"
     web_state.update(
         mode="VIEW",
         viewer_only=True,
@@ -2549,8 +2620,9 @@ def apply_manage_dataset(web_state, env: OfflineDatasetEnv, *, message: str = ""
         t_elapsed=0.0,
         has_intervention=has_inter,
         dagger_stats=dagger_stats,
+        dataset_format=fmt,
         message=message
-        or f"已加载 {env.output_dir} · {n_ep} episodes{extra}",
+        or f"已加载 {env.output_dir} · {n_ep} episodes{fmt_tag}{extra}",
     )
 
 
@@ -2569,7 +2641,11 @@ def handle_load_dataset_cmd(web_state, cmd: dict, *, default_output: str) -> boo
         print(f"[dataset] load failed: {exc}")
         return False
     apply_manage_dataset(web_state, env)
-    print(f"[dataset] loaded {env.output_dir} ({env.replay_buffer.n_episodes} eps)")
+    print(
+        f"[dataset] loaded {env.output_dir} "
+        f"({env.replay_buffer.n_episodes} eps, "
+        f"{getattr(env, 'dataset_format', 'zarr')})"
+    )
     return True
 
 
@@ -2749,6 +2825,192 @@ def handle_dagger_split_web_cmd(
     return False
 
 
+def schedule_convert_to_lerobot(
+    src_dir: str | Path,
+    *,
+    out_dir: str | Path,
+    fps: int = 20,
+    prompt: str = "Flatten and fold the cloth.",
+    overwrite: bool = False,
+    web_state=None,
+    done_mode: str = "VIEW",
+) -> bool:
+    """后台把当前 zarr 数据集转成 LeRobot；完成后自动加载输出目录。"""
+    from modules.convert_zarr_bimanual_to_lerobot import (
+        convert_one_zarr,
+        find_zarr,
+    )
+
+    src = Path(src_dir).expanduser().resolve()
+    dst = Path(out_dir).expanduser().resolve()
+    try:
+        zpath = find_zarr(src)
+    except FileNotFoundError as exc:
+        msg = str(exc)
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+
+    if not _DELETE_LOCK.acquire(blocking=False):
+        msg = "正在处理数据（删除/裁剪/转换），请稍候…"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+
+    if web_state is not None:
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            delete_pending=None,
+            delete_progress={
+                "phase": "convert",
+                "frac": 0.0,
+                "message": f"转换为 LeRobot → {dst}…",
+            },
+            message=f"转换为 LeRobot → {dst}…",
+        )
+
+    def _on_progress(info: dict) -> None:
+        if web_state is None or not isinstance(info, dict):
+            return
+        payload = dict(info)
+        msg = str(payload.get("message") or "转换中…")
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            delete_progress=payload,
+            message=msg,
+        )
+
+    def _worker() -> None:
+        ok = False
+        err = ""
+        n_eps = 0
+        n_frames = 0
+        try:
+            print(
+                f"[convert-lerobot] {zpath} → {dst} "
+                f"fps={fps} overwrite={overwrite}"
+            )
+            n_eps, n_frames = convert_one_zarr(
+                zpath,
+                dst,
+                prompt=str(prompt),
+                fps=int(fps),
+                overwrite=bool(overwrite),
+                progress_cb=_on_progress,
+            )
+            ok = True
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            print(f"[convert-lerobot] failed: {exc}")
+            ok = False
+        finally:
+            if web_state is not None:
+                if ok:
+                    try:
+                        env = open_offline_dataset(dst)
+                        apply_manage_dataset(
+                            web_state,
+                            env,
+                            message=(
+                                f"已转换为 LeRobot · {n_eps} ep / {n_frames} frames "
+                                f"→ {dst}"
+                            ),
+                        )
+                        web_state.update(
+                            deleting=False,
+                            delete_pending=None,
+                            delete_progress=None,
+                        )
+                    except Exception as load_exc:  # noqa: BLE001
+                        web_state.update(
+                            mode=done_mode,
+                            deleting=False,
+                            delete_pending=None,
+                            delete_progress=None,
+                            message=(
+                                f"转换完成但加载失败: {load_exc} · 输出在 {dst}"
+                            ),
+                        )
+                else:
+                    web_state.update(
+                        mode=done_mode,
+                        deleting=False,
+                        delete_pending=None,
+                        delete_progress=None,
+                        message=f"转换失败: {err}" if err else "转换失败",
+                    )
+            _DELETE_LOCK.release()
+
+    threading.Thread(
+        target=_worker, name="convert-lerobot", daemon=True
+    ).start()
+    return True
+
+
+def handle_convert_lerobot_web_cmd(
+    web_state,
+    cmd: dict,
+    *,
+    done_mode: str = "VIEW",
+) -> bool:
+    """处理 convert_lerobot_request / convert_lerobot_confirm。"""
+    from modules.convert_zarr_bimanual_to_lerobot import default_lerobot_out_dir
+
+    action = cmd.get("action")
+    env = web_state.env if web_state is not None else None
+    if env is None:
+        if web_state is not None:
+            web_state.update(message="尚未加载数据目录")
+        return False
+    if getattr(env, "dataset_format", "zarr") != "zarr":
+        if web_state is not None:
+            web_state.update(message="当前已是 LeRobot，无需再转换")
+        return False
+    src = Path(env.output_dir)
+
+    if action == "convert_lerobot_request":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+        out_raw = cmd.get("out_dir") or str(default_lerobot_out_dir(src))
+        if web_state is not None:
+            web_state.update(
+                message=f"confirm convert to LeRobot → {out_raw}",
+            )
+        print(f"Confirm convert {src} → LeRobot {out_raw}? (web Yes)")
+        return True
+
+    if action == "convert_lerobot_confirm":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+        out_raw = cmd.get("out_dir") or str(default_lerobot_out_dir(src))
+        try:
+            fps = int(cmd.get("fps", 20))
+        except (TypeError, ValueError):
+            fps = 20
+        prompt = str(cmd.get("prompt") or "Flatten and fold the cloth.")
+        overwrite = bool(cmd.get("overwrite", False))
+        return bool(
+            schedule_convert_to_lerobot(
+                src,
+                out_dir=out_raw,
+                fps=fps,
+                prompt=prompt,
+                overwrite=overwrite,
+                web_state=web_state,
+                done_mode=done_mode,
+            )
+        )
+    return False
+
+
 def handle_trim_web_cmd(
     web_state,
     cmd: dict,
@@ -2778,12 +3040,20 @@ def handle_trim_web_cmd(
             if web_state is not None:
                 web_state.update(message="裁剪参数无效（需要 episode_id/start/end）")
             return False
-        n = int(env.replay_buffer.n_episodes)
-        if eid < 0 or eid >= n:
-            if web_state is not None:
-                web_state.update(message=f"invalid episode_id {eid}")
-            return False
-        sl = env.replay_buffer.get_episode_slice(eid)
+        fmt = getattr(env, "dataset_format", "zarr")
+        rb = env.replay_buffer
+        if fmt == "lerobot":
+            if not getattr(rb, "has_episode", lambda _e: False)(eid):
+                if web_state is not None:
+                    web_state.update(message=f"invalid episode_id {eid}")
+                return False
+        else:
+            n = int(rb.n_episodes)
+            if eid < 0 or eid >= n:
+                if web_state is not None:
+                    web_state.update(message=f"invalid episode_id {eid}")
+                return False
+        sl = rb.get_episode_slice(eid)
         T = int(sl.stop - sl.start)
         if start < 0 or end > T or start >= end:
             if web_state is not None:
@@ -2924,6 +3194,11 @@ def run_viewer_only(
                     if env is None:
                         web_state.update(message="尚未加载数据目录")
                         continue
+                    if getattr(env, "dataset_format", "zarr") == "lerobot":
+                        web_state.update(
+                            message="LeRobot 模式暂不支持删除 episode（可用裁剪）"
+                        )
+                        continue
                     eid = cmd.get("episode_id")
                     n = int(env.replay_buffer.n_episodes)
                     if eid is None or int(eid) < 0 or int(eid) >= n:
@@ -2937,6 +3212,11 @@ def run_viewer_only(
                 if action == "delete_confirm":
                     env = web_state.env
                     if env is None:
+                        continue
+                    if getattr(env, "dataset_format", "zarr") == "lerobot":
+                        web_state.update(
+                            message="LeRobot 模式暂不支持删除 episode"
+                        )
                         continue
                     eid = cmd.get("episode_id", web_state.delete_pending)
                     if eid is not None:
@@ -2955,6 +3235,14 @@ def run_viewer_only(
                     continue
                 if action in ("dagger_split_request", "dagger_split_confirm"):
                     handle_dagger_split_web_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
+                if action in (
+                    "convert_lerobot_request",
+                    "convert_lerobot_confirm",
+                ):
+                    handle_convert_lerobot_web_cmd(
                         web_state, cmd, done_mode="VIEW"
                     )
                     continue
@@ -3205,6 +3493,11 @@ def run_web_hub(
                     if env is None:
                         web_state.update(message="尚未加载数据目录")
                         continue
+                    if getattr(env, "dataset_format", "zarr") == "lerobot":
+                        web_state.update(
+                            message="LeRobot 模式暂不支持删除 episode（可用裁剪）"
+                        )
+                        continue
                     eid = cmd.get("episode_id")
                     n = int(env.replay_buffer.n_episodes)
                     if eid is None or int(eid) < 0 or int(eid) >= n:
@@ -3218,6 +3511,11 @@ def run_web_hub(
                 if action == "delete_confirm":
                     env = web_state.env
                     if env is None:
+                        continue
+                    if getattr(env, "dataset_format", "zarr") == "lerobot":
+                        web_state.update(
+                            message="LeRobot 模式暂不支持删除 episode"
+                        )
                         continue
                     eid = cmd.get("episode_id", web_state.delete_pending)
                     if eid is not None:
@@ -3236,6 +3534,14 @@ def run_web_hub(
                     continue
                 if action in ("dagger_split_request", "dagger_split_confirm"):
                     handle_dagger_split_web_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
+                if action in (
+                    "convert_lerobot_request",
+                    "convert_lerobot_confirm",
+                ):
+                    handle_convert_lerobot_web_cmd(
                         web_state, cmd, done_mode="VIEW"
                     )
                     continue
@@ -4061,6 +4367,18 @@ def run_collect_session(
                             "dagger_split_confirm",
                         ):
                             handle_dagger_split_web_cmd(
+                                web_state,
+                                cmd,
+                                done_mode=(
+                                    "READY" if no_zero_force else "IDLE"
+                                ),
+                            )
+                            continue
+                        if action in (
+                            "convert_lerobot_request",
+                            "convert_lerobot_confirm",
+                        ):
+                            handle_convert_lerobot_web_cmd(
                                 web_state,
                                 cmd,
                                 done_mode=(

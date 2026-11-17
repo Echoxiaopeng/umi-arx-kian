@@ -62,8 +62,11 @@ def list_fs_dir(path: str | Path | None = None) -> dict:
         # zarr 组目录无需再点进去浏览
         if name.endswith(".zarr"):
             continue
-        # 跳过明显的大数据/缓存目录名里的 zarr 本体：仍可进入，但标成数据集
-        is_dataset = (child / "replay_buffer.zarr").exists()
+        # zarr (replay_buffer.zarr) 或 LeRobot (meta/info.json)
+        from modules.lerobot_dataset_io import detect_dataset_format
+
+        fmt = detect_dataset_format(child)
+        is_dataset = fmt is not None
         n_children = None
         try:
             n_children = sum(
@@ -80,15 +83,19 @@ def list_fs_dir(path: str | Path | None = None) -> dict:
                 "name": name,
                 "path": str(child),
                 "is_dataset": bool(is_dataset),
+                "dataset_format": fmt,
                 "n_children": n_children,
             }
         )
 
-    is_dataset = (target / "replay_buffer.zarr").exists()
+    from modules.lerobot_dataset_io import detect_dataset_format
+
+    fmt_self = detect_dataset_format(target)
     return {
         "path": str(target),
         "parent": str(parent) if parent is not None else None,
-        "is_dataset": bool(is_dataset),
+        "is_dataset": fmt_self is not None,
+        "dataset_format": fmt_self,
         "repo_root": str(_REPO_ROOT),
         "entries": entries,
     }
@@ -151,6 +158,8 @@ class SharedCollectState:
         # DAgger：当前目录是否含 intervention/ sidecar
         self.has_intervention: bool = False
         self.dagger_stats: Optional[dict] = None
+        # zarr | lerobot | ""
+        self.dataset_format: str = ""
         self._jpeg: bytes = b""
         self._live_series: list[dict] = []
         self.logs: list[str] = []
@@ -256,6 +265,11 @@ class SharedCollectState:
                     dict(self.dagger_stats)
                     if isinstance(getattr(self, "dagger_stats", None), dict)
                     else None
+                ),
+                "dataset_format": str(
+                    getattr(self, "dataset_format", "")
+                    or getattr(getattr(self, "env", None), "dataset_format", "")
+                    or ""
                 ),
                 "output_dir": str(out_dir) if out_dir is not None else "",
                 "repo_root": str(_REPO_ROOT),
@@ -505,6 +519,12 @@ def episode_series_from_buffer(
 
 
 def list_episodes(env) -> list[dict]:
+    fmt = getattr(env, "dataset_format", "zarr")
+    if fmt == "lerobot":
+        from modules.lerobot_dataset_io import list_lerobot_episodes
+
+        return list_lerobot_episodes(Path(env.output_dir))
+
     rb = env.replay_buffer
     n = int(rb.n_episodes)
     video_dir = Path(env.video_dir)
@@ -533,6 +553,20 @@ def list_episodes(env) -> list[dict]:
     return out
 
 
+def episode_series(env, episode_id: int, *, max_points: int = 2000) -> dict:
+    """Episode time-series for the chart (zarr or LeRobot)."""
+    fmt = getattr(env, "dataset_format", "zarr")
+    if fmt == "lerobot":
+        from modules.lerobot_dataset_io import episode_series_lerobot
+
+        return episode_series_lerobot(
+            Path(env.output_dir), int(episode_id), max_points=max_points
+        )
+    return episode_series_from_buffer(
+        env.replay_buffer, int(episode_id), max_points=max_points
+    )
+
+
 def _open_episode_video(env, episode_id: int) -> Optional[cv2.VideoCapture]:
     vdir = Path(env.video_dir) / str(episode_id)
     if not vdir.is_dir():
@@ -556,8 +590,17 @@ def episode_frame_jpeg(
     取 episode 某一帧 JPEG。
 
     优先 zarr 相机（与训练数据一致）；失败再回退 mp4。
-    返回 (jpeg_bytes, meta)，meta 含 source=zarr|mp4 与可选 warning。
+    LeRobot：从三路 mp4 拼条带。
+    返回 (jpeg_bytes, meta)，meta 含 source=zarr|mp4|lerobot_mp4 与可选 warning。
     """
+    fmt = getattr(env, "dataset_format", "zarr")
+    if fmt == "lerobot":
+        from modules.lerobot_dataset_io import episode_frame_jpeg_lerobot
+
+        return episode_frame_jpeg_lerobot(
+            Path(env.output_dir), int(episode_id), int(index), quality=quality
+        )
+
     n_ep = int(env.replay_buffer.n_episodes)
     if episode_id < 0 or episode_id >= n_ep:
         raise IndexError(f"episode {episode_id} out of range")
@@ -754,6 +797,11 @@ class CollectWebServer:
                                 snap["n_episodes"] = int(
                                     state.env.replay_buffer.n_episodes
                                 )
+                                snap["dataset_format"] = str(
+                                    getattr(state.env, "dataset_format", "")
+                                    or snap.get("dataset_format")
+                                    or ""
+                                )
                                 if include_eps:
                                     snap["episodes"] = list_episodes(state.env)
                             except Exception as exc:  # noqa: BLE001
@@ -827,14 +875,16 @@ class CollectWebServer:
                         eid = int(parts[2])
                         max_points = int(qs.get("max_points", ["2000"])[0])
                         try:
-                            data = episode_series_from_buffer(
-                                state.env.replay_buffer,
+                            data = episode_series(
+                                state.env,
                                 eid,
                                 max_points=max_points,
                             )
                             self._send_json(200, data)
                         except IndexError as exc:
                             self._send_json(404, {"error": str(exc)})
+                        except Exception as exc:  # noqa: BLE001
+                            self._send_json(500, {"error": str(exc)})
                         return
 
                     if (

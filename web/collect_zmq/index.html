@@ -112,6 +112,58 @@
     body.viewer-mode #viewerOnlyBar {
       flex: 0 0 auto;
     }
+    .fold-box {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border);
+    }
+    .fold-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      margin: 0;
+      padding: 4px 2px;
+      border: none;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+      border-radius: 6px;
+    }
+    .fold-toggle:hover {
+      background: rgba(255, 255, 255, 0.04);
+    }
+    .fold-chevron {
+      display: inline-block;
+      width: 1em;
+      color: var(--muted);
+      transition: transform 0.15s ease;
+      flex: 0 0 auto;
+    }
+    .fold-box.open .fold-chevron {
+      transform: rotate(90deg);
+    }
+    .fold-toggle strong {
+      font-size: 0.9rem;
+      flex: 0 0 auto;
+    }
+    .fold-toggle .msg {
+      margin: 0;
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .fold-body {
+      display: none;
+      padding-top: 6px;
+    }
+    .fold-box.open .fold-body {
+      display: block;
+    }
     @media (max-width: 960px) {
       .row.top {
         flex: 0 0 auto;
@@ -803,6 +855,7 @@
       <h2>数据管理</h2>
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
         <span id="modeBadgeView" class="badge VIEW">VIEW<span class="badge-sub">数据管理</span></span>
+        <span id="datasetFormatBadge" class="badge" style="display:none">zarr</span>
         <span style="color:var(--muted);font-size:0.85rem">
           saved: <strong id="nEpisodesView">0</strong> · no robot / camera
         </span>
@@ -819,31 +872,63 @@
         <button id="btnBrowseDataset" type="button" class="primary">浏览文件夹…</button>
         <button id="btnResetDataset" type="button" title="回到启动时的 -o 目录">默认目录</button>
       </div>
-      <div id="daggerSplitBox" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
-        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px">
-          <strong style="font-size:0.9rem">DAgger 拆分</strong>
-          <span class="msg" id="daggerStatsLabel" style="margin:0">—</span>
+      <div id="daggerSplitBox" class="fold-box" style="display:none">
+        <button type="button" class="fold-toggle" id="daggerFoldToggle" aria-expanded="false" title="展开 / 折叠">
+          <span class="fold-chevron">▸</span>
+          <strong>DAgger 拆分</strong>
+          <span class="msg" id="daggerStatsLabel">—</span>
+        </button>
+        <div class="fold-body" id="daggerFoldBody">
+          <div class="path-row" style="margin-top:4px">
+            <label>人工示教</label>
+            <input id="daggerHumanOut" type="text" style="flex:1;min-width:180px" placeholder="{dir}_human" />
+          </div>
+          <div class="path-row" style="margin-top:4px">
+            <label>纯模型</label>
+            <input id="daggerPolicyOut" type="text" style="flex:1;min-width:180px" placeholder="{dir}_policy" />
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px">
+            <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
+              <input id="daggerOverwrite" type="checkbox" /> 覆盖已有输出
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
+              <input id="daggerTrimStill" type="checkbox" checked /> 去掉人工段开头静止
+            </label>
+          </div>
+          <div class="btns" style="margin-top:8px;flex-wrap:wrap">
+            <button id="btnDaggerHuman" type="button" class="ok" title="提取 intervention=1 段并去静止">提取人工示教</button>
+            <button id="btnDaggerPolicy" type="button" title="提取整条全是模型输出的 episode">提取纯模型</button>
+            <button id="btnDaggerBoth" type="button" class="primary" title="两者都提取到旁边目录">全部拆分</button>
+          </div>
         </div>
-        <div class="path-row" style="margin-top:4px">
-          <label>人工示教</label>
-          <input id="daggerHumanOut" type="text" style="flex:1;min-width:180px" placeholder="{dir}_human" />
-        </div>
-        <div class="path-row" style="margin-top:4px">
-          <label>纯模型</label>
-          <input id="daggerPolicyOut" type="text" style="flex:1;min-width:180px" placeholder="{dir}_policy" />
-        </div>
-        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px">
-          <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
-            <input id="daggerOverwrite" type="checkbox" /> 覆盖已有输出
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
-            <input id="daggerTrimStill" type="checkbox" checked /> 去掉人工段开头静止
-          </label>
-        </div>
-        <div class="btns" style="margin-top:8px;flex-wrap:wrap">
-          <button id="btnDaggerHuman" type="button" class="ok" title="提取 intervention=1 段并去静止">提取人工示教</button>
-          <button id="btnDaggerPolicy" type="button" title="提取整条全是模型输出的 episode">提取纯模型</button>
-          <button id="btnDaggerBoth" type="button" class="primary" title="两者都提取到旁边目录">全部拆分</button>
+      </div>
+      <div id="convertLerobotBox" class="fold-box" style="display:none">
+        <button type="button" class="fold-toggle" id="convertLerobotFoldToggle" aria-expanded="false" title="展开 / 折叠">
+          <span class="fold-chevron">▸</span>
+          <strong>转换为 LeRobot</strong>
+          <span class="msg" id="convertLerobotHint">关节 state/action + 三路 224 视频</span>
+        </button>
+        <div class="fold-body" id="convertLerobotFoldBody">
+          <div class="path-row" style="margin-top:4px">
+            <label>输出目录</label>
+            <input id="convertLerobotOut" type="text" style="flex:1;min-width:180px" placeholder="{dir}_lerobot" />
+          </div>
+          <div class="path-row" style="margin-top:4px">
+            <label>prompt</label>
+            <input id="convertLerobotPrompt" type="text" style="flex:1;min-width:180px" value="Flatten and fold the cloth." />
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px">
+            <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
+              fps
+              <input id="convertLerobotFps" type="number" min="1" max="120" value="20" style="width:64px" />
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
+              <input id="convertLerobotOverwrite" type="checkbox" /> 覆盖已有输出
+            </label>
+          </div>
+          <div class="btns" style="margin-top:8px;flex-wrap:wrap">
+            <button id="btnConvertLerobot" type="button" class="primary" title="把当前 zarr 转成 LeRobot v2.1">转换为 LeRobot</button>
+          </div>
         </div>
       </div>
     </div>
@@ -855,6 +940,17 @@
         <div class="btns">
           <button id="daggerYes" class="ok">确认拆分</button>
           <button id="daggerNo">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-bg" id="convertLerobotModal">
+      <div class="modal">
+        <h3>转换为 LeRobot？</h3>
+        <p id="convertLerobotText">将把当前 zarr 写成 LeRobot 数据集。</p>
+        <div class="btns">
+          <button id="convertLerobotYes" class="ok">确认转换</button>
+          <button id="convertLerobotNo">取消</button>
         </div>
       </div>
     </div>
@@ -873,7 +969,7 @@
             <button id="btnTrimIn" type="button" disabled title="把当前 scrub 帧标为保留起点（含）">标起点 [</button>
             <button id="btnTrimOut" type="button" disabled title="把当前 scrub 帧标为保留终点（含）">标终点 ]</button>
             <button id="btnTrimClear" type="button" disabled title="清除裁剪标记">清除</button>
-            <button id="btnTrimApply" type="button" class="ok" disabled title="裁掉标记外的头尾，原地改 zarr/视频">应用裁剪</button>
+            <button id="btnTrimApply" type="button" class="ok" disabled title="裁掉标记外的头尾，原地改 zarr 或 LeRobot parquet/视频">应用裁剪</button>
           </div>
           <div class="msg" id="trimRangeLabel" style="margin-top:4px">裁剪范围：未标记</div>
         </div>
@@ -936,7 +1032,7 @@
   <div class="modal-bg" id="fsModal">
     <div class="modal fs-modal">
       <h3>选择数据文件夹</h3>
-      <p class="fs-hint">单击进入子文件夹（像资源管理器）。含 replay_buffer.zarr 的目录会标「数据集」，点「打开此数据集」加载。</p>
+      <p class="fs-hint">单击进入子文件夹（像资源管理器）。含 replay_buffer.zarr 或 LeRobot meta/info.json 的目录会标「数据集」，点「打开此数据集」加载。</p>
       <div class="fs-toolbar">
         <button type="button" id="fsUp" title="上级目录">↑ 上级</button>
         <button type="button" id="fsHome" title="仓库根目录">仓库根</button>
@@ -969,6 +1065,7 @@
     let trimOut = null;
     let pendingTrim = null; // {episode_id, start, end}
     let pendingDagger = null; // {what, human_out, policy_out, overwrite, trim_still}
+    let pendingConvert = null; // {out_dir, fps, prompt, overwrite}
     let lastDeleting = false;
     let lastUiMode = "";
     let lastOutputDir = "";
@@ -1213,6 +1310,77 @@
       return { human: p + "_human", policy: p + "_policy" };
     }
 
+    function defaultLerobotOutPath(srcPath) {
+      const p = String(srcPath || "").replace(/\/+$/, "");
+      if (!p) return "";
+      return p + "_lerobot";
+    }
+
+    function syncDatasetFormatBadge(s) {
+      const el = $("datasetFormatBadge");
+      if (!el) return;
+      const fmt = String((s && s.dataset_format) || "");
+      if (!fmt || hubMode) {
+        el.style.display = "none";
+        return;
+      }
+      el.style.display = "";
+      el.textContent = fmt;
+      el.className = "badge " + (fmt === "lerobot" ? "READY" : "VIEW");
+    }
+
+    function syncConvertLerobotUi(s) {
+      const box = $("convertLerobotBox");
+      if (!box) return;
+      const fmt = String((s && s.dataset_format) || "");
+      const show =
+        !!(s && s.viewer_only) &&
+        fmt === "zarr" &&
+        !hubMode &&
+        !!String(s.output_dir || "").trim();
+      box.style.display = show ? "" : "none";
+      if (!show) return;
+      const def = defaultLerobotOutPath(s.output_dir);
+      if ($("convertLerobotOut") && !$("convertLerobotOut").dataset.touched) {
+        $("convertLerobotOut").value = def;
+      }
+      const busy = !!(s.mode === "DELETING" || s.deleting);
+      if ($("btnConvertLerobot")) $("btnConvertLerobot").disabled = busy;
+    }
+
+    function openConvertLerobotConfirm() {
+      if (status.mode === "DELETING" || status.deleting) {
+        setMsg("正在处理数据，请稍候…");
+        return;
+      }
+      if (String(status.dataset_format || "") !== "zarr") {
+        setMsg("仅 zarr 数据集可转换为 LeRobot");
+        return;
+      }
+      const outDir =
+        ($("convertLerobotOut") && $("convertLerobotOut").value.trim()) ||
+        defaultLerobotOutPath(status.output_dir);
+      const prompt =
+        ($("convertLerobotPrompt") && $("convertLerobotPrompt").value.trim()) ||
+        "Flatten and fold the cloth.";
+      let fps = 20;
+      if ($("convertLerobotFps")) {
+        fps = Number($("convertLerobotFps").value) || 20;
+      }
+      const overwrite = !!(
+        $("convertLerobotOverwrite") && $("convertLerobotOverwrite").checked
+      );
+      pendingConvert = { out_dir: outDir, fps, prompt, overwrite };
+      if ($("convertLerobotText")) {
+        $("convertLerobotText").textContent =
+          `从 ${status.output_dir || "当前目录"} 转换为 LeRobot → ${outDir}\n` +
+          `fps=${fps} · prompt="${prompt}"` +
+          (overwrite ? " · 将覆盖已有输出" : " · 已存在 episode 会跳过（可勾选覆盖）");
+      }
+      if ($("convertLerobotModal")) $("convertLerobotModal").classList.add("show");
+      postCmd("convert_lerobot_request", pendingConvert).catch((e) => setMsg(e.message));
+    }
+
     function syncDaggerSplitUi(s) {
       const box = $("daggerSplitBox");
       if (!box) return;
@@ -1292,6 +1460,7 @@
         series = null;
         stopPlay();
         $("btnDelete").disabled = true;
+        resetConvertPathInputs();
         if ($("viewerMsg")) {
           $("viewerMsg").textContent = "Select an episode to scrub";
         }
@@ -1314,6 +1483,13 @@
       }
     }
 
+    function resetConvertPathInputs() {
+      if ($("convertLerobotOut")) {
+        delete $("convertLerobotOut").dataset.touched;
+        $("convertLerobotOut").value = "";
+      }
+    }
+
     async function loadDatasetPath(path) {
       const p = (path || "").trim();
       setMsg(p ? `正在加载 ${p}…` : "正在加载默认目录…");
@@ -1321,6 +1497,7 @@
       selectedEp = null;
       series = null;
       resetDaggerPathInputs();
+      resetConvertPathInputs();
       try {
         await postCmd("load_dataset", { path: p });
         await new Promise((r) => setTimeout(r, 150));
@@ -1416,7 +1593,12 @@
         if (ent.is_dataset) {
           const tag = document.createElement("span");
           tag.className = "fs-tag";
-          tag.textContent = "数据集";
+          tag.textContent =
+            ent.dataset_format === "lerobot"
+              ? "LeRobot"
+              : ent.dataset_format === "zarr"
+                ? "zarr"
+                : "数据集";
           li.appendChild(tag);
         } else if (ent.n_children != null) {
           const meta = document.createElement("span");
@@ -1490,14 +1672,22 @@
       setDeleteProgress(s);
       syncDatasetPathLabel(s);
       syncDaggerSplitUi(s);
+      syncConvertLerobotUi(s);
+      syncDatasetFormatBadge(s);
 
       if (hubMode) return;
 
       const deleting = mode === "DELETING" || !!s.deleting;
+      const isLerobot = String(s.dataset_format || "") === "lerobot";
       const trimEpOk =
         selectedEp != null && selectedEp !== "live" && !deleting;
+      const deleteOk =
+        !isLerobot &&
+        selectedEp != null &&
+        selectedEp !== "live" &&
+        !deleting;
 
-      // 删除/裁剪结束：强制刷新列表并重选当前 episode（保留高亮）
+      // 删除/裁剪/转换结束：强制刷新列表并重选当前 episode（保留高亮）
       if (lastDeleting && !deleting) {
         const keepEp = selectedEp;
         const msg = s.message || "处理完成";
@@ -1511,11 +1701,15 @@
       lastDeleting = deleting;
 
       if (viewerOnly) {
-        $("btnDelete").disabled =
-          selectedEp === null || selectedEp === "live" || deleting;
+        $("btnDelete").disabled = !deleteOk;
         setTrimControlsEnabled(trimEpOk);
         if ($("btnTrimIn")) $("btnTrimIn").disabled = !trimEpOk;
         if ($("btnTrimOut")) $("btnTrimOut").disabled = !trimEpOk;
+        if ($("btnTrimApply")) {
+          $("btnTrimApply").title = isLerobot
+            ? "裁掉标记外的头尾，原地改 parquet/视频"
+            : "裁掉标记外的头尾，原地改 zarr/视频";
+        }
         return;
       }
 
@@ -1542,7 +1736,8 @@
       ["btnArmBoth", "btnArmL", "btnArmR"].forEach((id) => {
         if ($(id)) $(id).disabled = rec || busy;
       });
-      $("btnDelete").disabled = selectedEp === null || selectedEp === "live" || busy;
+      $("btnDelete").disabled =
+        isLerobot || selectedEp === null || selectedEp === "live" || busy;
       setTrimControlsEnabled(trimEpOk);
       if ($("btnTrimIn")) $("btnTrimIn").disabled = !trimEpOk;
       if ($("btnTrimOut")) $("btnTrimOut").disabled = !trimEpOk;
@@ -1584,11 +1779,37 @@
       lastReplaying = replaying;
     }
 
-    function renderEpList(episodes) {
+    let lastEpListSig = "";
+
+    function episodeListSignature(episodes) {
+      return (episodes || [])
+        .map(
+          (ep) =>
+            `${ep.id}:${ep.n_steps}:${ep.duration ?? ""}:${ep.has_video ? 1 : 0}`
+        )
+        .join("|");
+    }
+
+    function renderEpList(episodes, { force = false } = {}) {
       const ul = $("epList");
+      if (!ul) return;
+      const eps = episodes || [];
+      const sig = episodeListSignature(eps);
       const keep = selectedEp;
+      // 列表内容没变：只更新 active，不要重建 DOM（否则 scrollTop 被清掉，scrub 时列表乱跳）
+      if (!force && sig === lastEpListSig && ul.children.length === eps.length) {
+        ul.querySelectorAll("li").forEach((li) => {
+          const id = Number(li.dataset.id);
+          const on =
+            keep != null && keep !== "live" && Number(keep) === id;
+          li.classList.toggle("active", on);
+        });
+        return;
+      }
+      lastEpListSig = sig;
+      const scrollTop = ul.scrollTop;
       ul.innerHTML = "";
-      (episodes || []).slice().reverse().forEach((ep) => {
+      eps.slice().reverse().forEach((ep) => {
         const li = document.createElement("li");
         li.dataset.id = String(ep.id);
         if (
@@ -1603,6 +1824,7 @@
         li.onclick = () => selectEpisode(ep.id);
         ul.appendChild(li);
       });
+      ul.scrollTop = scrollTop;
     }
 
     function formatPoseHtml(s) {
@@ -2545,6 +2767,30 @@
       $("btnBackHub").onclick = () =>
         postCmd("back_hub").then(() => setMsg("返回入口…")).catch(e => setMsg(e.message));
     }
+    function wireFoldToggle(boxId, btnId, storageKey) {
+      const box = $(boxId);
+      const btn = $(btnId);
+      if (!box || !btn) return;
+      try {
+        if (localStorage.getItem(storageKey) === "1") {
+          box.classList.add("open");
+          btn.setAttribute("aria-expanded", "true");
+        }
+      } catch (_) {}
+      btn.onclick = () => {
+        const open = box.classList.toggle("open");
+        btn.setAttribute("aria-expanded", open ? "true" : "false");
+        try {
+          localStorage.setItem(storageKey, open ? "1" : "0");
+        } catch (_) {}
+        requestAnimationFrame(() => {
+          if (typeof onViewportResize === "function") onViewportResize();
+        });
+      };
+    }
+    wireFoldToggle("daggerSplitBox", "daggerFoldToggle", "fold_dagger_split");
+    wireFoldToggle("convertLerobotBox", "convertLerobotFoldToggle", "fold_convert_lerobot");
+
     if ($("btnBrowseDataset")) {
       $("btnBrowseDataset").onclick = () => openFsModal();
     }
@@ -2572,6 +2818,43 @@
     }
     if ($("btnDaggerBoth")) {
       $("btnDaggerBoth").onclick = () => openDaggerSplitConfirm("both");
+    }
+    if ($("convertLerobotOut")) {
+      $("convertLerobotOut").addEventListener("input", () => {
+        $("convertLerobotOut").dataset.touched = "1";
+      });
+    }
+    if ($("btnConvertLerobot")) {
+      $("btnConvertLerobot").onclick = () => openConvertLerobotConfirm();
+    }
+    if ($("convertLerobotNo")) {
+      $("convertLerobotNo").onclick = () => {
+        if ($("convertLerobotModal")) $("convertLerobotModal").classList.remove("show");
+        pendingConvert = null;
+        postCmd("delete_cancel").catch(() => {});
+      };
+    }
+    if ($("convertLerobotYes")) {
+      $("convertLerobotYes").onclick = async () => {
+        if (!pendingConvert) {
+          if ($("convertLerobotModal")) $("convertLerobotModal").classList.remove("show");
+          return;
+        }
+        if (status.mode === "DELETING" || status.deleting) {
+          if ($("convertLerobotModal")) $("convertLerobotModal").classList.remove("show");
+          setMsg("正在处理数据，请稍候…");
+          return;
+        }
+        const payload = { ...pendingConvert };
+        if ($("convertLerobotModal")) $("convertLerobotModal").classList.remove("show");
+        try {
+          await postCmd("convert_lerobot_confirm", payload);
+          setMsg(`正在转换为 LeRobot → ${payload.out_dir}…`);
+        } catch (e) {
+          setMsg(e.message);
+        }
+        pendingConvert = null;
+      };
     }
     if ($("daggerNo")) {
       $("daggerNo").onclick = () => {
@@ -2675,6 +2958,8 @@
       const trimModalOpen = $("trimModal") && $("trimModal").classList.contains("show");
       const daggerModalOpen =
         $("daggerModal") && $("daggerModal").classList.contains("show");
+      const convertModalOpen =
+        $("convertLerobotModal") && $("convertLerobotModal").classList.contains("show");
       const fsOpen = $("fsModal") && $("fsModal").classList.contains("show");
 
       if (fsOpen) {
@@ -2702,6 +2987,17 @@
         } else if (k === "n" || k === "escape") {
           ev.preventDefault();
           if ($("trimNo")) $("trimNo").click();
+        }
+        return;
+      }
+
+      if (convertModalOpen) {
+        if (k === "y" || k === "enter") {
+          ev.preventDefault();
+          if ($("convertLerobotYes")) $("convertLerobotYes").click();
+        } else if (k === "n" || k === "escape") {
+          ev.preventDefault();
+          if ($("convertLerobotNo")) $("convertLerobotNo").click();
         }
         return;
       }
@@ -2870,10 +3166,12 @@
           start,
           end,
         };
+        const fmt = String(status.dataset_format || "zarr");
+        const rewriteHint =
+          fmt === "lerobot" ? "将改写 parquet / 视频 / meta" : "将改写 zarr / 视频";
         $("trimText").textContent =
           `裁剪 episode ${selectedEp}：保留帧 [${start}, ${trimOut}]（共 ${end - start} / ${T} 步），` +
-          `删除头 ${start} 步与尾 ${T - end} 步。将改写 zarr / 视频` +
-          (status.viewer_only ? "" : "") +
+          `删除头 ${start} 步与尾 ${T - end} 步。${rewriteHint}` +
           "，不可撤销。";
         $("trimModal").classList.add("show");
         postCmd("trim_request", pendingTrim).catch((e) => setMsg(e.message));
@@ -2961,8 +3259,10 @@
         const r = await fetch(url);
         status = await r.json();
         updateControls(status);
-        if (forceList && status.episodes) renderEpList(status.episodes || []);
-        else if (status.episodes) renderEpList(status.episodes || []);
+        // 只在显式要列表时刷新；内容未变则跳过重建，避免 ep-list 滚动条被重置
+        if (forceList && status.episodes) {
+          renderEpList(status.episodes || []);
+        }
         if (status.delete_pending != null && !$("delModal").classList.contains("show")) {
           // keyboard-side pending; show modal
         }
