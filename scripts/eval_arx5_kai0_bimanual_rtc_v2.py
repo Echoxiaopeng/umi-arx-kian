@@ -26,7 +26,8 @@ python scripts/eval_arx5_kai0_bimanual_rtc_v2.py \
   --dispatch tick \
   --gripper-close-threshold 0.03 \
   --chunk-size 50 \
-  --output data_local/kai0_eval
+  --output data_local/kai0_eval \
+  --no-save-model-traj
 
 ``--dispatch schedule`` (default): timed ZMQ waypoints via interpolator.
 ``--dispatch tick``: ROS-style immediate SET_JOINT_POSITION each control tick.
