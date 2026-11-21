@@ -80,6 +80,145 @@
       min-width: 2.8rem;
       text-align: center;
     }
+    .btn-icon {
+      width: 36px;
+      height: 36px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 8px;
+      background: transparent;
+      border-color: transparent;
+      color: var(--muted);
+    }
+    .btn-icon:hover {
+      background: #243044;
+      color: var(--text);
+      border-color: var(--border);
+    }
+    .btn-icon svg {
+      width: 20px;
+      height: 20px;
+      display: block;
+    }
+    #btnSettings {
+      width: 48px;
+      height: 48px;
+      border-radius: 10px;
+      color: var(--text);
+    }
+    #btnSettings svg {
+      width: 28px;
+      height: 28px;
+    }
+    .settings-modal {
+      max-width: 520px;
+      width: min(92vw, 520px);
+      max-height: min(86vh, 720px);
+      overflow: auto;
+      padding: 0;
+    }
+    .settings-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 16px 18px 12px;
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      background: var(--panel);
+      z-index: 1;
+    }
+    .settings-head h3 { margin: 0; }
+    .settings-body {
+      padding: 8px 18px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .settings-section {
+      padding: 12px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .settings-section:last-child { border-bottom: none; }
+    .settings-section h4 {
+      margin: 0 0 10px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .settings-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 8px 0;
+    }
+    .settings-row-text {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+    .settings-row-text strong {
+      font-size: 0.95rem;
+      font-weight: 600;
+    }
+    .settings-row-text span {
+      font-size: 0.8rem;
+      color: var(--muted);
+      line-height: 1.35;
+    }
+    .settings-toggle {
+      position: relative;
+      width: 42px;
+      height: 24px;
+      flex: 0 0 auto;
+    }
+    .settings-toggle input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+      position: absolute;
+    }
+    .settings-toggle .slider {
+      position: absolute;
+      inset: 0;
+      background: #2a3548;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: background 0.15s ease;
+      border: 1px solid var(--border);
+    }
+    .settings-toggle .slider::before {
+      content: "";
+      position: absolute;
+      width: 18px;
+      height: 18px;
+      left: 2px;
+      top: 2px;
+      border-radius: 50%;
+      background: #c5d0e0;
+      transition: transform 0.15s ease;
+    }
+    .settings-toggle input:checked + .slider {
+      background: rgba(61, 156, 240, 0.35);
+      border-color: var(--accent);
+    }
+    .settings-toggle input:checked + .slider::before {
+      transform: translateX(18px);
+      background: var(--accent);
+    }
+    .settings-foot {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      padding-top: 8px;
+    }
     .wrap {
       flex: 1 1 auto;
       min-height: 0;
@@ -163,6 +302,37 @@
     }
     .fold-box.open .fold-body {
       display: block;
+    }
+    .merge-src-list {
+      list-style: none;
+      margin: 6px 0 0;
+      padding: 0;
+      max-height: 140px;
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .merge-src-list li {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.82rem;
+    }
+    .merge-src-list li:last-child { border-bottom: none; }
+    .merge-src-list .merge-src-path {
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+    }
+    .merge-src-list button {
+      flex: 0 0 auto;
+      padding: 2px 8px;
+      font-size: 0.78rem;
     }
     @media (max-width: 960px) {
       .row.top {
@@ -477,10 +647,76 @@
     .scrub {
       display: flex;
       align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
+      gap: 12px;
+      width: 100%;
+      flex-wrap: nowrap;
     }
-    .scrub input[type=range] { flex: 1; min-width: 160px; }
+    .scrub input[type=range] {
+      -webkit-appearance: none;
+      appearance: none;
+      flex: 1 1 auto;
+      width: 100%;
+      min-width: 320px;
+      height: 36px;
+      margin: 0;
+      padding: 0;
+      cursor: pointer;
+      background: transparent;
+    }
+    .scrub input[type=range]:focus {
+      outline: none;
+    }
+    /* Chrome / Edge：必须先 appearance:none，自定义轨道才会生效 */
+    .scrub input[type=range]::-webkit-slider-runnable-track {
+      height: 14px;
+      border-radius: 7px;
+      background: #3a4a63;
+      border: 1px solid #55657f;
+    }
+    .scrub input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 24px;
+      height: 24px;
+      margin-top: -5px;
+      border-radius: 50%;
+      background: var(--accent);
+      border: 2px solid #0e141c;
+      box-shadow: 0 0 0 2px #55657f;
+    }
+    .scrub input[type=range]::-moz-range-track {
+      height: 14px;
+      border-radius: 7px;
+      background: #3a4a63;
+      border: 1px solid #55657f;
+    }
+    .scrub input[type=range]::-moz-range-thumb {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: var(--accent);
+      border: 2px solid #0e141c;
+      box-shadow: 0 0 0 2px #55657f;
+    }
+    .hotkey-settings-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .hotkey-bind {
+      min-width: 5rem;
+      padding: 6px 12px;
+      font-variant-numeric: tabular-nums;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      background: #121820;
+      border-color: #55657f;
+    }
+    .hotkey-bind.listening {
+      border-color: var(--accent);
+      color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent);
+    }
     #chart {
       flex: 1 1 auto;
       width: 100%;
@@ -519,6 +755,47 @@
       padding: 32px 20px;
     }
     .hub-page.show { display: flex; }
+    .merge-page {
+      display: none;
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: auto;
+      padding: 24px 20px 40px;
+      justify-content: center;
+      align-items: flex-start;
+    }
+    .merge-page.show { display: flex; }
+    .merge-card {
+      width: min(820px, 100%);
+      text-align: left;
+    }
+    .merge-card h2 {
+      margin: 0 0 6px;
+      font-size: 1.45rem;
+      font-weight: 600;
+      text-transform: none;
+      letter-spacing: 0;
+      color: var(--text);
+    }
+    .merge-card .merge-sub {
+      color: var(--muted);
+      font-size: 0.92rem;
+      margin: 0 0 18px;
+      line-height: 1.5;
+    }
+    .merge-card .merge-src-list {
+      max-height: min(42vh, 360px);
+    }
+    .merge-card .del-progress {
+      margin-top: 14px;
+    }
+    .merge-card .merge-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 16px;
+      align-items: center;
+    }
     .hub-card {
       width: min(640px, 100%);
       text-align: center;
@@ -776,11 +1053,27 @@
       <div class="hint" id="headerHint">网页快捷键: P/C/S/D/Q · 仅可信局域网</div>
     </div>
     <div class="right">
-      <div class="font-btns" title="调节界面字体">
-        <button type="button" id="fontDown" aria-label="减小字体">A−</button>
-        <span id="fontLabel">100%</span>
-        <button type="button" id="fontUp" aria-label="增大字体">A+</button>
-      </div>
+      <button
+        type="button"
+        class="btn-icon"
+        id="btnSettings"
+        title="设置（Ctrl+,）"
+        aria-label="打开设置"
+      >
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path
+            d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"
+            stroke="currentColor"
+            stroke-width="1.8"
+          />
+          <path
+            d="M19.4 13a7.8 7.8 0 0 0 .1-2l2-1.2-2-3.4-2.3.7a7.7 7.7 0 0 0-1.7-1L15 3.1h-4l-.5 2.9a7.7 7.7 0 0 0-1.7 1L6.5 6.4l-2 3.4 2 1.2a7.8 7.8 0 0 0 0 2l-2 1.2 2 3.4 2.3-.7a7.7 7.7 0 0 0 1.7 1l.5 2.9h4l.5-2.9a7.7 7.7 0 0 0 1.7-1l2.3.7 2-3.4-2-1.2Z"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
     </div>
   </header>
 
@@ -798,6 +1091,45 @@
       <div class="hub-log-wrap" id="hubLogWrap">
         <h3>连接日志</h3>
         <pre class="hub-log" id="hubLog"><span class="hub-log-empty">等待日志…</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="merge-page" id="mergePage">
+    <div class="merge-card panel" id="mergeCard">
+      <h2>合并 LeRobot</h2>
+      <p class="merge-sub" id="mergePageHint">
+        选择至少 2 个兼容的 LeRobot 数据集（fps / features / 视频键一致），自定义输出名后合并。
+        会重排 episode_index / index / task_index，并写全 meta 与视频，可直接训练。
+      </p>
+      <ul id="mergeSourceList" class="merge-src-list"></ul>
+      <div class="btns" style="margin-top:10px;flex-wrap:wrap">
+        <button id="btnMergeAddSource" type="button" title="从文件夹浏览器添加 LeRobot 数据集">添加数据集…</button>
+        <button id="btnMergeAddCurrent" type="button" title="把当前已加载目录加入列表">加入当前目录</button>
+        <button id="btnMergeClearSources" type="button" title="清空列表">清空</button>
+      </div>
+      <div class="path-row" style="margin-top:14px">
+        <label>输出名</label>
+        <input id="mergeLerobotName" type="text" style="flex:1;min-width:160px" placeholder="merged_lerobot" />
+      </div>
+      <div class="path-row" style="margin-top:8px">
+        <label>输出目录</label>
+        <input id="mergeLerobotOut" type="text" style="flex:1;min-width:180px" placeholder="自动：首个源同级/{输出名}" />
+      </div>
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:10px">
+        <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
+          <input id="mergeLerobotOverwrite" type="checkbox" /> 覆盖已有输出
+        </label>
+        <span class="msg" id="mergeLerobotHint" style="margin:0">尚未添加数据集</span>
+      </div>
+      <div class="del-progress" id="mergeProgress">
+        <div class="del-progress-track"><div class="del-progress-bar" id="mergeProgressBar"></div></div>
+        <div class="del-progress-label" id="mergeProgressLabel"></div>
+      </div>
+      <div class="merge-actions">
+        <button id="btnMergeLerobot" type="button" class="primary" title="合并为完整可训练 LeRobot 数据集">开始合并</button>
+        <button id="btnMergeBack" type="button" title="返回数据管理">返回数据管理</button>
+        <div class="msg" id="mergeMsg" style="margin:0"></div>
       </div>
     </div>
   </div>
@@ -860,6 +1192,7 @@
           saved: <strong id="nEpisodesView">0</strong> · no robot / camera
         </span>
         <button id="btnBackHub" type="button">返回入口</button>
+        <button id="btnOpenMergePage" type="button" class="primary" title="进入合并 LeRobot 页面">合并 LeRobot</button>
         <div class="msg" id="msgView"></div>
       </div>
       <div class="del-progress" id="delProgressView">
@@ -955,6 +1288,17 @@
       </div>
     </div>
 
+    <div class="modal-bg" id="mergeLerobotModal">
+      <div class="modal">
+        <h3>合并 LeRobot？</h3>
+        <p id="mergeLerobotText">将合并所选数据集到输出目录。</p>
+        <div class="btns">
+          <button id="mergeLerobotYes" class="ok">确认合并</button>
+          <button id="mergeLerobotNo">取消</button>
+        </div>
+      </div>
+    </div>
+
     <div class="panel grow" id="episodePanel">
       <h2>Episode viewer</h2>
       <div class="viewer">
@@ -966,10 +1310,14 @@
             <button id="btnLiveView">Follow LIVE</button>
           </div>
           <div class="btns" style="margin-top:8px;flex:0 0 auto;flex-wrap:wrap">
-            <button id="btnTrimIn" type="button" disabled title="把当前 scrub 帧标为保留起点（含）">标起点 [</button>
-            <button id="btnTrimOut" type="button" disabled title="把当前 scrub 帧标为保留终点（含）">标终点 ]</button>
+            <button id="btnTrimIn" type="button" disabled title="把当前 scrub 帧标为保留起点（含）">标起点</button>
+            <button id="btnTrimOut" type="button" disabled title="把当前 scrub 帧标为保留终点（含）">标终点</button>
             <button id="btnTrimClear" type="button" disabled title="清除裁剪标记">清除</button>
             <button id="btnTrimApply" type="button" class="ok" disabled title="裁掉标记外的头尾，原地改 zarr 或 LeRobot parquet/视频">应用裁剪</button>
+          </div>
+          <div class="btns" style="margin-top:8px;flex:0 0 auto;flex-wrap:wrap">
+            <button id="btnEndGripTrimCur" type="button" disabled title="检测末尾全开→闭合拐点，自动标出保留起止；检查后点「应用裁剪」">标记末尾开合</button>
+            <button id="btnEndGripTrimAll" type="button" class="ok" disabled title="扫描全部 episode 末尾全开→闭合拐点并批量裁剪（先确认）">一键裁剪全部末尾开合</button>
           </div>
           <div class="msg" id="trimRangeLabel" style="margin-top:4px">裁剪范围：未标记</div>
         </div>
@@ -1029,10 +1377,119 @@
     </div>
   </div>
 
+  <div class="modal-bg" id="endGripModal">
+    <div class="modal">
+      <h3>裁剪末尾开合？</h3>
+      <p id="endGripText">将自动裁掉末尾夹爪开合片段，同步改写数据与视频，不可撤销。</p>
+      <div class="btns">
+        <button id="endGripYes" class="ok">确认裁剪</button>
+        <button id="endGripNo">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-bg" id="settingsModal">
+    <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <div class="settings-head">
+        <h3 id="settingsTitle">设置</h3>
+        <button type="button" class="btn-icon" id="settingsClose" title="关闭" aria-label="关闭设置">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+      <div class="settings-body">
+        <section class="settings-section">
+          <h4>外观</h4>
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <strong>界面字体</strong>
+              <span>放大后 scrub / 曲线读数更清楚</span>
+            </div>
+            <div class="font-btns" title="调节界面字体">
+              <button type="button" id="fontDown" aria-label="减小字体">A−</button>
+              <span id="fontLabel">100%</span>
+              <button type="button" id="fontUp" aria-label="增大字体">A+</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <h4>裁剪快捷键</h4>
+          <div class="hotkey-settings-list">
+            <div class="settings-row">
+              <div class="settings-row-text">
+                <strong>标起点</strong>
+                <span>把当前 scrub 帧标为保留起点</span>
+              </div>
+              <button type="button" class="hotkey-bind" data-bind="in" id="hkBindIn" title="点击后按下新按键">1</button>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-text">
+                <strong>标终点</strong>
+                <span>把当前 scrub 帧标为保留终点</span>
+              </div>
+              <button type="button" class="hotkey-bind" data-bind="out" id="hkBindOut" title="点击后按下新按键">2</button>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-text">
+                <strong>应用裁剪</strong>
+                <span>起终点齐了后触发裁剪</span>
+              </div>
+              <button type="button" class="hotkey-bind" data-bind="apply" id="hkBindApply" title="点击后按下新按键">Space</button>
+            </div>
+          </div>
+          <div class="msg" id="hkBindHint" style="margin-top:6px">点击按键位可重新设置</div>
+          <div class="btns" style="margin-top:10px">
+            <button type="button" id="hkBindReset" title="恢复默认 1 / 2 / Space">恢复默认快捷键</button>
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <h4>回看与裁剪</h4>
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <strong>拖完进度条后失焦</strong>
+              <span>避免焦点停在滑条上导致快捷键失效</span>
+            </div>
+            <label class="settings-toggle">
+              <input type="checkbox" id="optScrubBlur" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <strong>按钮显示快捷键</strong>
+              <span>在「标起点 / 标终点 / 应用裁剪」上标注当前按键</span>
+            </div>
+            <label class="settings-toggle">
+              <input type="checkbox" id="optShowHotkeyLabels" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <strong>裁剪前二次确认</strong>
+              <span>关闭后按应用键将直接裁剪（不可撤销）</span>
+            </div>
+            <label class="settings-toggle">
+              <input type="checkbox" id="optConfirmTrim" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+        </section>
+
+        <div class="settings-foot">
+          <button type="button" id="settingsDone" class="ok">完成</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-bg" id="fsModal">
     <div class="modal fs-modal">
-      <h3>选择数据文件夹</h3>
-      <p class="fs-hint">单击进入子文件夹（像资源管理器）。含 replay_buffer.zarr 或 LeRobot meta/info.json 的目录会标「数据集」，点「打开此数据集」加载。</p>
+      <h3 id="fsModalTitle">选择数据文件夹</h3>
+      <p class="fs-hint" id="fsModalHint">单击进入子文件夹（像资源管理器）。含 replay_buffer.zarr 或 LeRobot meta/info.json 的目录会标「数据集」，点「打开此数据集」加载。</p>
       <div class="fs-toolbar">
         <button type="button" id="fsUp" title="上级目录">↑ 上级</button>
         <button type="button" id="fsHome" title="仓库根目录">仓库根</button>
@@ -1066,6 +1523,11 @@
     let pendingTrim = null; // {episode_id, start, end}
     let pendingDagger = null; // {what, human_out, policy_out, overwrite, trim_still}
     let pendingConvert = null; // {out_dir, fps, prompt, overwrite}
+    let pendingEndGrip = null; // {scope, episode_id, grip_idx, window_s}
+    let pendingMerge = null; // {sources, out_dir, out_name, overwrite}
+    let mergeSources = []; // string paths
+    let fsPickMode = "load"; // load | merge_add
+    let mergePageOpen = false;
     let lastDeleting = false;
     let lastUiMode = "";
     let lastOutputDir = "";
@@ -1085,6 +1547,213 @@
     const FONT_MAX = 32;
     const FONT_STEP = 2;
     let uiFontPx = 20;
+
+    const TRIM_HOTKEY_STORAGE = "collect_trim_hotkeys";
+    const TRIM_HOTKEY_DEFAULTS = { in: "1", out: "2", apply: "space" };
+    const TRIM_HOTKEY_LABELS = { in: "起点", out: "终点", apply: "裁剪" };
+    const UI_PREFS_STORAGE = "collect_ui_prefs";
+    const UI_PREFS_DEFAULTS = {
+      scrubBlur: true,
+      showHotkeyLabels: true,
+      confirmTrim: true,
+    };
+    let trimHotkeys = { ...TRIM_HOTKEY_DEFAULTS };
+    let uiPrefs = { ...UI_PREFS_DEFAULTS };
+    let hotkeyListening = null; // "in" | "out" | "apply" | null
+
+    function normalizeHotkeyEvent(ev) {
+      if (!ev || ev.ctrlKey || ev.metaKey || ev.altKey) return null;
+      const key = ev.key || "";
+      if (!key) return null;
+      if (key === " " || key === "Spacebar") return "space";
+      const lower = String(key).toLowerCase();
+      if (
+        [
+          "escape",
+          "tab",
+          "shift",
+          "control",
+          "alt",
+          "meta",
+          "dead",
+          "capslock",
+          "numlock",
+          "scrolllock",
+        ].includes(lower)
+      ) {
+        return null;
+      }
+      if (key.length === 1) return lower;
+      return lower;
+    }
+
+    function hotkeyDisplay(code) {
+      if (!code) return "?";
+      if (code === "space") return "Space";
+      if (code.length === 1) return code.toUpperCase();
+      return code.replace(/(^|_)([a-z])/g, (_, a, b) => a + b.toUpperCase());
+    }
+
+    function loadTrimHotkeys() {
+      try {
+        const raw = localStorage.getItem(TRIM_HOTKEY_STORAGE);
+        if (!raw) return { ...TRIM_HOTKEY_DEFAULTS };
+        const parsed = JSON.parse(raw);
+        const next = { ...TRIM_HOTKEY_DEFAULTS };
+        for (const k of ["in", "out", "apply"]) {
+          if (typeof parsed[k] === "string" && parsed[k]) next[k] = parsed[k];
+        }
+        return next;
+      } catch (_) {
+        return { ...TRIM_HOTKEY_DEFAULTS };
+      }
+    }
+
+    function saveTrimHotkeys() {
+      try {
+        localStorage.setItem(TRIM_HOTKEY_STORAGE, JSON.stringify(trimHotkeys));
+      } catch (_) {}
+    }
+
+    function setHotkeyHint(text) {
+      if ($("hkBindHint")) $("hkBindHint").textContent = text;
+    }
+
+    function loadUiPrefs() {
+      try {
+        const raw = localStorage.getItem(UI_PREFS_STORAGE);
+        if (!raw) return { ...UI_PREFS_DEFAULTS };
+        const parsed = JSON.parse(raw);
+        return {
+          scrubBlur:
+            typeof parsed.scrubBlur === "boolean"
+              ? parsed.scrubBlur
+              : UI_PREFS_DEFAULTS.scrubBlur,
+          showHotkeyLabels:
+            typeof parsed.showHotkeyLabels === "boolean"
+              ? parsed.showHotkeyLabels
+              : UI_PREFS_DEFAULTS.showHotkeyLabels,
+          confirmTrim:
+            typeof parsed.confirmTrim === "boolean"
+              ? parsed.confirmTrim
+              : UI_PREFS_DEFAULTS.confirmTrim,
+        };
+      } catch (_) {
+        return { ...UI_PREFS_DEFAULTS };
+      }
+    }
+
+    function saveUiPrefs() {
+      try {
+        localStorage.setItem(UI_PREFS_STORAGE, JSON.stringify(uiPrefs));
+      } catch (_) {}
+    }
+
+    function syncSettingsToggles() {
+      if ($("optScrubBlur")) $("optScrubBlur").checked = !!uiPrefs.scrubBlur;
+      if ($("optShowHotkeyLabels")) {
+        $("optShowHotkeyLabels").checked = !!uiPrefs.showHotkeyLabels;
+      }
+      if ($("optConfirmTrim")) {
+        $("optConfirmTrim").checked = !!uiPrefs.confirmTrim;
+      }
+    }
+
+    function syncTrimHotkeyUi() {
+      const map = {
+        in: "hkBindIn",
+        out: "hkBindOut",
+        apply: "hkBindApply",
+      };
+      for (const [which, id] of Object.entries(map)) {
+        const el = $(id);
+        if (!el) continue;
+        el.textContent =
+          hotkeyListening === which
+            ? "…"
+            : hotkeyDisplay(trimHotkeys[which]);
+        el.classList.toggle("listening", hotkeyListening === which);
+      }
+      const inL = hotkeyDisplay(trimHotkeys.in);
+      const outL = hotkeyDisplay(trimHotkeys.out);
+      const applyL = hotkeyDisplay(trimHotkeys.apply);
+      const showLabels = !!uiPrefs.showHotkeyLabels;
+      if ($("btnTrimIn")) {
+        $("btnTrimIn").textContent = showLabels ? `标起点 ${inL}` : "标起点";
+        $("btnTrimIn").title =
+          `把当前 scrub 帧标为保留起点（含）；快捷键 ${inL}`;
+      }
+      if ($("btnTrimOut")) {
+        $("btnTrimOut").textContent = showLabels ? `标终点 ${outL}` : "标终点";
+        $("btnTrimOut").title =
+          `把当前 scrub 帧标为保留终点（含）；快捷键 ${outL}`;
+      }
+      if ($("btnTrimApply")) {
+        const base =
+          status && status.dataset_format === "lerobot"
+            ? "裁掉标记外的头尾，原地改 parquet/视频"
+            : "裁掉标记外的头尾，原地改 zarr/视频";
+        $("btnTrimApply").textContent = showLabels
+          ? `应用裁剪 ${applyL}`
+          : "应用裁剪";
+        $("btnTrimApply").title = `${base}；快捷键 ${applyL}`;
+      }
+      if (hotkeyListening) {
+        setHotkeyHint(
+          `正在设置「${TRIM_HOTKEY_LABELS[hotkeyListening]}」：按下新按键（Esc 取消）`
+        );
+      } else {
+        setHotkeyHint("点击右侧按键位，再按下新键");
+      }
+    }
+
+    function openSettings() {
+      cancelHotkeyListen();
+      syncSettingsToggles();
+      if ($("settingsModal")) $("settingsModal").classList.add("show");
+      syncTrimHotkeyUi();
+    }
+
+    function closeSettings() {
+      cancelHotkeyListen();
+      if ($("settingsModal")) $("settingsModal").classList.remove("show");
+      syncTrimHotkeyUi();
+    }
+
+    function beginHotkeyListen(which) {
+      hotkeyListening = which;
+      syncTrimHotkeyUi();
+    }
+
+    function cancelHotkeyListen() {
+      if (!hotkeyListening) return;
+      hotkeyListening = null;
+      syncTrimHotkeyUi();
+    }
+
+    function assignTrimHotkey(which, code) {
+      for (const [other, val] of Object.entries(trimHotkeys)) {
+        if (other !== which && val === code) {
+          hotkeyListening = null;
+          syncTrimHotkeyUi();
+          setHotkeyHint(
+            `「${hotkeyDisplay(code)}」已被「${TRIM_HOTKEY_LABELS[other]}」占用`
+          );
+          return false;
+        }
+      }
+      trimHotkeys[which] = code;
+      saveTrimHotkeys();
+      hotkeyListening = null;
+      syncTrimHotkeyUi();
+      setHotkeyHint(
+        `已设置「${TRIM_HOTKEY_LABELS[which]}」= ${hotkeyDisplay(code)}`
+      );
+      return true;
+    }
+
+    trimHotkeys = loadTrimHotkeys();
+    uiPrefs = loadUiPrefs();
 
     function applyFontSize(px, { replot = true } = {}) {
       uiFontPx = Math.max(FONT_MIN, Math.min(FONT_MAX, px));
@@ -1144,13 +1813,17 @@
     function setMsg(t) {
       const el = $("msg");
       el.textContent = t || "";
-      const busy = /保存|丢弃|稍候|写盘|回放|删除/.test(t || "");
+      const busy = /保存|丢弃|稍候|写盘|回放|删除|合并|转换|裁剪/.test(t || "");
       el.classList.toggle("busy", busy);
       if ($("msgView")) {
         $("msgView").textContent = t || "";
         $("msgView").classList.toggle("busy", busy);
       }
       if ($("hubMsg")) $("hubMsg").textContent = t || "";
+      if ($("mergeMsg")) {
+        $("mergeMsg").textContent = t || "";
+        $("mergeMsg").classList.toggle("busy", busy);
+      }
     }
 
     function setDeleteProgress(s) {
@@ -1158,26 +1831,40 @@
       const p = (s && s.delete_progress) || null;
       const frac = p && typeof p.frac === "number" ? Math.max(0, Math.min(1, p.frac)) : 0;
       const pct = Math.round(frac * 100);
+      const phase = p && p.phase ? String(p.phase) : "";
+      const rawMsg = p && p.message ? String(p.message) : "";
       const label = p
-        ? (p.message || `删除中 ${pct}%`)
-        : (deleting ? "删除中…" : "");
+        ? (rawMsg || `处理中 ${pct}%`)
+        : (deleting ? "处理中…" : "");
+      const isMerge =
+        phase === "merge" || /合并/.test(rawMsg) || /合并/.test(String((s && s.message) || ""));
       [
         ["delProgress", "delProgressBar", "delProgressLabel"],
         ["delProgressView", "delProgressBarView", "delProgressLabelView"],
+        ["mergeProgress", "mergeProgressBar", "mergeProgressLabel"],
       ].forEach(([wrapId, barId, labelId]) => {
         const wrap = $(wrapId);
         const bar = $(barId);
         const lab = $(labelId);
         if (!wrap || !bar) return;
-        wrap.classList.toggle("show", !!deleting);
-        if (deleting) {
+        const show =
+          wrapId === "mergeProgress" ? !!(deleting && isMerge) : !!deleting;
+        wrap.classList.toggle("show", show);
+        if (show) {
           bar.style.width = pct + "%";
-          if (lab) lab.textContent = label;
+          if (lab) {
+            lab.textContent =
+              pct > 0 || rawMsg ? `${pct}% · ${label.replace(/\n/g, " ")}` : label;
+          }
         } else {
           bar.style.width = "0%";
           if (lab) lab.textContent = "";
         }
       });
+      // 合并进行中：确保停在合并页看进度
+      if (deleting && isMerge && !mergePageOpen) {
+        showMergePage();
+      }
     }
 
     const MODE_LABELS = {
@@ -1225,14 +1912,46 @@
       pre.scrollTop = pre.scrollHeight;
     }
 
+    function showMergePage() {
+      mergePageOpen = true;
+      if ($("mergePage")) $("mergePage").classList.add("show");
+      if ($("mainWrap")) $("mainWrap").style.display = "none";
+      if ($("hubPage")) $("hubPage").classList.remove("show");
+      $("headerHint").textContent = "合并 LeRobot · 返回数据管理 · 仅可信局域网";
+      $("pageTitle").textContent = "ARX5 Merge LeRobot";
+      document.title = "ARX5 Merge LeRobot";
+      renderMergeSourceList();
+      syncMergeOutPreview();
+      syncMergeLerobotUi(status);
+    }
+
+    function hideMergePage() {
+      mergePageOpen = false;
+      if ($("mergePage")) $("mergePage").classList.remove("show");
+      // 回到数据管理主界面（由后续 applyUiMode / poll 校正）
+      if (!hubMode && $("mainWrap")) $("mainWrap").style.display = "flex";
+      $("headerHint").textContent = "数据管理 · 返回入口 · 仅可信局域网";
+      $("pageTitle").textContent = "ARX5 Dataset Viewer";
+      document.title = "ARX5 Dataset Viewer";
+    }
+
     function applyUiMode(mode, s) {
       const connecting = mode === "CONNECTING";
       hubMode = mode === "HUB" || connecting;
       viewerOnly = !!(s && s.viewer_only) || mode === "VIEW";
-      document.body.classList.toggle("viewer-mode", viewerOnly && !hubMode);
+      document.body.classList.toggle("viewer-mode", viewerOnly && !hubMode && !mergePageOpen);
 
+      // 合并页优先；入口页其次；否则主界面
+      if ($("mergePage")) {
+        $("mergePage").classList.toggle("show", !!mergePageOpen && !hubMode);
+      }
       $("hubPage").classList.toggle("show", hubMode);
-      $("mainWrap").style.display = hubMode ? "none" : "flex";
+      if (hubMode) {
+        mergePageOpen = false;
+        if ($("mergePage")) $("mergePage").classList.remove("show");
+      }
+      $("mainWrap").style.display =
+        hubMode || mergePageOpen ? "none" : "flex";
 
       if ($("hubCard")) {
         $("hubCard").classList.toggle("hub-connecting", connecting);
@@ -1241,6 +1960,13 @@
         $("hubLogWrap").classList.toggle("show", connecting || (hubMode && (s.logs || []).length > 0));
       }
       renderHubLogs(s && s.logs);
+
+      if (mergePageOpen && !hubMode) {
+        $("headerHint").textContent = "合并 LeRobot · 返回数据管理 · 仅可信局域网";
+        $("pageTitle").textContent = "ARX5 Merge LeRobot";
+        document.title = "ARX5 Merge LeRobot";
+        return;
+      }
 
       if (hubMode) {
         if (connecting) {
@@ -1346,6 +2072,282 @@
       }
       const busy = !!(s.mode === "DELETING" || s.deleting);
       if ($("btnConvertLerobot")) $("btnConvertLerobot").disabled = busy;
+    }
+
+    function defaultMergeOutPath(sources, name) {
+      const n = String(name || "").trim() || "merged_lerobot";
+      if (n.startsWith("/")) return n;
+      const src0 = (sources && sources[0]) || lastOutputDir || "";
+      if (!src0) return n;
+      const parts = String(src0).replace(/\/+$/, "").split("/");
+      parts.pop();
+      const parent = parts.join("/") || "/";
+      if (n.indexOf("/") >= 0) {
+        return parent.replace(/\/+$/, "") + "/" + n.replace(/^\/+/, "");
+      }
+      return parent.replace(/\/+$/, "") + "/" + n;
+    }
+
+    function renderMergeSourceList() {
+      const ul = $("mergeSourceList");
+      if (!ul) return;
+      ul.innerHTML = "";
+      if (!mergeSources.length) {
+        const li = document.createElement("li");
+        li.innerHTML =
+          '<span class="merge-src-path">（尚未添加 · 至少 2 个）</span>';
+        ul.appendChild(li);
+        return;
+      }
+      mergeSources.forEach((p, i) => {
+        const li = document.createElement("li");
+        const pathEl = document.createElement("span");
+        pathEl.className = "merge-src-path";
+        pathEl.textContent = `${i + 1}. ${p}`;
+        pathEl.title = p;
+        const up = document.createElement("button");
+        up.type = "button";
+        up.textContent = "↑";
+        up.title = "上移";
+        up.disabled = i === 0;
+        up.onclick = () => {
+          if (i <= 0) return;
+          const t = mergeSources[i - 1];
+          mergeSources[i - 1] = mergeSources[i];
+          mergeSources[i] = t;
+          renderMergeSourceList();
+          syncMergeOutPreview();
+        };
+        const down = document.createElement("button");
+        down.type = "button";
+        down.textContent = "↓";
+        down.title = "下移";
+        down.disabled = i >= mergeSources.length - 1;
+        down.onclick = () => {
+          if (i >= mergeSources.length - 1) return;
+          const t = mergeSources[i + 1];
+          mergeSources[i + 1] = mergeSources[i];
+          mergeSources[i] = t;
+          renderMergeSourceList();
+          syncMergeOutPreview();
+        };
+        const rm = document.createElement("button");
+        rm.type = "button";
+        rm.textContent = "移除";
+        rm.onclick = () => {
+          mergeSources.splice(i, 1);
+          renderMergeSourceList();
+          syncMergeOutPreview();
+        };
+        li.appendChild(pathEl);
+        li.appendChild(up);
+        li.appendChild(down);
+        li.appendChild(rm);
+        ul.appendChild(li);
+      });
+    }
+
+    function syncMergeOutPreview() {
+      if (!$("mergeLerobotOut") || $("mergeLerobotOut").dataset.touched) return;
+      const name = ($("mergeLerobotName") && $("mergeLerobotName").value) || "";
+      $("mergeLerobotOut").value = defaultMergeOutPath(mergeSources, name);
+    }
+
+    function addMergeSource(path) {
+      const p = String(path || "").trim();
+      if (!p) return;
+      if (mergeSources.includes(p)) {
+        setMsg(`已在合并列表中: ${p}`);
+        return;
+      }
+      mergeSources.push(p);
+      renderMergeSourceList();
+      syncMergeOutPreview();
+      setMsg(`已加入合并列表 (${mergeSources.length}): ${p}`);
+    }
+
+    function syncMergeLerobotUi(s) {
+      const busy = !!(s && (s.mode === "DELETING" || s.deleting));
+      const canOpen = !!(s && s.viewer_only) && !hubMode;
+      if ($("btnOpenMergePage")) $("btnOpenMergePage").disabled = !canOpen || busy;
+      [
+        "btnMergeLerobot",
+        "btnMergeAddSource",
+        "btnMergeAddCurrent",
+        "btnMergeClearSources",
+        "btnMergeBack",
+      ].forEach((id) => {
+        if (!$(id)) return;
+        if (id === "btnMergeBack") {
+          $(id).disabled = busy;
+          return;
+        }
+        $(id).disabled = busy;
+      });
+      if ($("mergeLerobotHint")) {
+        $("mergeLerobotHint").textContent =
+          mergeSources.length > 0
+            ? `已选 ${mergeSources.length} 个源`
+            : "尚未添加数据集";
+      }
+      if (mergePageOpen) {
+        renderMergeSourceList();
+        syncMergeOutPreview();
+      }
+    }
+
+    function openMergeLerobotConfirm() {
+      if (status.mode === "DELETING" || status.deleting) {
+        setMsg("正在处理数据，请稍候…");
+        return;
+      }
+      if (mergeSources.length < 2) {
+        setMsg("请至少添加 2 个 LeRobot 数据集");
+        return;
+      }
+      const name = (($("mergeLerobotName") && $("mergeLerobotName").value) || "").trim();
+      let outDir =
+        ($("mergeLerobotOut") && $("mergeLerobotOut").value.trim()) ||
+        defaultMergeOutPath(mergeSources, name);
+      const overwrite = !!(
+        $("mergeLerobotOverwrite") && $("mergeLerobotOverwrite").checked
+      );
+      pendingMerge = {
+        sources: [...mergeSources],
+        out_dir: outDir,
+        out_name: name,
+        overwrite,
+      };
+      if ($("mergeLerobotText")) {
+        $("mergeLerobotText").textContent =
+          `合并 ${mergeSources.length} 个 LeRobot →\n${outDir}\n` +
+          mergeSources.map((p, i) => `${i + 1}. ${p}`).join("\n") +
+          (overwrite ? "\n将覆盖已有输出。" : "\n若输出已存在会失败（可勾选覆盖）。");
+      }
+      if ($("mergeLerobotModal")) $("mergeLerobotModal").classList.add("show");
+      postCmd("merge_lerobot_request", pendingMerge).catch((e) => setMsg(e.message));
+    }
+
+    function syncEndGripTrimUi(s) {
+      const busy = !!(s && (s.mode === "DELETING" || s.deleting));
+      const hasDir = !!String((s && s.output_dir) || "").trim();
+      const curOk =
+        hasDir &&
+        !busy &&
+        !hubMode &&
+        selectedEp != null &&
+        selectedEp !== "live";
+      const allOk = hasDir && !busy && !hubMode;
+      if ($("btnEndGripTrimCur")) $("btnEndGripTrimCur").disabled = !curOk;
+      if ($("btnEndGripTrimAll")) $("btnEndGripTrimAll").disabled = !allOk;
+    }
+
+    function applyEndGripPreviewMarks(preview) {
+      if (!preview || typeof preview !== "object") return false;
+      const eid = Number(preview.episode_id);
+      if (!Number.isFinite(eid)) return false;
+      if (selectedEp == null || selectedEp === "live" || Number(selectedEp) !== eid) {
+        setMsg(`末尾开合标记属于 ep${eid}，请先选中该 episode`);
+        return false;
+      }
+      const start = Number(preview.start);
+      const end = Number(preview.end);
+      const cut = Number(preview.cut);
+      const drop = Number(preview.drop);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
+        setMsg("末尾开合预览无效");
+        return false;
+      }
+      trimIn = start;
+      trimOut = end;
+      updateTrimRangeLabel();
+      const scrubTo = Number.isFinite(cut) ? Math.max(0, cut - 1) : end;
+      if ($("scrub")) {
+        $("scrub").value = String(scrubTo);
+        $("scrub").dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      if (series) {
+        plotSeries(series, series._title || `Episode ${eid}`, scrubTo);
+      }
+      if (typeof loadFrame === "function") {
+        loadFrame(scrubTo).catch(() => {});
+      }
+      setMsg(
+        `已标记末尾开合 ep${eid}：保留 [${start}, ${end}]，` +
+          `将丢尾 ${Number.isFinite(drop) ? drop : "?"} 帧（全开→闭合拐点）。` +
+          `请 scrub 检查，确认后点「应用裁剪」。`
+      );
+      return true;
+    }
+
+    async function openEndGripTrimFlow(scope) {
+      if (status.mode === "DELETING" || status.deleting) {
+        setMsg("正在处理数据，请稍候…");
+        return;
+      }
+      if (!String(status.output_dir || "").trim()) {
+        setMsg("尚未加载数据目录");
+        return;
+      }
+      const scopeS = scope === "current" ? "current" : "all";
+      if (scopeS === "current") {
+        if (selectedEp == null || selectedEp === "live") {
+          setMsg("请先选择一条 episode");
+          return;
+        }
+      }
+      const payload = {
+        scope: scopeS,
+        episode_id: scopeS === "current" ? Number(selectedEp) : null,
+        grip_idx: 13,
+        window_s: 1.5,
+      };
+      pendingEndGrip = payload;
+      setMsg("正在扫描末尾开合…");
+      try {
+        await postCmd("end_grip_trim_request", payload);
+        let msg = "";
+        for (let i = 0; i < 40; i++) {
+          await new Promise((r) => setTimeout(r, 80));
+          await pollStatus(false);
+          msg = String((status && status.message) || "");
+          if (scopeS === "current" && msg.startsWith("marked end-grip trim")) {
+            const preview = status.end_grip_preview;
+            if (applyEndGripPreviewMarks(preview)) {
+              pendingEndGrip = null;
+              return;
+            }
+          }
+          if (msg.startsWith("confirm end-grip trim")) {
+            const nice = msg.replace(
+              /^confirm end-grip trim/,
+              "确认裁剪末尾开合"
+            );
+            if ($("endGripText")) {
+              $("endGripText").textContent =
+                nice +
+                "\n切点=全开→闭合拐点；将同步改写 parquet/zarr 与视频，不可撤销。";
+            }
+            if ($("endGripModal")) $("endGripModal").classList.add("show");
+            return;
+          }
+          if (
+            msg.includes("未检测到") ||
+            msg.includes("请先选择") ||
+            msg.includes("请稍候") ||
+            msg.includes("尚未加载")
+          ) {
+            setMsg(msg);
+            pendingEndGrip = null;
+            return;
+          }
+        }
+        setMsg(msg || "扫描超时，请重试");
+        pendingEndGrip = null;
+      } catch (e) {
+        setMsg(e.message);
+        pendingEndGrip = null;
+      }
     }
 
     function openConvertLerobotConfirm() {
@@ -1514,10 +2516,22 @@
 
     function closeFsModal() {
       if ($("fsModal")) $("fsModal").classList.remove("show");
+      fsPickMode = "load";
     }
 
-    function openFsModal() {
+    function openFsModal(mode) {
       if (!$("fsModal")) return;
+      fsPickMode = mode === "merge_add" ? "merge_add" : "load";
+      if ($("fsModalTitle")) {
+        $("fsModalTitle").textContent =
+          fsPickMode === "merge_add" ? "添加要合并的 LeRobot" : "选择数据文件夹";
+      }
+      if ($("fsModalHint")) {
+        $("fsModalHint").textContent =
+          fsPickMode === "merge_add"
+            ? "浏览并选中 LeRobot 数据集目录（含 meta/info.json），点「加入合并列表」。可重复添加多个。"
+            : "单击进入子文件夹（像资源管理器）。含 replay_buffer.zarr 或 LeRobot meta/info.json 的目录会标「数据集」，点「打开此数据集」加载。";
+      }
       $("fsModal").classList.add("show");
       // 从当前数据目录的上级开始，便于点进兄弟文件夹；否则仓库 data/
       let start = "";
@@ -1607,15 +2621,36 @@
           li.appendChild(meta);
         }
         li.onclick = () => browseFs(ent.path);
-        // 双击数据集：直接打开
+        // 双击数据集：打开 / 加入合并
         if (ent.is_dataset) {
           li.ondblclick = (ev) => {
             ev.preventDefault();
-            openDatasetFromBrowser(ent.path);
+            pickFsDataset(ent.path, ent.dataset_format);
           };
         }
         ul.appendChild(li);
       });
+    }
+
+    function fsCanPickCurrent(data) {
+      if (!data || !data.is_dataset) return false;
+      if (fsPickMode === "merge_add") {
+        return String(data.dataset_format || "") === "lerobot";
+      }
+      return true;
+    }
+
+    function pickFsDataset(path, fmt) {
+      if (fsPickMode === "merge_add") {
+        if (String(fmt || fsBrowse.dataset_format || "") !== "lerobot") {
+          setMsg("合并仅支持 LeRobot 数据集（需 meta/info.json）");
+          return;
+        }
+        addMergeSource(path);
+        closeFsModal();
+        return;
+      }
+      openDatasetFromBrowser(path);
     }
 
     async function browseFs(path) {
@@ -1631,16 +2666,29 @@
         renderFsCrumb(data.path);
         renderFsList(data);
         if ($("fsUp")) $("fsUp").disabled = !data.parent;
+        const canPick = fsCanPickCurrent(data);
         if ($("fsOpen")) {
-          $("fsOpen").disabled = !data.is_dataset;
-          $("fsOpen").textContent = data.is_dataset
-            ? "打开此数据集"
-            : "打开此数据集（当前不是）";
+          $("fsOpen").disabled = !canPick;
+          if (fsPickMode === "merge_add") {
+            $("fsOpen").textContent = canPick
+              ? "加入合并列表"
+              : "请选择 LeRobot 数据集";
+          } else {
+            $("fsOpen").textContent = data.is_dataset
+              ? "打开此数据集"
+              : "打开此数据集（当前不是）";
+          }
         }
         if (statusEl) {
-          statusEl.textContent = data.is_dataset
-            ? "当前目录含 replay_buffer.zarr，可打开"
-            : `子文件夹 ${ (data.entries || []).length } 个 · 单击进入`;
+          if (fsPickMode === "merge_add") {
+            statusEl.textContent = canPick
+              ? "当前是 LeRobot，可加入合并列表"
+              : `子文件夹 ${(data.entries || []).length} 个 · 请进入 LeRobot 目录`;
+          } else {
+            statusEl.textContent = data.is_dataset
+              ? "当前目录是数据集，可打开"
+              : `子文件夹 ${(data.entries || []).length} 个 · 单击进入`;
+          }
         }
       } catch (e) {
         if (statusEl) statusEl.textContent = "读取失败: " + e.message;
@@ -1673,7 +2721,9 @@
       syncDatasetPathLabel(s);
       syncDaggerSplitUi(s);
       syncConvertLerobotUi(s);
+      syncMergeLerobotUi(s);
       syncDatasetFormatBadge(s);
+      syncEndGripTrimUi(s);
 
       if (hubMode) return;
 
@@ -1705,11 +2755,7 @@
         setTrimControlsEnabled(trimEpOk);
         if ($("btnTrimIn")) $("btnTrimIn").disabled = !trimEpOk;
         if ($("btnTrimOut")) $("btnTrimOut").disabled = !trimEpOk;
-        if ($("btnTrimApply")) {
-          $("btnTrimApply").title = isLerobot
-            ? "裁掉标记外的头尾，原地改 parquet/视频"
-            : "裁掉标记外的头尾，原地改 zarr/视频";
-        }
+        syncTrimHotkeyUi();
         return;
       }
 
@@ -2791,8 +3837,22 @@
     wireFoldToggle("daggerSplitBox", "daggerFoldToggle", "fold_dagger_split");
     wireFoldToggle("convertLerobotBox", "convertLerobotFoldToggle", "fold_convert_lerobot");
 
+    if ($("btnOpenMergePage")) {
+      $("btnOpenMergePage").onclick = () => showMergePage();
+    }
+    if ($("btnMergeBack")) {
+      $("btnMergeBack").onclick = () => {
+        if (status.mode === "DELETING" || status.deleting) {
+          setMsg("合并进行中，请稍候…");
+          return;
+        }
+        hideMergePage();
+        applyUiMode(status.mode || "VIEW", status);
+      };
+    }
+
     if ($("btnBrowseDataset")) {
-      $("btnBrowseDataset").onclick = () => openFsModal();
+      $("btnBrowseDataset").onclick = () => openFsModal("load");
     }
     if ($("btnResetDataset")) {
       $("btnResetDataset").onclick = () => {
@@ -2826,6 +3886,80 @@
     }
     if ($("btnConvertLerobot")) {
       $("btnConvertLerobot").onclick = () => openConvertLerobotConfirm();
+    }
+    if ($("btnMergeAddSource")) {
+      $("btnMergeAddSource").onclick = () => openFsModal("merge_add");
+    }
+    if ($("btnMergeAddCurrent")) {
+      $("btnMergeAddCurrent").onclick = () => {
+        const dir = String(status.output_dir || "").trim();
+        if (!dir) {
+          setMsg("尚未加载数据目录");
+          return;
+        }
+        if (String(status.dataset_format || "") !== "lerobot") {
+          setMsg("当前目录不是 LeRobot，无法加入合并");
+          return;
+        }
+        addMergeSource(dir);
+      };
+    }
+    if ($("btnMergeClearSources")) {
+      $("btnMergeClearSources").onclick = () => {
+        mergeSources = [];
+        renderMergeSourceList();
+        syncMergeOutPreview();
+        setMsg("已清空合并列表");
+      };
+    }
+    if ($("mergeLerobotName")) {
+      $("mergeLerobotName").addEventListener("input", () => {
+        if ($("mergeLerobotOut")) delete $("mergeLerobotOut").dataset.touched;
+        syncMergeOutPreview();
+      });
+    }
+    if ($("mergeLerobotOut")) {
+      $("mergeLerobotOut").addEventListener("input", () => {
+        $("mergeLerobotOut").dataset.touched = "1";
+      });
+    }
+    if ($("btnMergeLerobot")) {
+      $("btnMergeLerobot").onclick = () => openMergeLerobotConfirm();
+    }
+    if ($("mergeLerobotNo")) {
+      $("mergeLerobotNo").onclick = () => {
+        if ($("mergeLerobotModal")) $("mergeLerobotModal").classList.remove("show");
+        pendingMerge = null;
+        postCmd("delete_cancel").catch(() => {});
+      };
+    }
+    if ($("mergeLerobotYes")) {
+      $("mergeLerobotYes").onclick = async () => {
+        if (!pendingMerge) {
+          if ($("mergeLerobotModal")) $("mergeLerobotModal").classList.remove("show");
+          return;
+        }
+        if (status.mode === "DELETING" || status.deleting) {
+          if ($("mergeLerobotModal")) $("mergeLerobotModal").classList.remove("show");
+          setMsg("正在处理数据，请稍候…");
+          return;
+        }
+        const payload = { ...pendingMerge };
+        if ($("mergeLerobotModal")) $("mergeLerobotModal").classList.remove("show");
+        if (!mergePageOpen) showMergePage();
+        if ($("mergeProgress")) $("mergeProgress").classList.add("show");
+        if ($("mergeProgressLabel")) {
+          $("mergeProgressLabel").textContent = "0% · 正在启动合并…";
+        }
+        if ($("mergeProgressBar")) $("mergeProgressBar").style.width = "0%";
+        try {
+          await postCmd("merge_lerobot_confirm", payload);
+          setMsg(`正在合并 → ${payload.out_dir}…`);
+        } catch (e) {
+          setMsg(e.message);
+        }
+        pendingMerge = null;
+      };
     }
     if ($("convertLerobotNo")) {
       $("convertLerobotNo").onclick = () => {
@@ -2901,7 +4035,7 @@
     if ($("fsOpen")) {
       $("fsOpen").onclick = () => {
         if (!fsBrowse.is_dataset || !fsBrowse.path) return;
-        openDatasetFromBrowser(fsBrowse.path);
+        pickFsDataset(fsBrowse.path, fsBrowse.dataset_format);
       };
     }
     // 点遮罩空白关闭浏览器
@@ -2939,6 +4073,13 @@
       stopPlay();
       onScrub();
     };
+    // 拖完进度条后焦点会留在 range 上，导致快捷键被 INPUT 过滤；松手后交还焦点
+    const blurScrub = () => {
+      if (!uiPrefs.scrubBlur) return;
+      if (document.activeElement === $("scrub")) $("scrub").blur();
+    };
+    $("scrub").addEventListener("pointerup", blurScrub);
+    $("scrub").addEventListener("change", blurScrub);
 
     document.querySelectorAll("#chanBtns button").forEach((btn) => {
       btn.onclick = () => setChartChannel(btn.dataset.chan);
@@ -2951,9 +4092,48 @@
     // --web 时后端不启 pynput，避免本机按 P 双触发（进拖拽又立刻退出）
     let _keyBusyUntil = 0;
     window.addEventListener("keydown", (ev) => {
+      // 正在改绑裁剪快捷键：优先捕获，不触发业务快捷键
+      if (hotkeyListening) {
+        if (ev.key === "Escape") {
+          ev.preventDefault();
+          cancelHotkeyListen();
+          return;
+        }
+        const code = normalizeHotkeyEvent(ev);
+        if (code) {
+          ev.preventDefault();
+          assignTrimHotkey(hotkeyListening, code);
+        }
+        return;
+      }
+
       const tag = (ev.target && ev.target.tagName) || "";
-      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
       const k = (ev.key || "").toLowerCase();
+      const settingsModalOpen =
+        $("settingsModal") && $("settingsModal").classList.contains("show");
+
+      // 设置面板：Esc 关闭；改绑时由上方 hotkeyListening 优先处理
+      if (settingsModalOpen) {
+        if (k === "escape") {
+          ev.preventDefault();
+          closeSettings();
+        }
+        return;
+      }
+
+      // 常见习惯：Ctrl+, / Cmd+, 打开设置
+      if (k === "," && (ev.ctrlKey || ev.metaKey)) {
+        ev.preventDefault();
+        openSettings();
+        return;
+      }
+
+      if (tag === "TEXTAREA" || tag === "SELECT") return;
+      // 文本框仍拦截；scrub 等 range 拖完常持有焦点，仍允许快捷键
+      if (tag === "INPUT") {
+        const itype = ((ev.target && ev.target.type) || "").toLowerCase();
+        if (itype !== "range") return;
+      }
       const modalOpen = $("delModal").classList.contains("show");
       const trimModalOpen = $("trimModal") && $("trimModal").classList.contains("show");
       const daggerModalOpen =
@@ -2974,7 +4154,7 @@
         } else if (k === "enter") {
           if (fsBrowse.is_dataset && fsBrowse.path) {
             ev.preventDefault();
-            openDatasetFromBrowser(fsBrowse.path);
+            pickFsDataset(fsBrowse.path, fsBrowse.dataset_format);
           }
         }
         return;
@@ -3024,25 +4204,32 @@
         return;
       }
 
-      // 数据管理快捷键：[ = 标起点，] = 标终点，T = 应用裁剪
+      // 数据管理快捷键（可在网页上改，存 localStorage）
       if (
         (viewerOnly || selectedEp != null) &&
         selectedEp != null &&
         selectedEp !== "live"
       ) {
-        if (ev.key === "[") {
+        const hk = normalizeHotkeyEvent(ev);
+        if (hk && hk === trimHotkeys.in) {
           ev.preventDefault();
           if ($("btnTrimIn") && !$("btnTrimIn").disabled) $("btnTrimIn").click();
           return;
         }
-        if (ev.key === "]") {
+        if (hk && hk === trimHotkeys.out) {
           ev.preventDefault();
           if ($("btnTrimOut") && !$("btnTrimOut").disabled) $("btnTrimOut").click();
           return;
         }
-        if (k === "t" && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+        // 应用键：起终点齐了才裁剪；否则空格仍可留给播放/暂停
+        if (
+          hk &&
+          hk === trimHotkeys.apply &&
+          $("btnTrimApply") &&
+          !$("btnTrimApply").disabled
+        ) {
           ev.preventDefault();
-          if ($("btnTrimApply") && !$("btnTrimApply").disabled) $("btnTrimApply").click();
+          $("btnTrimApply").click();
           return;
         }
       }
@@ -3142,6 +4329,58 @@
         setMsg("已清除裁剪标记");
       };
     }
+    if ($("btnSettings")) $("btnSettings").onclick = () => openSettings();
+    if ($("settingsDone")) $("settingsDone").onclick = () => closeSettings();
+    if ($("settingsClose")) $("settingsClose").onclick = () => closeSettings();
+    if ($("settingsModal")) {
+      $("settingsModal").addEventListener("click", (ev) => {
+        if (ev.target === $("settingsModal")) closeSettings();
+      });
+    }
+    document.querySelectorAll(".hotkey-bind").forEach((btn) => {
+      btn.onclick = () => {
+        const which = btn.dataset.bind;
+        if (!which) return;
+        if (hotkeyListening === which) {
+          cancelHotkeyListen();
+          return;
+        }
+        beginHotkeyListen(which);
+      };
+    });
+    if ($("hkBindReset")) {
+      $("hkBindReset").onclick = () => {
+        trimHotkeys = { ...TRIM_HOTKEY_DEFAULTS };
+        saveTrimHotkeys();
+        hotkeyListening = null;
+        syncTrimHotkeyUi();
+        setHotkeyHint("已恢复默认：1 / 2 / Space");
+      };
+    }
+    [
+      ["optScrubBlur", "scrubBlur"],
+      ["optShowHotkeyLabels", "showHotkeyLabels"],
+      ["optConfirmTrim", "confirmTrim"],
+    ].forEach(([id, key]) => {
+      if (!$(id)) return;
+      $(id).onchange = () => {
+        uiPrefs[key] = !!$(id).checked;
+        saveUiPrefs();
+        if (key === "showHotkeyLabels") syncTrimHotkeyUi();
+      };
+    });
+
+    async function confirmPendingTrim(payload) {
+      try {
+        await postCmd("trim_confirm", payload);
+        setMsg(
+          `正在裁剪 ep${payload.episode_id} → [${payload.start},${payload.end})…`
+        );
+      } catch (e) {
+        setMsg(e.message);
+      }
+    }
+
     if ($("btnTrimApply")) {
       $("btnTrimApply").onclick = () => {
         if (selectedEp == null || selectedEp === "live") return;
@@ -3169,12 +4408,59 @@
         const fmt = String(status.dataset_format || "zarr");
         const rewriteHint =
           fmt === "lerobot" ? "将改写 parquet / 视频 / meta" : "将改写 zarr / 视频";
+        if (!uiPrefs.confirmTrim) {
+          const payload = { ...pendingTrim };
+          pendingTrim = null;
+          postCmd("trim_request", payload)
+            .then(() => confirmPendingTrim(payload))
+            .catch((e) => setMsg(e.message));
+          return;
+        }
         $("trimText").textContent =
           `裁剪 episode ${selectedEp}：保留帧 [${start}, ${trimOut}]（共 ${end - start} / ${T} 步），` +
           `删除头 ${start} 步与尾 ${T - end} 步。${rewriteHint}` +
           "，不可撤销。";
         $("trimModal").classList.add("show");
         postCmd("trim_request", pendingTrim).catch((e) => setMsg(e.message));
+      };
+    }
+    if ($("btnEndGripTrimCur")) {
+      $("btnEndGripTrimCur").onclick = () => openEndGripTrimFlow("current");
+    }
+    if ($("btnEndGripTrimAll")) {
+      $("btnEndGripTrimAll").onclick = () => openEndGripTrimFlow("all");
+    }
+    if ($("endGripNo")) {
+      $("endGripNo").onclick = () => {
+        if ($("endGripModal")) $("endGripModal").classList.remove("show");
+        pendingEndGrip = null;
+        postCmd("delete_cancel").catch(() => {});
+      };
+    }
+    if ($("endGripYes")) {
+      $("endGripYes").onclick = async () => {
+        if (!pendingEndGrip) {
+          if ($("endGripModal")) $("endGripModal").classList.remove("show");
+          return;
+        }
+        if (status.mode === "DELETING" || status.deleting) {
+          if ($("endGripModal")) $("endGripModal").classList.remove("show");
+          setMsg("正在处理数据，请稍候…");
+          return;
+        }
+        const payload = { ...pendingEndGrip };
+        if ($("endGripModal")) $("endGripModal").classList.remove("show");
+        try {
+          await postCmd("end_grip_trim_confirm", payload);
+          setMsg(
+            payload.scope === "current"
+              ? `正在裁剪 ep${payload.episode_id} 末尾开合…`
+              : "正在一键裁剪全部末尾开合…"
+          );
+        } catch (e) {
+          setMsg(e.message);
+        }
+        pendingEndGrip = null;
       };
     }
     if ($("trimNo")) {
@@ -3307,6 +4593,7 @@
     } catch (_) {
       applyFontSize(20, { replot: false });
     }
+    syncTrimHotkeyUi();
   </script>
 </body>
 </html>

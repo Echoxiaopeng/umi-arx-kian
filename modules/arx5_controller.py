@@ -918,9 +918,39 @@ class Arx5Controller(mp.Process):
                                     if drag_hold_gripper is not None
                                     else g_meas
                                 )
-                                self.robot_client.set_tcp_pose(
-                                    drag_hold_pose, grip_cmd
-                                )
+                                try:
+                                    self.robot_client.set_tcp_pose(
+                                        drag_hold_pose, grip_cmd
+                                    )
+                                except Exception as tcp_hold_exc:
+                                    # 人手拖快时 hold 相对 last_eef_cmd 超距 → 全拒绝。
+                                    # sync 把 last 钉到实测后再跟，否则臂/爪都会发死。
+                                    msg = str(tcp_hold_exc).lower()
+                                    if (
+                                        "far away" not in msg
+                                        and "last command" not in msg
+                                    ):
+                                        raise
+                                    try:
+                                        self.robot_client.sync_after_drag()
+                                    except Exception:
+                                        pass
+                                    self.robot_client.get_state()
+                                    drag_hold_pose = np.asarray(
+                                        self.robot_client.tcp_pose, dtype=np.float64
+                                    ).reshape(6).copy()
+                                    drag_hold_gripper = float(
+                                        self.robot_client.gripper_pos
+                                    )
+                                    self.robot_client.set_tcp_pose(
+                                        drag_hold_pose, drag_hold_gripper
+                                    )
+                                    if time.monotonic() - _ee_pose_fail_t > 2.0:
+                                        _ee_pose_fail_t = time.monotonic()
+                                        print(
+                                            "[Arx5Controller] soft-hold re-synced "
+                                            "after far-away EE reject"
+                                        )
                             elif (
                                 drag_hold_mode == "joint"
                                 and drag_hold_joint is not None

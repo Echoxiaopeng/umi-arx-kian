@@ -152,6 +152,8 @@ class SharedCollectState:
         self.deleting: bool = False
         # 删除进度：{episode_id, phase, key, key_i, n_keys, frac, message} 或 None
         self.delete_progress: Optional[dict] = None
+        # 末尾开合预览：{episode_id, n, cut, drop, start, end} 或 None
+        self.end_grip_preview: Optional[dict] = None
         self.message: str = ""
         self.frequency: float = 60.0
         self.viewer_only: bool = False
@@ -252,6 +254,11 @@ class SharedCollectState:
                 "delete_progress": (
                     dict(self.delete_progress)
                     if isinstance(getattr(self, "delete_progress", None), dict)
+                    else None
+                ),
+                "end_grip_preview": (
+                    dict(self.end_grip_preview)
+                    if isinstance(getattr(self, "end_grip_preview", None), dict)
                     else None
                 ),
                 "message": self.message,

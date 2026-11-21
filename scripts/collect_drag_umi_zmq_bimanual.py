@@ -81,7 +81,7 @@ D435 画面预处理（训练 / 推理必须一致）
   已保存 episode（改写 zarr + videos + 可选 intervention sidecar）。
   支持打开 LeRobot v2.1（meta/info.json）并原地裁剪 parquet/视频；
   zarr 页可「转换为 LeRobot」（默认旁路 {dir}_lerobot，带进度）。
-  快捷键: [ = 标起点, ] = 标终点, T = 应用裁剪。
+  快捷键默认: 1 = 标起点, 2 = 标终点, Space = 应用裁剪（右上角 ⚙ 设置可改）。
   若目录含 intervention/（DAgger），可一键拆出人工示教（去首尾静止）与纯模型
   子集到旁边的 {name}_human / {name}_policy（也可用 scripts/extract_dagger_split.py）。
 
@@ -1591,6 +1591,42 @@ def save_episode(env: Arx5EnvWithImages, episode_id: int) -> bool:
     return True
 
 
+def auto_trim_end_grip_after_save(
+    env: Arx5EnvWithImages,
+    episode_id: int,
+    *,
+    grip_idx: int,
+    gripper_min_width: float = 0.011,
+    gripper_max_width: float = 0.085,
+    window_s: float = 1.5,
+    fps: float = 20.0,
+) -> tuple[int, int] | None:
+    """保存后若有末尾开合，裁到全开→闭合拐点；成功返回 (cut, drop)。"""
+    from modules.end_grip_gesture_trim import plan_end_grip_trims
+
+    plans = plan_end_grip_trims(
+        env,
+        grip_idx=int(grip_idx),
+        gripper_min=float(gripper_min_width),
+        gripper_max=float(gripper_max_width),
+        window_s=float(window_s),
+        episode_id=int(episode_id),
+        fps=float(fps),
+    )
+    if not plans:
+        return None
+    plan = plans[0]
+    cut = int(plan["cut"])
+    drop = int(plan["drop"])
+    n_before = int(plan["n"])
+    print(
+        f"Auto end-grip trim ep{episode_id}: drop last {drop} steps "
+        f"(keep [0, {cut}) of {n_before})."
+    )
+    ok = trim_saved_episode(env, int(episode_id), 0, cut)
+    return (cut, drop) if ok else None
+
+
 def leave_drag_stay_pose(env: Arx5EnvWithImages) -> None:
     """退出零力/拖拽，停留在当前位姿并恢复末端控制（供回放前调用）。"""
     print("Leaving drag for replay (stay at current pose)...")
@@ -3011,6 +3047,190 @@ def handle_convert_lerobot_web_cmd(
     return False
 
 
+def schedule_merge_lerobot(
+    sources: list[str | Path],
+    *,
+    out_dir: str | Path,
+    overwrite: bool = False,
+    web_state=None,
+    done_mode: str = "VIEW",
+) -> bool:
+    """后台合并多个 LeRobot 数据集；完成后自动加载输出目录。"""
+    from modules.merge_lerobot_datasets import merge_lerobot_datasets, validate_lerobot_sources
+
+    srcs = [Path(s).expanduser().resolve() for s in sources]
+    dst = Path(out_dir).expanduser().resolve()
+    try:
+        validate_lerobot_sources(srcs)
+    except Exception as exc:  # noqa: BLE001
+        msg = f"合并校验失败: {exc}"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+
+    if not _DELETE_LOCK.acquire(blocking=False):
+        msg = "正在处理数据（删除/裁剪/转换/合并），请稍候…"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+
+    if web_state is not None:
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            viewer_only=True,
+            delete_pending=None,
+            delete_progress={
+                "phase": "merge",
+                "frac": 0.0,
+                "message": f"合并 LeRobot → {dst}…",
+            },
+            message=f"合并 LeRobot · {len(srcs)} 源 → {dst}…",
+        )
+
+    def _on_progress(info: dict) -> None:
+        if web_state is None or not isinstance(info, dict):
+            return
+        payload = dict(info)
+        msg = str(payload.get("message") or "合并中…")
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            delete_progress=payload,
+            message=msg,
+        )
+
+    def _worker() -> None:
+        ok = False
+        err = ""
+        summary: dict = {}
+        try:
+            print(
+                f"[merge-lerobot] {len(srcs)} sources → {dst} "
+                f"overwrite={overwrite}"
+            )
+            summary = merge_lerobot_datasets(
+                srcs,
+                dst,
+                overwrite=bool(overwrite),
+                progress_cb=_on_progress,
+            )
+            ok = True
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            print(f"[merge-lerobot] failed: {exc}")
+            ok = False
+        finally:
+            if web_state is not None:
+                if ok:
+                    try:
+                        env = open_offline_dataset(dst)
+                        apply_manage_dataset(
+                            web_state,
+                            env,
+                            message=(
+                                f"已合并 LeRobot · {summary.get('n_episodes', 0)} ep / "
+                                f"{summary.get('n_frames', 0)} frames → {dst}"
+                            ),
+                        )
+                        web_state.update(
+                            deleting=False,
+                            delete_pending=None,
+                            delete_progress=None,
+                        )
+                    except Exception as load_exc:  # noqa: BLE001
+                        web_state.update(
+                            mode=done_mode,
+                            deleting=False,
+                            delete_pending=None,
+                            delete_progress=None,
+                            message=(
+                                f"合并完成但加载失败: {load_exc} · 输出在 {dst}"
+                            ),
+                        )
+                else:
+                    web_state.update(
+                        mode=done_mode,
+                        deleting=False,
+                        delete_pending=None,
+                        delete_progress=None,
+                        message=f"合并失败: {err}" if err else "合并失败",
+                    )
+            _DELETE_LOCK.release()
+
+    threading.Thread(target=_worker, name="merge-lerobot", daemon=True).start()
+    return True
+
+
+def handle_merge_lerobot_web_cmd(
+    web_state,
+    cmd: dict,
+    *,
+    done_mode: str = "VIEW",
+) -> bool:
+    """处理 merge_lerobot_request / merge_lerobot_confirm。"""
+    from modules.merge_lerobot_datasets import (
+        default_merge_out_dir,
+        validate_lerobot_sources,
+    )
+
+    action = cmd.get("action")
+    raw_sources = cmd.get("sources") or []
+    if not isinstance(raw_sources, list):
+        raw_sources = [raw_sources]
+    sources = [str(s).strip() for s in raw_sources if str(s).strip()]
+    if len(sources) < 2:
+        if web_state is not None:
+            web_state.update(message="请至少选择 2 个 LeRobot 数据集")
+        return False
+
+    name = str(cmd.get("out_name") or cmd.get("name") or "").strip()
+    out_raw = str(cmd.get("out_dir") or "").strip()
+    if not out_raw:
+        out_raw = str(default_merge_out_dir([Path(s) for s in sources], name))
+    overwrite = bool(cmd.get("overwrite", False))
+
+    if action == "merge_lerobot_request":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+        try:
+            validate_lerobot_sources([Path(s) for s in sources])
+        except Exception as exc:  # noqa: BLE001
+            if web_state is not None:
+                web_state.update(message=f"合并校验失败: {exc}")
+            return False
+        if web_state is not None:
+            web_state.update(
+                message=(
+                    f"confirm merge lerobot · {len(sources)} 源 → {out_raw}"
+                ),
+            )
+        print(
+            f"Confirm merge {len(sources)} lerobot → {out_raw}? (web Yes)"
+        )
+        return True
+
+    if action == "merge_lerobot_confirm":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+        return bool(
+            schedule_merge_lerobot(
+                sources,
+                out_dir=out_raw,
+                overwrite=overwrite,
+                web_state=web_state,
+                done_mode=done_mode,
+            )
+        )
+    return False
+
+
 def handle_trim_web_cmd(
     web_state,
     cmd: dict,
@@ -3103,6 +3323,241 @@ def handle_trim_web_cmd(
                 end,
                 web_state=web_state,
                 hold_robot=hold_robot,
+                done_mode=done_mode,
+            )
+        )
+    return False
+
+
+def schedule_end_grip_trim(
+    env,
+    *,
+    scope: str = "all",
+    episode_id: int | None = None,
+    grip_idx: int = 13,
+    window_s: float = 1.5,
+    web_state=None,
+    done_mode: str = "VIEW",
+) -> bool:
+    """后台批量裁剪末尾夹爪开合（parquet/zarr + 视频）。"""
+    from modules.end_grip_gesture_trim import apply_end_grip_trims, plan_end_grip_trims
+
+    if env is None:
+        if web_state is not None:
+            web_state.update(message="尚未加载数据目录")
+        return False
+
+    scope_s = str(scope or "all").lower().strip()
+    eid = None
+    if scope_s == "current":
+        if episode_id is None:
+            if web_state is not None:
+                web_state.update(message="请先选择一条 episode")
+            return False
+        eid = int(episode_id)
+
+    if not _DELETE_LOCK.acquire(blocking=False):
+        msg = "正在处理数据（删除/裁剪），请稍候…"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+
+    preview = plan_end_grip_trims(
+        env,
+        grip_idx=int(grip_idx),
+        window_s=float(window_s),
+        episode_id=eid,
+    )
+    if not preview:
+        _DELETE_LOCK.release()
+        msg = "未检测到末尾夹爪开合，无需裁剪"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+
+    n_ep = len(preview)
+    drop_sum = int(sum(int(p["drop"]) for p in preview))
+    if web_state is not None:
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            delete_pending=None,
+            delete_progress={
+                "phase": "start",
+                "frac": 0.0,
+                "message": f"末尾开合裁剪启动 · {n_ep} 条 / {drop_sum} 帧…",
+            },
+            message=f"末尾开合裁剪启动 · {n_ep} 条 / {drop_sum} 帧…",
+        )
+
+    def _on_progress(info: dict) -> None:
+        if web_state is None or not isinstance(info, dict):
+            return
+        payload = dict(info)
+        msg = str(payload.get("message") or "末尾开合裁剪中…")
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            delete_progress=payload,
+            message=msg,
+        )
+
+    def _worker() -> None:
+        ok = False
+        err = ""
+        summary = None
+        try:
+            summary = apply_end_grip_trims(
+                env,
+                grip_idx=int(grip_idx),
+                window_s=float(window_s),
+                episode_id=eid,
+                progress_cb=_on_progress,
+                trim_fn=trim_saved_episode,
+            )
+            # refresh lerobot shim lengths if available
+            rb = getattr(env, "replay_buffer", None)
+            if rb is not None and hasattr(rb, "refresh"):
+                try:
+                    rb.refresh()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"end-grip-trim refresh warning: {exc}")
+            ok = True
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            print(f"[end-grip-trim] failed: {exc}")
+            ok = False
+        finally:
+            if web_state is not None:
+                if ok and isinstance(summary, dict):
+                    msg = (
+                        f"末尾开合裁剪完成 · 处理 {summary.get('n_trimmed', 0)} 次 · "
+                        f"丢 {summary.get('n_drop_frames', 0)} 帧 · "
+                        f"{summary.get('n_passes', 0)} 轮"
+                    )
+                else:
+                    msg = f"末尾开合裁剪失败: {err}" if err else "末尾开合裁剪失败"
+                web_state.update(
+                    mode=done_mode,
+                    deleting=False,
+                    delete_pending=None,
+                    delete_progress=None,
+                    message=msg,
+                )
+            _DELETE_LOCK.release()
+
+    threading.Thread(target=_worker, name="end-grip-trim", daemon=True).start()
+    return True
+
+
+def handle_end_grip_trim_web_cmd(
+    web_state,
+    cmd: dict,
+    *,
+    done_mode: str = "VIEW",
+) -> bool:
+    """处理 end_grip_trim_request / end_grip_trim_confirm。"""
+    from modules.end_grip_gesture_trim import plan_end_grip_trims
+
+    action = cmd.get("action")
+    env = web_state.env if web_state is not None else None
+    if env is None:
+        if web_state is not None:
+            web_state.update(message="尚未加载数据目录")
+        return False
+
+    scope = str(cmd.get("scope", "all")).lower().strip() or "all"
+    grip_idx = int(cmd.get("grip_idx", 13))
+    window_s = float(cmd.get("window_s", 1.5))
+    eid = cmd.get("episode_id", None)
+    try:
+        eid_i = int(eid) if eid is not None and str(eid) != "" else None
+    except (TypeError, ValueError):
+        eid_i = None
+    if scope == "current" and eid_i is None:
+        if web_state is not None:
+            web_state.update(message="请先选择一条 episode")
+        return False
+
+    if action == "end_grip_trim_request":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…", end_grip_preview=None)
+            return False
+        plans = plan_end_grip_trims(
+            env,
+            grip_idx=grip_idx,
+            window_s=window_s,
+            episode_id=eid_i if scope == "current" else None,
+        )
+        if not plans:
+            if web_state is not None:
+                web_state.update(
+                    message="未检测到末尾夹爪开合，无需裁剪",
+                    end_grip_preview=None,
+                )
+            return False
+        n_ep = len(plans)
+        drop_sum = int(sum(int(p["drop"]) for p in plans))
+        avg = drop_sum / max(n_ep, 1)
+        scope_txt = f"当前 ep{eid_i}" if scope == "current" else "全部 episode"
+
+        # 当前条：只预览并写入标记，由用户检查后点「应用裁剪」
+        if scope == "current":
+            p0 = plans[0]
+            preview = {
+                "episode_id": int(p0["episode_id"]),
+                "n": int(p0["n"]),
+                "cut": int(p0["cut"]),
+                "drop": int(p0["drop"]),
+                "start": int(p0.get("start", 0)),
+                "end": int(p0.get("end", max(0, int(p0["cut"]) - 1))),
+            }
+            if web_state is not None:
+                web_state.update(
+                    end_grip_preview=preview,
+                    message=(
+                        f"marked end-grip trim ep{preview['episode_id']} · "
+                        f"保留 [{preview['start']}, {preview['end']}] · "
+                        f"丢尾 {preview['drop']} 帧（全开→闭合拐点）· 请检查后点应用裁剪"
+                    ),
+                )
+            print(
+                f"Marked end-grip trim ep{preview['episode_id']}: "
+                f"keep [{preview['start']}, {preview['end']}] "
+                f"drop {preview['drop']} (closing-onset)"
+            )
+            return True
+
+        if web_state is not None:
+            web_state.update(
+                end_grip_preview=None,
+                message=(
+                    f"confirm end-grip trim ({scope_txt}) · "
+                    f"{n_ep} 条 · 约丢 {drop_sum} 帧 (均 {avg:.0f})"
+                ),
+            )
+        print(
+            f"Confirm end-grip trim ({scope_txt}): {n_ep} eps, "
+            f"drop ~{drop_sum} frames? (web Yes)"
+        )
+        return True
+
+    if action == "end_grip_trim_confirm":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+        return bool(
+            schedule_end_grip_trim(
+                env,
+                scope=scope,
+                episode_id=eid_i if scope == "current" else None,
+                grip_idx=grip_idx,
+                window_s=window_s,
+                web_state=web_state,
                 done_mode=done_mode,
             )
         )
@@ -3243,6 +3698,22 @@ def run_viewer_only(
                     "convert_lerobot_confirm",
                 ):
                     handle_convert_lerobot_web_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
+                if action in (
+                    "merge_lerobot_request",
+                    "merge_lerobot_confirm",
+                ):
+                    handle_merge_lerobot_web_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
+                if action in (
+                    "end_grip_trim_request",
+                    "end_grip_trim_confirm",
+                ):
+                    handle_end_grip_trim_web_cmd(
                         web_state, cmd, done_mode="VIEW"
                     )
                     continue
@@ -3545,6 +4016,22 @@ def run_web_hub(
                         web_state, cmd, done_mode="VIEW"
                     )
                     continue
+                if action in (
+                    "merge_lerobot_request",
+                    "merge_lerobot_confirm",
+                ):
+                    handle_merge_lerobot_web_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
+                if action in (
+                    "end_grip_trim_request",
+                    "end_grip_trim_confirm",
+                ):
+                    handle_end_grip_trim_web_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
                 if is_delete_busy() and action in (
                     "load_dataset",
                     "back_hub",
@@ -3730,8 +4217,12 @@ def run_collect_session(
         print(
             f"  grip_gesture: robot{int(grip_gesture_robot)} (can1) "
             f"double open-close within {float(grip_gesture_window):.2f}s "
-            "→ start / save (trimmed); S/gesture save → init then drag"
+            "→ start / save; S/gesture save → init then drag"
         )
+    print(
+        "  auto_end_grip_trim: ON "
+        "(after each save, drop leftover end open-close @ closing onset)"
+    )
     if web:
         print(f"  web        : http://{web_host}:{web_port}/  (no_cv={no_cv})")
     print("=" * 60)
@@ -4386,6 +4877,30 @@ def run_collect_session(
                                 ),
                             )
                             continue
+                        if action in (
+                            "merge_lerobot_request",
+                            "merge_lerobot_confirm",
+                        ):
+                            handle_merge_lerobot_web_cmd(
+                                web_state,
+                                cmd,
+                                done_mode=(
+                                    "READY" if no_zero_force else "IDLE"
+                                ),
+                            )
+                            continue
+                        if action in (
+                            "end_grip_trim_request",
+                            "end_grip_trim_confirm",
+                        ):
+                            handle_end_grip_trim_web_cmd(
+                                web_state,
+                                cmd,
+                                done_mode=(
+                                    "READY" if no_zero_force else "IDLE"
+                                ),
+                            )
+                            continue
                         if is_delete_busy() and action not in (
                             "quit",
                             "estop",
@@ -4791,7 +5306,7 @@ def run_collect_session(
                         grip_detector.reset()
                         print(
                             f"Double open-close robot{grip_robot_idx} gripper "
-                            "to SAVE (gesture trimmed from zarr), or press S."
+                            "to SAVE (gesture + end-grip trimmed), or press S."
                         )
                     if web_state is not None:
                         web_state.clear_live_series()
@@ -5046,15 +5561,49 @@ def run_collect_session(
                                         message=f"正在保存 episode {episode_id}…写盘中，请稍候",
                                     )
                                 ok = save_episode(env, episode_id)
+                                end_grip_drop = 0
                                 if ok:
+                                    if web_state is not None:
+                                        web_state.update(
+                                            mode="SAVING",
+                                            recording=False,
+                                            message=(
+                                                f"已写入 episode {episode_id}，"
+                                                "检查末尾开合…"
+                                            ),
+                                        )
+                                    # 与数据管理「裁剪末尾开合」同一套拐点逻辑：
+                                    # 每次保存后同步裁掉结尾开合（含按 S 留下的）。
+                                    trimmed = auto_trim_end_grip_after_save(
+                                        env,
+                                        episode_id,
+                                        grip_idx=int(grip_robot_idx) * 7 + 6,
+                                        gripper_min_width=float(
+                                            gripper_min_width
+                                        ),
+                                        gripper_max_width=float(
+                                            gripper_max_width
+                                        ),
+                                        window_s=float(grip_gesture_window),
+                                        fps=float(frequency),
+                                    )
+                                    if trimmed is not None:
+                                        cut, end_grip_drop = trimmed
+                                        n_steps = int(cut)
                                     via = (
-                                        " [grip gesture, trimmed]"
+                                        " [grip gesture]"
                                         if save_via_grip_gesture
+                                        else ""
+                                    )
+                                    trim_note = (
+                                        f", end-grip -{end_grip_drop}"
+                                        if end_grip_drop > 0
                                         else ""
                                     )
                                     print(
                                         f"Episode {episode_id} saved{via} "
-                                        f"({n_steps} steps @ {frequency} Hz). "
+                                        f"({n_steps} steps{trim_note} "
+                                        f"@ {frequency} Hz). "
                                         "Press R to replay, E to delete."
                                     )
                                 if grip_detector is not None:
