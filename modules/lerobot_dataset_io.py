@@ -1,4 +1,4 @@
-"""LeRobot v2.1 dataset helpers for offline viewer: detect / list / series / frame / trim."""
+"""LeRobot v2.1 dataset helpers for offline viewer: detect / list / series / frame / trim / delete."""
 
 from __future__ import annotations
 
@@ -685,6 +685,233 @@ def trim_lerobot_episode(
                 "message": f"已裁剪 ep{episode_id} → [{start},{end}) · {keep} 步",
             }
         )
+    return True
+
+
+def _unlink_episode_assets(root: Path, episode_id: int, info: dict) -> None:
+    pq_path = episode_parquet_path(root, episode_id, info)
+    if pq_path.is_file():
+        pq_path.unlink()
+    for vkey in LEROBOT_CAM_KEYS:
+        mp4 = episode_video_path(root, episode_id, vkey, info)
+        if mp4.is_file():
+            mp4.unlink()
+
+
+def _relocate_episode_assets(
+    root: Path,
+    src_eid: int,
+    dst_eid: int,
+    info: dict,
+) -> None:
+    """Move parquet + videos src→dst and set parquet ``episode_index`` to dst."""
+    pa, pq = _require_pyarrow()
+    src_pq = episode_parquet_path(root, src_eid, info)
+    dst_pq = episode_parquet_path(root, dst_eid, info)
+    if not src_pq.is_file():
+        raise FileNotFoundError(f"missing parquet for ep{src_eid}: {src_pq}")
+    if dst_pq.exists():
+        raise FileExistsError(f"destination parquet already exists: {dst_pq}")
+    dst_pq.parent.mkdir(parents=True, exist_ok=True)
+
+    tab = pq.read_table(src_pq)
+    T = int(tab.num_rows)
+    cols = {name: tab[name] for name in tab.column_names}
+    if "episode_index" in cols:
+        cols["episode_index"] = pa.array(
+            np.full(T, int(dst_eid), dtype=np.int64), type=pa.int64()
+        )
+    tmp_pq = dst_pq.with_suffix(".move_tmp.parquet")
+    pq.write_table(pa.table(cols), tmp_pq)
+    tmp_pq.replace(dst_pq)
+    src_pq.unlink()
+
+    for vkey in LEROBOT_CAM_KEYS:
+        src_v = episode_video_path(root, src_eid, vkey, info)
+        dst_v = episode_video_path(root, dst_eid, vkey, info)
+        if not src_v.is_file():
+            continue
+        dst_v.parent.mkdir(parents=True, exist_ok=True)
+        if dst_v.exists():
+            dst_v.unlink()
+        shutil.move(str(src_v), str(dst_v))
+
+
+def _rewrite_meta_after_delete(
+    root: Path,
+    *,
+    deleted_eid: int,
+    id_map: dict[int, int],
+    lengths_by_new_id: dict[int, int],
+) -> None:
+    """Rewrite episodes.jsonl / episodes_stats.jsonl / info.json after a delete."""
+    meta_dir = Path(root) / "meta"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+
+    eps_path = meta_dir / "episodes.jsonl"
+    rows_out: list[dict] = []
+    if eps_path.is_file():
+        for line in eps_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+                old = int(row["episode_index"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
+            if old == int(deleted_eid) or old not in id_map:
+                continue
+            new = int(id_map[old])
+            row["episode_index"] = new
+            row["length"] = int(lengths_by_new_id.get(new, row.get("length") or 0))
+            rows_out.append(row)
+    if not rows_out:
+        for new in sorted(lengths_by_new_id):
+            rows_out.append(
+                {
+                    "episode_index": int(new),
+                    "tasks": [DEFAULT_PROMPT_FALLBACK],
+                    "length": int(lengths_by_new_id[new]),
+                }
+            )
+    rows_out.sort(key=lambda r: int(r["episode_index"]))
+    with open(eps_path, "w", encoding="utf-8") as f:
+        for row in rows_out:
+            f.write(json.dumps(row) + "\n")
+
+    stats_path = meta_dir / "episodes_stats.jsonl"
+    stats_out: list[dict] = []
+    if stats_path.is_file():
+        for line in stats_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+                old = int(row["episode_index"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
+            if old == int(deleted_eid) or old not in id_map:
+                continue
+            new = int(id_map[old])
+            row["episode_index"] = new
+            n = int(lengths_by_new_id.get(new, 0))
+            stats = row.setdefault("stats", {})
+            for key in ("observation.state", "action"):
+                if key not in stats:
+                    stats[key] = {
+                        "min": [],
+                        "max": [],
+                        "mean": [],
+                        "std": [],
+                        "count": [n],
+                    }
+                else:
+                    stats[key]["count"] = [n]
+            stats_out.append(row)
+    stats_out.sort(key=lambda r: int(r["episode_index"]))
+    with open(stats_path, "w", encoding="utf-8") as f:
+        for row in stats_out:
+            f.write(json.dumps(row) + "\n")
+
+    info = load_info(root)
+    info["total_episodes"] = len(rows_out)
+    info["total_frames"] = int(sum(int(r.get("length") or 0) for r in rows_out))
+    n_cams = len(LEROBOT_CAM_KEYS)
+    info["total_videos"] = int(info["total_episodes"]) * n_cams
+    info["splits"] = {"train": f"0:{info['total_episodes']}"}
+    with open(meta_dir / "info.json", "w", encoding="utf-8") as f:
+        json.dump(info, f, indent=2)
+
+
+def delete_lerobot_episode(
+    root: Path,
+    episode_id: int,
+    progress_cb: ProgressCb = None,
+) -> bool:
+    """Delete one episode; renumber higher ids down; rewrite parquet/videos/meta."""
+    root = Path(root)
+    info = load_info(root)
+    ids = list_episode_ids(root, info)
+    eid = int(episode_id)
+    if eid not in ids:
+        raise IndexError(f"episode {eid} not in dataset (have {ids[:8]}…)")
+
+    lengths_old = {i: int(episode_length(root, i, info)) for i in ids}
+    remaining_old = [i for i in ids if i != eid]
+    id_map = {old: new for new, old in enumerate(remaining_old)}
+
+    def _prog(frac: float, message: str, **extra) -> None:
+        if progress_cb is None:
+            return
+        payload = {
+            "phase": "lerobot_delete",
+            "frac": float(frac),
+            "message": message,
+            "episode_id": eid,
+        }
+        payload.update(extra)
+        progress_cb(payload)
+
+    _prog(0.05, f"删除 ep{eid} 文件…")
+    _unlink_episode_assets(root, eid, info)
+
+    # 从高到低搬迁，避免覆盖尚未搬走的目标
+    to_move = [(o, n) for o, n in id_map.items() if o != n]
+    to_move.sort(key=lambda x: x[0], reverse=True)
+    for mi, (src, dst) in enumerate(to_move):
+        _prog(
+            0.1 + 0.55 * ((mi + 1) / max(len(to_move), 1)),
+            f"重编号 ep{src} → ep{dst} ({mi + 1}/{len(to_move)})…",
+            key="relocate",
+        )
+        _relocate_episode_assets(root, src, dst, info)
+
+    lengths_by_new = {id_map[o]: lengths_old[o] for o in remaining_old}
+
+    _prog(0.75, "重写 meta…")
+    _rewrite_meta_after_delete(
+        root,
+        deleted_eid=eid,
+        id_map=id_map,
+        lengths_by_new_id=lengths_by_new,
+    )
+
+    # 全局 index 连续重排
+    pa, pq = _require_pyarrow()
+    info = load_info(root)
+    new_ids = list(range(len(remaining_old)))
+    running = 0
+    for ni, new_eid in enumerate(new_ids):
+        _prog(
+            0.8 + 0.15 * ((ni + 1) / max(len(new_ids), 1)),
+            f"重排 index ep{new_eid}…",
+            key="reindex",
+        )
+        path = episode_parquet_path(root, new_eid, info)
+        if not path.is_file():
+            continue
+        tab = pq.read_table(path)
+        T = int(tab.num_rows)
+        cols = {name: tab[name] for name in tab.column_names}
+        cols["index"] = pa.array(
+            np.arange(running, running + T, dtype=np.int64), type=pa.int64()
+        )
+        if "episode_index" in cols:
+            cols["episode_index"] = pa.array(
+                np.full(T, int(new_eid), dtype=np.int64), type=pa.int64()
+            )
+        tmp = path.with_suffix(".reindex_tmp.parquet")
+        pq.write_table(pa.table(cols), tmp)
+        tmp.replace(path)
+        running += T
+
+    _prog(
+        1.0,
+        f"已删除 ep{eid} · 剩余 {len(remaining_old)} 条 · {running} 帧",
+        key="(done)",
+    )
     return True
 
 

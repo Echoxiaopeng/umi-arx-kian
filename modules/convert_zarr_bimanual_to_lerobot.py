@@ -41,6 +41,7 @@ def _require_pyarrow():
 
 DEFAULT_PROMPT = "Flatten and fold the cloth."
 DEFAULT_FPS = 20
+DEFAULT_ROBOT_TYPE = "agilex"
 IMAGE_HW = (224, 224)
 
 CAM_MAP = (
@@ -197,6 +198,7 @@ def convert_one_zarr(
     *,
     prompt: str = DEFAULT_PROMPT,
     fps: int = DEFAULT_FPS,
+    robot_type: str = DEFAULT_ROBOT_TYPE,
     episode_offset: int = 0,
     global_index_offset: int = 0,
     overwrite: bool = False,
@@ -205,6 +207,7 @@ def convert_one_zarr(
     """Convert one replay_buffer.zarr into a LeRobot dataset at ``out_dir``.
 
     Returns (n_episodes, n_frames) written on disk.
+    ``robot_type`` is written to ``meta/info.json`` (default: agilex).
     """
     pa, pq = _require_pyarrow()
     zarr_path = Path(zarr_path)
@@ -363,11 +366,12 @@ def convert_one_zarr(
         lengths.append(n)
         total += n
 
+    robot = str(robot_type or "").strip() or DEFAULT_ROBOT_TYPE
     with open(meta_dir / "info.json", "w", encoding="utf-8") as f:
         json.dump(
             {
                 "codebase_version": "v2.1",
-                "robot_type": "agilex",
+                "robot_type": robot,
                 "total_episodes": len(parquets),
                 "total_frames": total,
                 "total_tasks": 1,

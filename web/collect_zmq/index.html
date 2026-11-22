@@ -4,20 +4,92 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ARX5 ZMQ Collect</title>
+  <script>
+    try {
+      var _t = JSON.parse(localStorage.getItem("collect_ui_prefs") || "{}").theme;
+      document.documentElement.setAttribute(
+        "data-theme",
+        _t === "light" ? "light" : "dark"
+      );
+    } catch (_e) {
+      document.documentElement.setAttribute("data-theme", "dark");
+    }
+  </script>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
-    :root {
+    :root,
+    html[data-theme="dark"] {
       --bg: #0f1419;
+      --bg-deep: #0a0e14;
       --panel: #1a2332;
+      --panel-2: #121820;
+      --hover: #243044;
+      --active: #1e2a3c;
       --border: #2d3a4d;
       --text: #e7ecf3;
       --muted: #8b9bb4;
+      --chart-fg: #c5d0e0;
       --accent: #3d9cf0;
       --ok: #3ecf8e;
       --warn: #f0b429;
       --danger: #f07178;
       --rec: #ff5c5c;
-      --ui-font: 20px;
+      --btn-bg: #243044;
+      --btn-primary: #1e4d7a;
+      --btn-danger: #4a2228;
+      --btn-ok: #1a3d30;
+      --track: #3a4a63;
+      --thumb-ring: #0e141c;
+      --preview-bg: #0c1017;
+      --preview-letterbox: #0a0e14;
+      --badge-bg: #243044;
+      --fmt-zarr-bg: #1e2a3c;
+      --fmt-zarr-fg: #7eb6e8;
+      --fmt-zarr-bd: #3d9cf066;
+      --fmt-lerobot-bg: #123528;
+      --fmt-lerobot-fg: #5dffb0;
+      --fmt-lerobot-bd: #3ecf8e66;
+      --annot-bg: rgba(18, 24, 32, 0.88);
+      /* 紧凑默认：大屏也压在 ~12–13px，避免各屏显得过大 */
+      --ui-font: clamp(11px, 0.25vw + 10px, 13px);
+      --ui-pad: clamp(4px, 0.4vw, 8px);
+      color-scheme: dark;
+    }
+    html[data-theme="light"] {
+      --bg: #e8eef5;
+      --bg-deep: #dce5f0;
+      --panel: #f7f9fc;
+      --panel-2: #eef3f9;
+      --ui-font: clamp(11px, 0.25vw + 10px, 13px);
+      --ui-pad: clamp(4px, 0.4vw, 8px);
+      --hover: #d9e4f2;
+      --active: #cfe0f4;
+      --border: #b7c5d8;
+      --text: #1a2433;
+      --muted: #5a6b82;
+      --chart-fg: #2a3a50;
+      --accent: #1a7fd4;
+      --ok: #1f9a62;
+      --warn: #c48a12;
+      --danger: #d0454c;
+      --rec: #e04040;
+      --btn-bg: #e2ebf6;
+      --btn-primary: #c8dff5;
+      --btn-danger: #f3d4d6;
+      --btn-ok: #cfeade;
+      --track: #a8b8cc;
+      --thumb-ring: #f7f9fc;
+      --preview-bg: #d5dee9;
+      --preview-letterbox: #c5d0de;
+      --badge-bg: #e2ebf6;
+      --fmt-zarr-bg: #d9e8f8;
+      --fmt-zarr-fg: #145a9c;
+      --fmt-zarr-bd: #1a7fd466;
+      --fmt-lerobot-bg: #d4efe3;
+      --fmt-lerobot-fg: #0f7a4a;
+      --fmt-lerobot-bd: #1f9a6266;
+      --annot-bg: rgba(247, 249, 252, 0.92);
+      color-scheme: light;
     }
     * { box-sizing: border-box; }
     html {
@@ -41,71 +113,122 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
-      padding: 10px 20px;
+      gap: 8px;
+      padding: 2px 8px;
+      min-height: 0;
       border-bottom: 1px solid var(--border);
       background: var(--panel);
+      flex-wrap: nowrap;
     }
-    header .left { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-    header .right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    header .left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1 1 auto;
+      min-width: 0;
+      flex-wrap: nowrap;
+    }
+    header .right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: 0 0 auto;
+      flex-wrap: nowrap;
+    }
     header h1 {
       margin: 0;
-      font-size: 1.25rem;
+      font-size: 0.92rem;
       font-weight: 600;
       letter-spacing: 0.02em;
+      white-space: nowrap;
     }
-    header .hint { color: var(--muted); font-size: 0.9rem; }
+    header .hint {
+      color: var(--muted);
+      font-size: 0.72rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    body.viewer-mode header .hint,
+    body.library-mode header .hint {
+      display: none;
+    }
     .font-btns {
       display: inline-flex;
       align-items: center;
-      gap: 4px;
+      gap: 2px;
       border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 2px;
-      background: #121820;
+      border-radius: 6px;
+      padding: 1px;
+      background: var(--panel-2);
     }
     .font-btns button {
-      padding: 4px 10px;
-      font-size: 0.85rem;
-      min-width: 2rem;
+      padding: 2px 7px;
+      font-size: 0.75rem;
+      min-width: 1.6rem;
       border: none;
       background: transparent;
     }
-    .font-btns button:hover:not(:disabled) { background: #243044; }
+    .font-btns button:hover:not(:disabled) { background: var(--hover); }
+    .theme-btns {
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1px;
+      background: var(--panel-2);
+    }
+    .theme-btns button {
+      padding: 2px 8px;
+      font-size: 0.75rem;
+      border: none;
+      background: transparent;
+      color: var(--muted);
+    }
+    .theme-btns button.active {
+      background: var(--hover);
+      color: var(--text);
+    }
+    .theme-btns button:hover:not(:disabled) {
+      background: var(--hover);
+      color: var(--text);
+    }
     .font-btns #fontLabel {
       color: var(--muted);
-      font-size: 0.8rem;
+      font-size: 0.72rem;
       font-variant-numeric: tabular-nums;
-      padding: 0 6px;
-      min-width: 2.8rem;
+      padding: 0 4px;
+      min-width: 2.2rem;
       text-align: center;
     }
     .btn-icon {
-      width: 36px;
-      height: 36px;
+      width: 26px;
+      height: 26px;
       padding: 0;
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      border-radius: 8px;
+      border-radius: 6px;
       background: transparent;
       border-color: transparent;
       color: var(--muted);
     }
     .btn-icon:hover {
-      background: #243044;
+      background: var(--hover);
       color: var(--text);
       border-color: var(--border);
     }
     .btn-icon svg {
-      width: 20px;
-      height: 20px;
+      width: 16px;
+      height: 16px;
       display: block;
     }
     #btnSettings {
-      width: 48px;
-      height: 48px;
-      border-radius: 10px;
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
       color: var(--text);
     }
     #btnSettings svg {
@@ -222,10 +345,10 @@
     .wrap {
       flex: 1 1 auto;
       min-height: 0;
-      padding: 12px 16px;
+      padding: var(--ui-pad) calc(var(--ui-pad) + 2px);
       display: flex;
       flex-direction: column;
-      gap: 12px;
+      gap: clamp(8px, 1vh, 12px);
       overflow: hidden;
     }
     .row { display: grid; gap: 12px; min-height: 0; }
@@ -236,20 +359,317 @@
       max-height: min(42vh, 480px);
       align-items: stretch;
     }
-    /* 数据管理：上方预览不被下方 episode 区挤扁 */
-    body.viewer-mode .row.top {
-      flex: 0 0 auto;
-      flex-shrink: 0;
-      height: min(38vh, 440px);
-      min-height: 240px;
-      max-height: min(42vh, 480px);
+    /* 数据管理：Visualizer 式单页（预览在主列，不再占上方独立行） */
+    body.viewer-mode #collectRow {
+      display: none !important;
+    }
+    body.viewer-mode #viewerOnlyBar {
+      display: none !important;
+    }
+    body.viewer-mode #episodePanel > h2 {
+      display: none;
     }
     body.viewer-mode .panel.grow {
       flex: 1 1 0;
       min-height: 0;
+      padding: 4px 6px;
     }
-    body.viewer-mode #viewerOnlyBar {
+    body.viewer-mode .viewer {
+      grid-template-columns: minmax(120px, 160px) 1fr;
+      gap: 8px;
+      height: 100%;
+    }
+    body.viewer-mode .viewer-main {
+      gap: 4px;
+      min-height: 0;
+      overflow: hidden;
+    }
+    body.viewer-mode .viz-header {
+      display: flex;
+      align-items: center;
+      gap: 4px 6px;
+      flex-wrap: nowrap;
       flex: 0 0 auto;
+      margin-bottom: 0;
+      min-height: 0;
+      overflow: hidden;
+    }
+    body.viewer-mode .viz-header .badge {
+      padding: 1px 6px;
+      font-size: 0.7rem;
+    }
+    body.viewer-mode .viz-header .badge .badge-sub {
+      font-size: 0.65rem;
+    }
+    body.viewer-mode .viz-header .viz-ep-title {
+      font-size: 0.82rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      margin: 0;
+      color: var(--text);
+      white-space: nowrap;
+    }
+    body.viewer-mode .viz-header .viz-path {
+      color: var(--muted);
+      font-size: 0.7rem;
+      max-width: min(18vw, 160px);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 0 1 auto;
+    }
+    body.viewer-mode .viz-header button {
+      padding: 1px 6px;
+      font-size: 0.72rem;
+      flex: 0 0 auto;
+    }
+    body.viewer-mode .viz-header .msg {
+      font-size: 0.7rem;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    body.viewer-mode .viz-stats {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 8px;
+      flex-wrap: nowrap;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      font-size: 0.72rem;
+      flex: 0 0 auto;
+    }
+    body.viewer-mode .viz-stats em {
+      font-style: normal;
+      color: var(--muted);
+      font-size: 0.65rem;
+      margin-right: 2px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    body.viewer-mode .viz-stats strong {
+      font-weight: 650;
+    }
+    body.viewer-mode .viz-path-bar {
+      flex: 0 0 auto;
+      width: 100%;
+      margin: 0;
+      padding: 4px 8px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel-2);
+      gap: 6px;
+      align-items: center;
+    }
+    body.viewer-mode .viz-path-bar > label {
+      font-weight: 650;
+      color: var(--text);
+      flex: 0 0 auto;
+    }
+    body.viewer-mode .viz-path-bar .path-suggest-wrap {
+      position: relative;
+      flex: 1 1 auto;
+      min-width: 0;
+      display: flex;
+    }
+    body.viewer-mode .viz-path-bar .path-current,
+    body.viewer-mode .viz-path-bar input.path-current {
+      flex: 1 1 auto;
+      width: 100%;
+      min-width: 0;
+      font-size: 0.88rem;
+      background: var(--bg);
+      border-color: var(--border);
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    body.viewer-mode .viz-path-bar input.path-current:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent);
+    }
+    body.viewer-mode .path-suggest {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: calc(100% + 4px);
+      z-index: 40;
+      margin: 0;
+      padding: 4px 0;
+      list-style: none;
+      max-height: min(40vh, 320px);
+      overflow: auto;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+    }
+    body.viewer-mode .path-suggest li {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 0.86rem;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+    }
+    body.viewer-mode .path-suggest li:hover,
+    body.viewer-mode .path-suggest li.active {
+      background: var(--hover);
+    }
+    body.viewer-mode .path-suggest .ps-name {
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--text);
+    }
+    body.viewer-mode .path-suggest .ps-tag {
+      flex: 0 0 auto;
+      font-size: 0.72rem;
+      color: var(--fmt-lerobot-fg);
+      background: var(--fmt-lerobot-bg);
+      border: 1px solid var(--fmt-lerobot-bd);
+      border-radius: 999px;
+      padding: 1px 7px;
+    }
+    body.viewer-mode .path-suggest .ps-tag.fmt-zarr {
+      color: var(--fmt-zarr-fg);
+      background: var(--fmt-zarr-bg);
+      border-color: var(--fmt-zarr-bd);
+    }
+    body.viewer-mode .path-suggest .ps-empty {
+      color: var(--muted);
+      cursor: default;
+      font-family: inherit;
+    }
+    body.viewer-mode .path-suggest .ps-empty:hover {
+      background: transparent;
+    }
+    body:not(.viewer-mode) .viz-path-bar {
+      display: none !important;
+    }
+    /* 预览与曲线接近 1:1，曲线用真实 flex 高度（勿把 Plotly 画布撑出容器） */
+    body.viewer-mode .viz-preview {
+      display: flex;
+      flex-direction: column;
+      flex: 1 1 0;
+      min-height: 0;
+      max-height: 46vh;
+      background: var(--preview-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      position: relative;
+    }
+    body.viewer-mode .viz-preview .live-img {
+      width: 100%;
+      height: 100%;
+      max-height: none;
+      object-fit: contain;
+      object-position: center;
+      background: var(--preview-letterbox);
+      flex: 1 1 auto;
+      min-height: 0;
+    }
+    body.viewer-mode .viz-preview #frameSourceHint {
+      position: absolute;
+      left: 6px;
+      bottom: 4px;
+      padding: 0;
+      margin: 0;
+      font-size: 0.72rem;
+      opacity: 0.75;
+      pointer-events: none;
+      background: transparent;
+    }
+    body.viewer-mode .viz-transport {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: nowrap;
+      flex: 0 0 auto;
+    }
+    body.viewer-mode .viz-transport .scrub {
+      flex: 1 1 auto;
+      min-width: 120px;
+    }
+    body.viewer-mode .viz-transport select {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 2px 6px;
+      font-size: 0.78rem;
+    }
+    body.viewer-mode #chart {
+      flex: 1.15 1 0;
+      min-height: 0;
+      height: auto;
+      max-height: none;
+      overflow: hidden;
+    }
+    body.viewer-mode .ep-side .viz-side-label {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin: 0 0 4px;
+      flex: 0 0 auto;
+    }
+    body.viewer-mode #vizToolsBox {
+      flex: 0 0 auto;
+      max-height: min(22vh, 180px);
+      overflow: auto;
+    }
+    body.viewer-mode #vizToolsBox:not(.open) {
+      max-height: none;
+    }
+    body.viewer-mode .viewer-toolbar {
+      flex: 0 0 auto;
+      gap: 2px;
+    }
+    body.viewer-mode .viewer-toolbar #chanHint {
+      display: none;
+    }
+    body.viewer-mode .viewer-toolbar .chan-btns {
+      gap: 4px;
+    }
+    body.viewer-mode .viewer-toolbar .chan-btns button {
+      padding: 2px 6px;
+      font-size: 0.75rem;
+    }
+    body.viewer-mode #armBtns {
+      margin-top: 2px !important;
+    }
+    body.viewer-mode #cursorReadout {
+      min-height: 1.1em !important;
+      max-height: 1.35em;
+      font-size: 0.7rem;
+      margin: 0;
+      padding: 1px 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+    }
+    body.viewer-mode #viewerMsg {
+      font-size: 0.75rem;
+      max-width: 28vw;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    /* 非 viewer：Visualizer 专用块隐藏（播放条保留，采集时也要 scrub） */
+    body:not(.viewer-mode) .viz-header,
+    body:not(.viewer-mode) .viz-preview,
+    body:not(.viewer-mode) #vizToolsBox,
+    body:not(.viewer-mode) #delProgressView {
+      display: none !important;
     }
     .fold-box {
       margin-top: 10px;
@@ -272,7 +692,7 @@
       border-radius: 6px;
     }
     .fold-toggle:hover {
-      background: rgba(255, 255, 255, 0.04);
+      background: var(--hover);
     }
     .fold-chevron {
       display: inline-block;
@@ -334,6 +754,14 @@
       padding: 2px 8px;
       font-size: 0.78rem;
     }
+    @media (max-width: 1100px) {
+      body.viewer-mode .viewer {
+        grid-template-columns: minmax(130px, 168px) 1fr;
+      }
+      body.viewer-mode .viz-header .viz-path {
+        max-width: min(40vw, 220px);
+      }
+    }
     @media (max-width: 960px) {
       .row.top {
         flex: 0 0 auto;
@@ -345,12 +773,35 @@
         height: min(32vh, 320px);
         min-height: 180px;
       }
+      body.viewer-mode .viewer {
+        grid-template-columns: 1fr;
+        grid-template-rows: minmax(120px, 28vh) 1fr;
+      }
+      body.viewer-mode .ep-side {
+        max-height: 28vh;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+      }
+    }
+    @media (max-height: 900px) {
+      body.viewer-mode #vizToolsBox.open {
+        max-height: min(18vh, 140px);
+      }
+    }
+    @media (max-height: 700px) {
+      header { padding: 1px 6px; }
+      header h1 { font-size: 0.85rem; }
+      header .hint { display: none; }
+      body.viewer-mode .viz-header .viz-path,
+      body.viewer-mode .viz-stats {
+        display: none;
+      }
     }
     .panel {
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 10px;
-      padding: 12px 14px;
+      padding: clamp(4px, 0.5vh + 2px, 8px) clamp(6px, 0.5vw + 2px, 10px);
       min-height: 0;
     }
     .panel.grow {
@@ -393,7 +844,7 @@
       height: 100%;
       object-fit: contain;
       object-position: center center;
-      background: #000;
+      background: var(--preview-letterbox);
       border-radius: 6px;
     }
     .viewer-toolbar {
@@ -405,20 +856,30 @@
     .badge {
       display: inline-flex;
       align-items: center;
-      gap: 8px;
-      padding: 8px 16px;
-      border-radius: 8px;
-      font-size: 1.05rem;
-      font-weight: 800;
-      letter-spacing: 0.04em;
-      background: #243044;
+      gap: 5px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      background: var(--badge-bg);
       color: var(--accent);
-      border: 2px solid transparent;
+      border: 1px solid transparent;
       text-transform: uppercase;
       line-height: 1.2;
     }
+    .badge.fmt-zarr {
+      background: var(--fmt-zarr-bg);
+      color: var(--fmt-zarr-fg);
+      border-color: var(--fmt-zarr-bd);
+    }
+    .badge.fmt-lerobot {
+      background: var(--fmt-lerobot-bg);
+      color: var(--fmt-lerobot-fg);
+      border-color: var(--fmt-lerobot-bd);
+    }
     .badge .badge-sub {
-      font-size: 0.85rem;
+      font-size: 0.72rem;
       font-weight: 600;
       letter-spacing: 0;
       text-transform: none;
@@ -502,9 +963,9 @@
     .del-progress .del-progress-track {
       height: 8px;
       border-radius: 4px;
-      background: #1a2433;
+      background: var(--panel-2);
       overflow: hidden;
-      border: 1px solid #2a3a50;
+      border: 1px solid var(--border);
     }
     .del-progress .del-progress-bar {
       height: 100%;
@@ -518,8 +979,8 @@
       color: var(--muted);
     }
     .badge.VIEW {
-      background: #1e2a3c;
-      color: #7ec8ff;
+      background: var(--active);
+      color: var(--accent);
       border-color: var(--accent);
     }
     .badge.HUB { background: #3d9cf033; color: var(--accent); border-color: var(--accent); }
@@ -538,12 +999,12 @@
       padding: 5px 12px;
       font-size: 0.8rem;
       border-radius: 999px;
-      background: #1a2332;
+      background: var(--panel);
     }
     .chan-btns button.active {
-      background: #1e4d7a;
+      background: var(--btn-primary);
       border-color: var(--accent);
-      color: #fff;
+      color: var(--text);
     }
     .stats {
       display: grid;
@@ -559,8 +1020,8 @@
       font-family: "IBM Plex Mono", ui-monospace, monospace;
       font-size: 0.82rem;
       line-height: 1.45;
-      color: #c5d0e0;
-      background: #121820;
+      color: var(--chart-fg);
+      background: var(--panel-2);
       padding: 8px 10px;
       border-radius: 6px;
       margin-bottom: 8px;
@@ -576,35 +1037,35 @@
     }
     button {
       border: 1px solid var(--border);
-      background: #243044;
+      background: var(--btn-bg);
       color: var(--text);
-      padding: 10px 16px;
-      border-radius: 6px;
+      padding: 4px 9px;
+      border-radius: 5px;
       cursor: pointer;
-      font-size: 0.95rem;
+      font-size: 0.82rem;
     }
     button:hover:not(:disabled) { border-color: var(--accent); }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
-    button.primary { background: #1e4d7a; border-color: var(--accent); }
-    button.danger { background: #4a2228; border-color: var(--danger); }
-    button.ok { background: #1a3d30; border-color: var(--ok); }
+    button.primary { background: var(--btn-primary); border-color: var(--accent); }
+    button.danger { background: var(--btn-danger); border-color: var(--danger); }
+    button.ok { background: var(--btn-ok); border-color: var(--ok); }
     #replayArmBtns button.active {
       border-color: var(--accent);
-      background: #1e4d7a;
+      background: var(--btn-primary);
     }
     #btnEStop {
       background: #6b1018;
       border-color: #ff3b4a;
       font-weight: 700;
     }
-    .msg { margin-top: 8px; color: var(--muted); font-size: 0.9rem; min-height: 1.2em; }
+    .msg { margin-top: 4px; color: var(--muted); font-size: 0.8rem; min-height: 1.1em; }
 
     .viewer {
       flex: 1 1 auto;
       min-height: 0;
       display: grid;
-      grid-template-columns: 200px 1fr;
-      gap: 12px;
+      grid-template-columns: 160px 1fr;
+      gap: 8px;
     }
     @media (max-width: 960px) {
       .viewer { grid-template-columns: 1fr; overflow: auto; }
@@ -625,16 +1086,16 @@
       overflow: auto;
     }
     .ep-list li {
-      padding: 8px 10px;
-      border-radius: 6px;
+      padding: 4px 7px;
+      border-radius: 5px;
       cursor: pointer;
       border: 1px solid transparent;
-      font-size: 0.95rem;
+      font-size: 0.82rem;
     }
-    .ep-list li:hover { background: #243044; }
+    .ep-list li:hover { background: var(--hover); }
     .ep-list li.active {
       border-color: var(--accent);
-      background: #1e2a3c;
+      background: var(--active);
     }
     .ep-list .meta { color: var(--muted); font-size: 0.75rem; }
     .viewer-main {
@@ -656,47 +1117,51 @@
       appearance: none;
       flex: 1 1 auto;
       width: 100%;
-      min-width: 320px;
-      height: 36px;
+      min-width: 80px;
+      height: 22px;
       margin: 0;
       padding: 0;
       cursor: pointer;
       background: transparent;
+    }
+    body.viewer-mode .scrub input[type=range] {
+      min-width: 80px;
+      height: 20px;
     }
     .scrub input[type=range]:focus {
       outline: none;
     }
     /* Chrome / Edge：必须先 appearance:none，自定义轨道才会生效 */
     .scrub input[type=range]::-webkit-slider-runnable-track {
-      height: 14px;
-      border-radius: 7px;
-      background: #3a4a63;
-      border: 1px solid #55657f;
+      height: 8px;
+      border-radius: 4px;
+      background: var(--track);
+      border: 1px solid var(--border);
     }
     .scrub input[type=range]::-webkit-slider-thumb {
       -webkit-appearance: none;
       appearance: none;
-      width: 24px;
-      height: 24px;
-      margin-top: -5px;
+      width: 14px;
+      height: 14px;
+      margin-top: -4px;
       border-radius: 50%;
       background: var(--accent);
-      border: 2px solid #0e141c;
-      box-shadow: 0 0 0 2px #55657f;
+      border: 2px solid var(--thumb-ring);
+      box-shadow: 0 0 0 1px var(--border);
     }
     .scrub input[type=range]::-moz-range-track {
-      height: 14px;
-      border-radius: 7px;
-      background: #3a4a63;
-      border: 1px solid #55657f;
+      height: 8px;
+      border-radius: 4px;
+      background: var(--track);
+      border: 1px solid var(--border);
     }
     .scrub input[type=range]::-moz-range-thumb {
-      width: 24px;
-      height: 24px;
+      width: 14px;
+      height: 14px;
       border-radius: 50%;
       background: var(--accent);
-      border: 2px solid #0e141c;
-      box-shadow: 0 0 0 2px #55657f;
+      border: 2px solid var(--thumb-ring);
+      box-shadow: 0 0 0 2px var(--border);
     }
     .hotkey-settings-list {
       display: flex;
@@ -709,8 +1174,8 @@
       font-variant-numeric: tabular-nums;
       font-weight: 700;
       letter-spacing: 0.02em;
-      background: #121820;
-      border-color: #55657f;
+      background: var(--panel-2);
+      border-color: var(--border);
     }
     .hotkey-bind.listening {
       border-color: var(--accent);
@@ -722,7 +1187,7 @@
       width: 100%;
       min-height: 160px;
       height: auto;
-      background: #121820;
+      background: var(--panel-2);
       border-radius: 6px;
     }
     #cursorReadout { flex: 0 0 auto; margin-top: 0; }
@@ -760,7 +1225,7 @@
       flex: 1 1 auto;
       min-height: 0;
       overflow: auto;
-      padding: 24px 20px 40px;
+      padding: clamp(12px, 2vh, 24px) clamp(12px, 2vw, 20px) clamp(20px, 3vh, 40px);
       justify-content: center;
       align-items: flex-start;
     }
@@ -770,8 +1235,8 @@
       text-align: left;
     }
     .merge-card h2 {
-      margin: 0 0 6px;
-      font-size: 1.45rem;
+      margin: 0 0 4px;
+      font-size: 1.15rem;
       font-weight: 600;
       text-transform: none;
       letter-spacing: 0;
@@ -794,6 +1259,131 @@
       flex-wrap: wrap;
       gap: 10px;
       margin-top: 16px;
+      align-items: center;
+    }
+    .library-page {
+      display: none;
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: hidden;
+      padding: 0;
+      justify-content: stretch;
+      align-items: stretch;
+    }
+    .library-page.show { display: flex; }
+    .library-card {
+      width: 100%;
+      height: 100%;
+      max-width: none;
+      text-align: left;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin: 0;
+      border-radius: 0;
+      border-left: none;
+      border-right: none;
+      border-bottom: none;
+      padding: 10px 14px 12px;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .library-card h2 {
+      margin: 0;
+      font-size: 1.15rem;
+      font-weight: 600;
+      text-transform: none;
+      letter-spacing: 0;
+      color: var(--text);
+      flex: 0 0 auto;
+    }
+    .library-card .merge-sub {
+      color: var(--muted);
+      font-size: 0.85rem;
+      margin: 0;
+      line-height: 1.4;
+      flex: 0 0 auto;
+    }
+    .library-card > .path-row,
+    .library-card > .library-filter-row,
+    .library-card > .library-batch,
+    .library-card > .del-progress {
+      flex: 0 0 auto;
+    }
+    .library-filter-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .library-filter-label {
+      color: var(--muted);
+      font-size: 0.82rem;
+      flex: 0 0 auto;
+    }
+    .library-filter-row .chan-btns {
+      margin: 0;
+    }
+    .library-filter-row .chan-btns button.active {
+      border-color: var(--accent);
+      background: var(--btn-primary);
+    }
+    .library-table-wrap {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: auto;
+      max-height: none;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+    }
+    .library-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.86rem;
+    }
+    .library-table th,
+    .library-table td {
+      padding: 8px 10px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    .library-table th {
+      position: sticky;
+      top: 0;
+      background: var(--panel-2);
+      color: var(--muted);
+      font-weight: 600;
+      z-index: 1;
+    }
+    .library-table tr:hover td {
+      background: var(--hover);
+    }
+    .library-table .lib-name {
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-weight: 500;
+      color: var(--text);
+    }
+    .library-table .lib-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .library-table .lib-actions button {
+      padding: 4px 8px;
+      font-size: 0.78rem;
+    }
+    .library-empty {
+      padding: 28px 16px;
+      text-align: center;
+      color: var(--muted);
+    }
+    .library-batch {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
       align-items: center;
     }
     .hub-card {
@@ -821,10 +1411,10 @@
     }
     .hub-btns button {
       width: 100%;
-      padding: 18px 20px;
-      font-size: 1.15rem;
+      padding: 10px 14px;
+      font-size: 0.95rem;
       font-weight: 600;
-      border-radius: 10px;
+      border-radius: 8px;
     }
     .hub-btns .hub-collect {
       background: var(--accent);
@@ -866,9 +1456,9 @@
       overflow: auto;
       padding: 12px 14px;
       border-radius: 8px;
-      background: #0a0e14;
+      background: var(--bg-deep);
       border: 1px solid var(--border);
-      color: #b8c4d6;
+      color: var(--chart-fg);
       font-family: "IBM Plex Mono", ui-monospace, monospace;
       font-size: 0.78rem;
       line-height: 1.55;
@@ -900,23 +1490,23 @@
       padding: 8px 10px;
       border-radius: 6px;
       border: 1px solid var(--border);
-      background: #121820;
-      color: #c5d0e0;
+      background: var(--panel-2);
+      color: var(--chart-fg);
       font-family: "IBM Plex Mono", ui-monospace, monospace;
       font-size: 0.82rem;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .path-row button { flex: 0 0 auto; padding: 8px 14px; }
+    .path-row button { flex: 0 0 auto; padding: 4px 9px; }
     .path-row input[type="text"] {
       flex: 1 1 240px;
       min-width: 160px;
       padding: 8px 10px;
       border-radius: 6px;
       border: 1px solid var(--border);
-      background: #121820;
-      color: #c5d0e0;
+      background: var(--panel-2);
+      color: var(--chart-fg);
       font-family: "IBM Plex Mono", ui-monospace, monospace;
       font-size: 0.82rem;
     }
@@ -950,8 +1540,8 @@
       min-width: 0;
       font-family: "IBM Plex Mono", ui-monospace, monospace;
       font-size: 0.78rem;
-      color: #c5d0e0;
-      background: #121820;
+      color: var(--chart-fg);
+      background: var(--panel-2);
       border: 1px solid var(--border);
       border-radius: 6px;
       padding: 6px 10px;
@@ -980,7 +1570,7 @@
       overflow: auto;
       border: 1px solid var(--border);
       border-radius: 8px;
-      background: #0a0e14;
+      background: var(--bg-deep);
     }
     .fs-list li {
       display: flex;
@@ -988,13 +1578,13 @@
       gap: 10px;
       padding: 10px 12px;
       cursor: pointer;
-      border-bottom: 1px solid #1a2332;
+      border-bottom: 1px solid var(--border);
       font-size: 0.95rem;
       user-select: none;
     }
     .fs-list li:last-child { border-bottom: none; }
-    .fs-list li:hover { background: #1e2a3c; }
-    .fs-list li:active { background: #243044; }
+    .fs-list li:hover { background: var(--active); }
+    .fs-list li:active { background: var(--hover); }
     .fs-list .fs-icon {
       flex: 0 0 auto;
       width: 1.4em;
@@ -1018,9 +1608,19 @@
       font-size: 0.72rem;
       padding: 2px 8px;
       border-radius: 999px;
-      background: #123528;
-      color: var(--ok);
-      border: 1px solid #3ecf8e55;
+      background: var(--fmt-lerobot-bg);
+      color: var(--fmt-lerobot-fg);
+      border: 1px solid var(--fmt-lerobot-bd);
+    }
+    .fs-list .fs-tag.fmt-zarr {
+      background: var(--fmt-zarr-bg);
+      color: var(--fmt-zarr-fg);
+      border-color: var(--fmt-zarr-bd);
+    }
+    .fs-list .fs-tag.fmt-lerobot {
+      background: var(--fmt-lerobot-bg);
+      color: var(--fmt-lerobot-fg);
+      border-color: var(--fmt-lerobot-bd);
     }
     .fs-list .fs-empty {
       padding: 28px 16px;
@@ -1053,6 +1653,10 @@
       <div class="hint" id="headerHint">网页快捷键: P/C/S/D/Q · 仅可信局域网</div>
     </div>
     <div class="right">
+      <div class="theme-btns" id="themeBtnsHeader" title="白天 / 黑暗">
+        <button type="button" data-theme="light" id="btnThemeLight">白天</button>
+        <button type="button" data-theme="dark" id="btnThemeDark" class="active">黑暗</button>
+      </div>
       <button
         type="button"
         class="btn-icon"
@@ -1091,6 +1695,61 @@
       <div class="hub-log-wrap" id="hubLogWrap">
         <h3>连接日志</h3>
         <pre class="hub-log" id="hubLog"><span class="hub-log-empty">等待日志…</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="library-page" id="libraryPage">
+    <div class="library-card panel" id="libraryCard">
+      <h2>数据集库管理</h2>
+      <p class="merge-sub" id="libraryPageHint">
+        浏览父目录下一层子文件夹中的数据集：打开、重命名、移动、删除；多选后可批量删除，或将 ≥2 个 LeRobot 送入合并页。
+      </p>
+      <div class="path-row" style="margin:0">
+        <label>库根目录</label>
+        <input id="libraryRootInput" type="text" style="flex:1;min-width:180px" spellcheck="false" autocomplete="off" placeholder="父文件夹绝对路径" />
+        <button id="btnLibraryOpenRoot" type="button" class="ok">打开</button>
+        <button id="btnLibraryBrowseRoot" type="button">浏览…</button>
+        <button id="btnLibraryRefresh" type="button">刷新</button>
+        <button id="btnLibraryParent" type="button" title="上级目录">↑ 上级</button>
+      </div>
+      <div class="library-filter-row" id="libraryFilterRow">
+        <span class="library-filter-label">类型</span>
+        <div class="chan-btns" id="libraryFmtBtns">
+          <button type="button" data-lib-fmt="all" class="active" title="显示全部数据集">全部</button>
+          <button type="button" data-lib-fmt="zarr" title="仅 zarr（replay_buffer.zarr）">zarr</button>
+          <button type="button" data-lib-fmt="lerobot" title="仅 LeRobot（meta/info.json）">LeRobot</button>
+        </div>
+        <span class="msg" id="libraryFilterCount" style="margin:0">—</span>
+      </div>
+      <div class="library-table-wrap">
+        <table class="library-table" id="libraryTable">
+          <thead>
+            <tr>
+              <th style="width:36px"><input type="checkbox" id="librarySelectAll" title="全选" /></th>
+              <th>名称</th>
+              <th>格式</th>
+              <th>Episodes</th>
+              <th>Frames</th>
+              <th>FPS</th>
+              <th>修改时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="libraryTableBody"></tbody>
+        </table>
+        <div class="library-empty" id="libraryEmpty" hidden>此目录下没有识别到数据集</div>
+      </div>
+      <div class="library-batch">
+        <button id="btnLibraryMergeSelected" type="button" class="primary" disabled title="所选须全部为 LeRobot 且至少 2 个">合并所选</button>
+        <button id="btnLibraryDeleteSelected" type="button" class="danger" disabled>删除所选</button>
+        <span class="msg" id="libraryHint" style="margin:0">未选择</span>
+        <button id="btnLibraryBack" type="button" title="返回数据管理">返回数据管理</button>
+        <div class="msg" id="libraryMsg" style="margin:0"></div>
+      </div>
+      <div class="del-progress" id="libraryProgress">
+        <div class="del-progress-track"><div class="del-progress-bar" id="libraryProgressBar"></div></div>
+        <div class="del-progress-label" id="libraryProgressLabel"></div>
       </div>
     </div>
   </div>
@@ -1183,88 +1842,8 @@
       </div>
     </div>
 
-    <div class="panel" id="viewerOnlyBar" style="display:none">
-      <h2>数据管理</h2>
-      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-        <span id="modeBadgeView" class="badge VIEW">VIEW<span class="badge-sub">数据管理</span></span>
-        <span id="datasetFormatBadge" class="badge" style="display:none">zarr</span>
-        <span style="color:var(--muted);font-size:0.85rem">
-          saved: <strong id="nEpisodesView">0</strong> · no robot / camera
-        </span>
-        <button id="btnBackHub" type="button">返回入口</button>
-        <button id="btnOpenMergePage" type="button" class="primary" title="进入合并 LeRobot 页面">合并 LeRobot</button>
-        <div class="msg" id="msgView"></div>
-      </div>
-      <div class="del-progress" id="delProgressView">
-        <div class="del-progress-track"><div class="del-progress-bar" id="delProgressBarView"></div></div>
-        <div class="del-progress-label" id="delProgressLabelView"></div>
-      </div>
-      <div class="path-row" title="当前已加载的数据目录">
-        <label>当前目录</label>
-        <div class="path-current" id="datasetPathLabel" title="">（未加载）</div>
-        <button id="btnBrowseDataset" type="button" class="primary">浏览文件夹…</button>
-        <button id="btnResetDataset" type="button" title="回到启动时的 -o 目录">默认目录</button>
-      </div>
-      <div id="daggerSplitBox" class="fold-box" style="display:none">
-        <button type="button" class="fold-toggle" id="daggerFoldToggle" aria-expanded="false" title="展开 / 折叠">
-          <span class="fold-chevron">▸</span>
-          <strong>DAgger 拆分</strong>
-          <span class="msg" id="daggerStatsLabel">—</span>
-        </button>
-        <div class="fold-body" id="daggerFoldBody">
-          <div class="path-row" style="margin-top:4px">
-            <label>人工示教</label>
-            <input id="daggerHumanOut" type="text" style="flex:1;min-width:180px" placeholder="{dir}_human" />
-          </div>
-          <div class="path-row" style="margin-top:4px">
-            <label>纯模型</label>
-            <input id="daggerPolicyOut" type="text" style="flex:1;min-width:180px" placeholder="{dir}_policy" />
-          </div>
-          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px">
-            <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
-              <input id="daggerOverwrite" type="checkbox" /> 覆盖已有输出
-            </label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
-              <input id="daggerTrimStill" type="checkbox" checked /> 去掉人工段开头静止
-            </label>
-          </div>
-          <div class="btns" style="margin-top:8px;flex-wrap:wrap">
-            <button id="btnDaggerHuman" type="button" class="ok" title="提取 intervention=1 段并去静止">提取人工示教</button>
-            <button id="btnDaggerPolicy" type="button" title="提取整条全是模型输出的 episode">提取纯模型</button>
-            <button id="btnDaggerBoth" type="button" class="primary" title="两者都提取到旁边目录">全部拆分</button>
-          </div>
-        </div>
-      </div>
-      <div id="convertLerobotBox" class="fold-box" style="display:none">
-        <button type="button" class="fold-toggle" id="convertLerobotFoldToggle" aria-expanded="false" title="展开 / 折叠">
-          <span class="fold-chevron">▸</span>
-          <strong>转换为 LeRobot</strong>
-          <span class="msg" id="convertLerobotHint">关节 state/action + 三路 224 视频</span>
-        </button>
-        <div class="fold-body" id="convertLerobotFoldBody">
-          <div class="path-row" style="margin-top:4px">
-            <label>输出目录</label>
-            <input id="convertLerobotOut" type="text" style="flex:1;min-width:180px" placeholder="{dir}_lerobot" />
-          </div>
-          <div class="path-row" style="margin-top:4px">
-            <label>prompt</label>
-            <input id="convertLerobotPrompt" type="text" style="flex:1;min-width:180px" value="Flatten and fold the cloth." />
-          </div>
-          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px">
-            <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
-              fps
-              <input id="convertLerobotFps" type="number" min="1" max="120" value="20" style="width:64px" />
-            </label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
-              <input id="convertLerobotOverwrite" type="checkbox" /> 覆盖已有输出
-            </label>
-          </div>
-          <div class="btns" style="margin-top:8px;flex-wrap:wrap">
-            <button id="btnConvertLerobot" type="button" class="primary" title="把当前 zarr 转成 LeRobot v2.1">转换为 LeRobot</button>
-          </div>
-        </div>
-      </div>
-    </div>
+    <!-- 旧顶栏已并入 episodePanel 的 Visualizer 布局；占位保留以免外部引用报错 -->
+    <div class="panel" id="viewerOnlyBar" style="display:none" aria-hidden="true"></div>
 
     <div class="modal-bg" id="daggerModal">
       <div class="modal">
@@ -1301,37 +1880,80 @@
 
     <div class="panel grow" id="episodePanel">
       <h2>Episode viewer</h2>
-      <div class="viewer">
+      <div class="viewer" id="vizLayout">
         <div class="ep-side">
+          <div class="viz-side-label">Episodes</div>
           <ul class="ep-list" id="epList"></ul>
           <div class="btns" style="margin-top:8px;flex:0 0 auto">
             <button id="btnRefresh">Refresh</button>
             <button id="btnDelete" class="danger" disabled>Delete</button>
             <button id="btnLiveView">Follow LIVE</button>
           </div>
-          <div class="btns" style="margin-top:8px;flex:0 0 auto;flex-wrap:wrap">
-            <button id="btnTrimIn" type="button" disabled title="把当前 scrub 帧标为保留起点（含）">标起点</button>
-            <button id="btnTrimOut" type="button" disabled title="把当前 scrub 帧标为保留终点（含）">标终点</button>
-            <button id="btnTrimClear" type="button" disabled title="清除裁剪标记">清除</button>
-            <button id="btnTrimApply" type="button" class="ok" disabled title="裁掉标记外的头尾，原地改 zarr 或 LeRobot parquet/视频">应用裁剪</button>
-          </div>
-          <div class="btns" style="margin-top:8px;flex:0 0 auto;flex-wrap:wrap">
-            <button id="btnEndGripTrimCur" type="button" disabled title="检测末尾全开→闭合拐点，自动标出保留起止；检查后点「应用裁剪」">标记末尾开合</button>
-            <button id="btnEndGripTrimAll" type="button" class="ok" disabled title="扫描全部 episode 末尾全开→闭合拐点并批量裁剪（先确认）">一键裁剪全部末尾开合</button>
-          </div>
-          <div class="msg" id="trimRangeLabel" style="margin-top:4px">裁剪范围：未标记</div>
         </div>
         <div class="viewer-main">
+          <div class="viz-header" id="vizHeader">
+            <span id="modeBadgeView" class="badge VIEW">VIEW<span class="badge-sub">数据管理</span></span>
+            <span id="datasetFormatBadge" class="badge" style="display:none">zarr</span>
+            <h3 class="viz-ep-title" id="vizEpisodeTitle">EPISODE —</h3>
+            <span class="viz-path" id="vizPathShort" title="">—</span>
+            <div class="viz-stats" id="vizStats" title="数据集 Frames / Episodes / FPS">
+              <span><em>Frames</em> <strong id="vizFrames">0</strong></span>
+              <span><em>Episodes</em> <strong id="nEpisodesView">0</strong></span>
+              <span><em>FPS</em> <strong id="vizFps">—</strong></span>
+            </div>
+            <button id="btnEpPrev" type="button" title="上一条 episode">‹</button>
+            <button id="btnEpNext" type="button" title="下一条 episode">›</button>
+            <button id="btnOpenRerun" type="button" class="primary" title="用本机 Rerun / lerobot-dataset-viz 打开当前数据集">用 Rerun 打开</button>
+            <button id="btnBackHub" type="button">返回入口</button>
+            <button id="btnOpenLibraryPage" type="button" title="管理父目录下一层的多个数据集">库管理</button>
+            <button id="btnOpenMergePage" type="button" title="进入合并 LeRobot 页面">合并</button>
+            <div class="msg" id="msgView" style="margin:0"></div>
+          </div>
+          <div class="path-row viz-path-bar" id="vizPathBar" title="输入时会提示子文件夹；回车或点打开加载">
+            <label>当前目录</label>
+            <div class="path-suggest-wrap" id="pathSuggestWrap">
+              <input
+                id="datasetPathLabel"
+                type="text"
+                class="path-current"
+                spellcheck="false"
+                autocomplete="off"
+                placeholder="输入路径，边输边选文件夹…"
+                title=""
+              />
+              <ul class="path-suggest" id="pathSuggestList" hidden></ul>
+            </div>
+            <button id="btnOpenDatasetPath" type="button" class="ok" title="加载输入框中的路径">打开</button>
+            <button id="btnBrowseDataset" type="button" class="primary">浏览文件夹…</button>
+            <button id="btnResetDataset" type="button" title="回到启动时的 -o 目录">默认目录</button>
+          </div>
+          <div class="del-progress" id="delProgressView">
+            <div class="del-progress-track"><div class="del-progress-bar" id="delProgressBarView"></div></div>
+            <div class="del-progress-label" id="delProgressLabelView"></div>
+          </div>
+          <div class="viz-preview" id="vizPreviewSlot">
+            <!-- #liveCam 在 viewer-mode 下由 JS 移入此处 -->
+          </div>
+          <div class="viz-transport" id="vizTransport">
+            <div class="scrub">
+              <button id="btnPlay" type="button">Play</button>
+              <input id="scrub" type="range" min="0" max="0" value="0" />
+              <span id="scrubLabel" style="font-variant-numeric:tabular-nums;font-size:0.85rem;color:var(--muted)">0 / 0</span>
+            </div>
+            <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
+              倍速
+              <select id="playSpeed" title="播放倍速">
+                <option value="0.5">0.5x</option>
+                <option value="1" selected>1x</option>
+                <option value="2">2x</option>
+              </select>
+            </label>
+            <div class="msg" id="viewerMsg" style="margin:0">Select an episode or Follow LIVE while recording.</div>
+          </div>
           <div class="viewer-toolbar">
-              <div class="scrub">
-                <button id="btnPlay">Play</button>
-                <input id="scrub" type="range" min="0" max="0" value="0" />
-                <span id="scrubLabel" style="font-variant-numeric:tabular-nums;font-size:0.85rem;color:var(--muted)">0 / 0</span>
-              </div>
-              <div class="msg" id="viewerMsg">Select an episode or Follow LIVE while recording.</div>
               <div class="chan-btns" id="chanBtns">
-                <button type="button" data-chan="all" class="active">All</button>
-                <button type="button" data-chan="pos" title="TCP position xyz (m)">pos</button>
+                <button type="button" data-chan="all">All</button>
+                <button type="button" data-chan="pos" class="active" title="TCP position xyz (m)">pos</button>
                 <button type="button" data-chan="gripper" title="Gripper opening width (m)">gripper</button>
                 <button type="button" data-chan="rot" title="TCP orientation as axis-angle / rotvec (rad)">rot (axis-angle)</button>
                 <button type="button" data-chan="action" title="Action: xyz + rotvec + gripper">action</button>
@@ -1343,12 +1965,100 @@
               </div>
               <div class="msg" id="chanHint" style="margin-top:2px">
                 双臂曲线带 L_/R_ 前缀 · rot = axis-angle（rad）·
-                左键拖动黄线 · 滚轮缩放 · 双击复位
+                左键拖动黄线 · 滚轮缩放 · 双击复位 · Space 播放
               </div>
           </div>
           <div id="chart"></div>
           <div id="cursorReadout" class="pose" style="min-height:2.6em">
             黄线当前位置：拖动曲线或 scrub 后显示数值
+          </div>
+          <div id="vizToolsBox" class="fold-box">
+            <button type="button" class="fold-toggle" id="vizToolsFoldToggle" aria-expanded="false" title="展开 / 折叠数据工具">
+              <span class="fold-chevron">▸</span>
+              <strong>数据工具</strong>
+              <span class="msg" id="vizToolsHint">裁剪 · 转换 · DAgger</span>
+            </button>
+            <div class="fold-body" id="vizToolsFoldBody">
+              <div class="btns" style="margin-top:8px;flex-wrap:wrap">
+                <button id="btnTrimIn" type="button" disabled title="把当前 scrub 帧标为保留起点（含）">标起点</button>
+                <button id="btnTrimOut" type="button" disabled title="把当前 scrub 帧标为保留终点（含）">标终点</button>
+                <button id="btnTrimClear" type="button" disabled title="清除裁剪标记">清除</button>
+                <button id="btnTrimApply" type="button" class="ok" disabled title="裁掉标记外的头尾，原地改 zarr 或 LeRobot parquet/视频">应用裁剪</button>
+                <button id="btnEndGripTrimCur" type="button" disabled title="检测末尾全开→闭合拐点，自动标出保留起止；检查后点「应用裁剪」">标记末尾开合</button>
+                <button id="btnEndGripTrimAll" type="button" class="ok" disabled title="扫描全部 episode 末尾全开→闭合拐点并批量裁剪（先确认）">一键裁剪全部末尾开合</button>
+              </div>
+              <div class="msg" id="trimRangeLabel" style="margin-top:4px">裁剪范围：未标记</div>
+              <div id="daggerSplitBox" class="fold-box" style="display:none">
+                <button type="button" class="fold-toggle" id="daggerFoldToggle" aria-expanded="false" title="展开 / 折叠">
+                  <span class="fold-chevron">▸</span>
+                  <strong>DAgger 拆分</strong>
+                  <span class="msg" id="daggerStatsLabel">—</span>
+                </button>
+                <div class="fold-body" id="daggerFoldBody">
+                  <div class="path-row" style="margin-top:4px">
+                    <label>人工示教</label>
+                    <input id="daggerHumanOut" type="text" style="flex:1;min-width:180px" placeholder="{dir}_human" />
+                  </div>
+                  <div class="path-row" style="margin-top:4px">
+                    <label>纯模型</label>
+                    <input id="daggerPolicyOut" type="text" style="flex:1;min-width:180px" placeholder="{dir}_policy" />
+                  </div>
+                  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
+                      <input id="daggerOverwrite" type="checkbox" /> 覆盖已有输出
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
+                      <input id="daggerTrimStill" type="checkbox" checked /> 去掉人工段开头静止
+                    </label>
+                  </div>
+                  <div class="btns" style="margin-top:8px;flex-wrap:wrap">
+                    <button id="btnDaggerHuman" type="button" class="ok" title="提取 intervention=1 段并去静止">提取人工示教</button>
+                    <button id="btnDaggerPolicy" type="button" title="提取整条全是模型输出的 episode">提取纯模型</button>
+                    <button id="btnDaggerBoth" type="button" class="primary" title="两者都提取到旁边目录">全部拆分</button>
+                  </div>
+                </div>
+              </div>
+              <div id="convertLerobotBox" class="fold-box" style="display:none">
+                <button type="button" class="fold-toggle" id="convertLerobotFoldToggle" aria-expanded="false" title="展开 / 折叠">
+                  <span class="fold-chevron">▸</span>
+                  <strong>转换为 LeRobot</strong>
+                  <span class="msg" id="convertLerobotHint">关节 state/action · robot_type / fps / prompt 可改</span>
+                </button>
+                <div class="fold-body" id="convertLerobotFoldBody">
+                  <div class="path-row" style="margin-top:4px">
+                    <label>输出目录</label>
+                    <input id="convertLerobotOut" type="text" style="flex:1;min-width:180px" placeholder="{dir}_lerobot" />
+                  </div>
+                  <div class="path-row" style="margin-top:4px">
+                    <label>prompt</label>
+                    <input id="convertLerobotPrompt" type="text" style="flex:1;min-width:180px" value="Flatten and fold the cloth." />
+                  </div>
+                  <div class="path-row" style="margin-top:4px" title="写入 meta/info.json 的 robot_type；留空则用默认 agilex">
+                    <label>robot_type</label>
+                    <input id="convertLerobotRobotType" type="text" style="flex:1;min-width:120px" value="agilex" placeholder="agilex" list="convertRobotTypeHints" />
+                    <datalist id="convertRobotTypeHints">
+                      <option value="agilex"></option>
+                      <option value="arx5"></option>
+                      <option value="umi"></option>
+                      <option value="so100"></option>
+                      <option value="so101"></option>
+                    </datalist>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
+                      fps
+                      <input id="convertLerobotFps" type="number" min="1" max="120" value="20" style="width:64px" />
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted)">
+                      <input id="convertLerobotOverwrite" type="checkbox" /> 覆盖已有输出
+                    </label>
+                  </div>
+                  <div class="btns" style="margin-top:8px;flex-wrap:wrap">
+                    <button id="btnConvertLerobot" type="button" class="primary" title="把当前 zarr 转成 LeRobot v2.1">转换为 LeRobot</button>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -1401,6 +2111,16 @@
       <div class="settings-body">
         <section class="settings-section">
           <h4>外观</h4>
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <strong>主题</strong>
+              <span>白天明亮 / 黑暗护眼，偏好会记住</span>
+            </div>
+            <div class="theme-btns" id="themeBtnsSettings" title="白天 / 黑暗">
+              <button type="button" data-theme="light" id="btnThemeLightSet">白天</button>
+              <button type="button" data-theme="dark" id="btnThemeDarkSet" class="active">黑暗</button>
+            </div>
+          </div>
           <div class="settings-row">
             <div class="settings-row-text">
               <strong>界面字体</strong>
@@ -1486,6 +2206,46 @@
     </div>
   </div>
 
+  <!-- 库管理弹窗必须在 mainWrap 外：库页打开时 mainWrap 为 display:none -->
+  <div class="modal-bg" id="libraryRenameModal">
+    <div class="modal">
+      <h3>重命名数据集</h3>
+      <p id="libraryRenameText" style="margin:0 0 10px;color:var(--muted);font-size:0.9rem">新名称（仅 basename）</p>
+      <input id="libraryRenameInput" type="text" style="width:100%;box-sizing:border-box" spellcheck="false" />
+      <div class="btns" style="margin-top:14px">
+        <button id="libraryRenameYes" class="ok">确认</button>
+        <button id="libraryRenameNo">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-bg" id="libraryMoveModal">
+    <div class="modal">
+      <h3>移动数据集</h3>
+      <p id="libraryMoveText" style="margin:0 0 10px;color:var(--muted);font-size:0.9rem">选择目标父目录</p>
+      <select id="libraryMoveSelect" style="width:100%;box-sizing:border-box;margin-bottom:8px"></select>
+      <div class="path-row">
+        <input id="libraryMoveInput" type="text" style="flex:1;min-width:140px" spellcheck="false" placeholder="或直接输入目标父目录路径" />
+        <button id="libraryMoveBrowse" type="button">浏览…</button>
+      </div>
+      <div class="btns" style="margin-top:14px">
+        <button id="libraryMoveYes" class="ok">确认移动</button>
+        <button id="libraryMoveNo">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-bg" id="libraryDeleteModal">
+    <div class="modal">
+      <h3>删除数据集？</h3>
+      <p id="libraryDeleteText">将永久删除所选数据集目录。</p>
+      <div class="btns">
+        <button id="libraryDeleteYes" class="danger">确认删除</button>
+        <button id="libraryDeleteNo">取消</button>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-bg" id="fsModal">
     <div class="modal fs-modal">
       <h3 id="fsModalTitle">选择数据文件夹</h3>
@@ -1512,8 +2272,10 @@
     let series = null;
     let playing = false;
     let playTimer = null;
+    let playSpeedRate = 1;
     let lastLiveFetch = 0;
     let viewerOnly = false;
+    let liveCamHomeParent = null;
     let hubMode = false;
     let lastRecording = false;
     let lastReplaying = false;
@@ -1526,8 +2288,16 @@
     let pendingEndGrip = null; // {scope, episode_id, grip_idx, window_s}
     let pendingMerge = null; // {sources, out_dir, out_name, overwrite}
     let mergeSources = []; // string paths
-    let fsPickMode = "load"; // load | merge_add
+    let fsPickMode = "load"; // load | merge_add | library_root | library_move
     let mergePageOpen = false;
+    let libraryPageOpen = false;
+    let libraryRoot = "";
+    let libraryData = { path: "", parent: null, datasets: [], other_dirs: [] };
+    let librarySelected = new Set(); // paths
+    let libraryFmtFilter = "all"; // all | zarr | lerobot
+    let pendingLibraryRename = null; // {path, name}
+    let pendingLibraryMove = null; // {path, name}
+    let pendingLibraryDelete = null; // string[] paths
     let lastDeleting = false;
     let lastUiMode = "";
     let lastOutputDir = "";
@@ -1539,14 +2309,16 @@
       is_dataset: false,
       entries: [],
     };
-    let chartChannel = "all"; // all | pos | gripper | rot | action
+    // 默认 pos：双臂 All 四宫格字太密；需要总览再点 All
+    let chartChannel = "pos"; // all | pos | gripper | rot | action
     let chartArmFilter = "both"; // both | L | R
     let chartTitle = "";
     let chartFrameIdx = 0;
-    const FONT_MIN = 16;
-    const FONT_MAX = 32;
-    const FONT_STEP = 2;
-    let uiFontPx = 20;
+    const FONT_MIN = 10;
+    const FONT_MAX = 18;
+    const FONT_STEP = 1;
+    const FONT_BASE = 12; // 百分比基准；null = 跟随视口自动
+    let uiFontPx = null;
 
     const TRIM_HOTKEY_STORAGE = "collect_trim_hotkeys";
     const TRIM_HOTKEY_DEFAULTS = { in: "1", out: "2", apply: "space" };
@@ -1556,6 +2328,7 @@
       scrubBlur: true,
       showHotkeyLabels: true,
       confirmTrim: true,
+      theme: "dark", // dark | light
     };
     let trimHotkeys = { ...TRIM_HOTKEY_DEFAULTS };
     let uiPrefs = { ...UI_PREFS_DEFAULTS };
@@ -1637,6 +2410,10 @@
             typeof parsed.confirmTrim === "boolean"
               ? parsed.confirmTrim
               : UI_PREFS_DEFAULTS.confirmTrim,
+          theme:
+            parsed.theme === "light" || parsed.theme === "dark"
+              ? parsed.theme
+              : UI_PREFS_DEFAULTS.theme,
         };
       } catch (_) {
         return { ...UI_PREFS_DEFAULTS };
@@ -1656,6 +2433,49 @@
       }
       if ($("optConfirmTrim")) {
         $("optConfirmTrim").checked = !!uiPrefs.confirmTrim;
+      }
+      syncThemeButtons();
+    }
+
+    function cssVar(name, fallback) {
+      try {
+        const v = getComputedStyle(document.documentElement)
+          .getPropertyValue(name)
+          .trim();
+        return v || fallback;
+      } catch (_) {
+        return fallback;
+      }
+    }
+
+    function chartThemeColors() {
+      return {
+        paper: cssVar("--panel-2", "#121820"),
+        plot: cssVar("--panel-2", "#121820"),
+        font: cssVar("--chart-fg", "#c5d0e0"),
+        muted: cssVar("--muted", "#8b9bb4"),
+        warn: cssVar("--warn", "#f0b429"),
+        annotBg: cssVar("--annot-bg", "rgba(18,24,32,0.88)"),
+      };
+    }
+
+    function syncThemeButtons() {
+      const theme = uiPrefs.theme === "light" ? "light" : "dark";
+      document
+        .querySelectorAll(".theme-btns button[data-theme]")
+        .forEach((btn) => {
+          btn.classList.toggle("active", btn.dataset.theme === theme);
+        });
+    }
+
+    function applyTheme(theme, { replot = true } = {}) {
+      const next = theme === "light" ? "light" : "dark";
+      uiPrefs.theme = next;
+      document.documentElement.setAttribute("data-theme", next);
+      syncThemeButtons();
+      saveUiPrefs();
+      if (replot && series) {
+        plotSeries(series, chartTitle, chartFrameIdx);
       }
     }
 
@@ -1754,30 +2574,95 @@
 
     trimHotkeys = loadTrimHotkeys();
     uiPrefs = loadUiPrefs();
+    // 尽早挂主题色（曲线在脚本末尾再按需重绘）
+    document.documentElement.setAttribute(
+      "data-theme",
+      uiPrefs.theme === "light" ? "light" : "dark"
+    );
+
+    function resolvedUiFontPx() {
+      if (uiFontPx != null) return uiFontPx;
+      const raw = getComputedStyle(document.documentElement).fontSize;
+      const n = parseFloat(raw);
+      return Number.isFinite(n) ? n : FONT_BASE;
+    }
+
+    function applyFontAuto({ replot = true } = {}) {
+      uiFontPx = null;
+      document.documentElement.style.removeProperty("--ui-font");
+      if ($("fontLabel")) $("fontLabel").textContent = "自动";
+      if ($("fontDown")) $("fontDown").disabled = false;
+      if ($("fontUp")) $("fontUp").disabled = false;
+      try { localStorage.setItem("collect_ui_font_px", "auto"); } catch (_) {}
+      if (replot && series) plotSeries(series, chartTitle, chartFrameIdx);
+      onViewportResize();
+    }
 
     function applyFontSize(px, { replot = true } = {}) {
-      uiFontPx = Math.max(FONT_MIN, Math.min(FONT_MAX, px));
+      uiFontPx = Math.max(FONT_MIN, Math.min(FONT_MAX, Math.round(px)));
       document.documentElement.style.setProperty("--ui-font", uiFontPx + "px");
-      $("fontLabel").textContent = Math.round((uiFontPx / 20) * 100) + "%";
-      $("fontDown").disabled = uiFontPx <= FONT_MIN;
-      $("fontUp").disabled = uiFontPx >= FONT_MAX;
+      if ($("fontLabel")) {
+        $("fontLabel").textContent =
+          Math.round((uiFontPx / FONT_BASE) * 100) + "%";
+      }
+      if ($("fontDown")) $("fontDown").disabled = uiFontPx <= FONT_MIN;
+      if ($("fontUp")) $("fontUp").disabled = uiFontPx >= FONT_MAX;
       try { localStorage.setItem("collect_ui_font_px", String(uiFontPx)); } catch (_) {}
       if (replot && series) plotSeries(series, chartTitle, chartFrameIdx);
+      onViewportResize();
     }
 
     function chartFontSize() {
-      // Plotly 用 px；随 UI 字体略放大
-      return Math.round(13 * (uiFontPx / 20));
+      // Plotly 固定紧凑字号，避免随 UI rem 放大后轴标题/图例互相重叠
+      const base = resolvedUiFontPx();
+      return Math.max(9, Math.min(11, Math.round(9.5 * (base / FONT_BASE))));
+    }
+
+    function chartLayoutChrome() {
+      const fs = chartFontSize();
+      return {
+        fontSize: fs,
+        titleSize: fs,
+        legendSize: Math.max(8, fs - 1),
+        // 无顶栏图标题；All 模式不画大图例，底边可更紧
+        marginAll: { t: 6, r: 28, b: 28, l: 40 },
+        marginSingle: { t: 8, r: 10, b: 48, l: 42 },
+      };
     }
 
     function chartPixelHeight() {
       const el = $("chart");
-      if (!el) return 280;
-      // 若尚未被 flex 撑开，用视口估算，避免 Plotly 画出 0 高
-      const h = el.clientHeight;
-      if (h >= 120) return Math.floor(h);
-      const vh = window.innerHeight || 800;
-      return Math.max(180, Math.floor(vh * (viewerOnly ? 0.48 : 0.36)));
+      if (!el) return 200;
+      // 先清掉固定高度，让 flex 分配真实可用空间，再量高
+      const prev = el.style.height;
+      el.style.height = "auto";
+      el.style.minHeight = "0";
+      el.style.height = "100%";
+      el.style.flex = viewerOnly ? "1.15 1 0" : "";
+      el.style.minHeight = "0";
+      el.style.maxHeight = "none";
+      el.style.overflow = "hidden";
+      void el.offsetHeight;
+      let h = Math.floor(el.getBoundingClientRect().height);
+      if (h < 80) {
+        const main = el.closest(".viewer-main");
+        if (main) {
+          let used = 0;
+          Array.from(main.children).forEach((ch) => {
+            if (ch === el) return;
+            used += ch.getBoundingClientRect().height;
+          });
+          const gaps = Math.max(0, main.children.length - 1) * 4;
+          h = Math.floor(main.clientHeight - used - gaps);
+        }
+      }
+      if (h < 80) {
+        const vh = window.innerHeight || 800;
+        h = Math.max(160, Math.floor(vh * (viewerOnly ? 0.3 : 0.26)));
+      }
+      // 绝不超过容器，否则 Plotly 画布溢出出现滚动条/文字叠字
+      el.style.height = prev || "";
+      return Math.max(140, h);
     }
 
     function resizeChart() {
@@ -1785,6 +2670,10 @@
       if (!gd) return;
       const h = chartPixelHeight();
       gd.style.height = h + "px";
+      gd.style.flex = viewerOnly ? "1.15 1 0" : "";
+      gd.style.minHeight = "0";
+      gd.style.maxHeight = "none";
+      gd.style.overflow = "hidden";
       if (gd.data && window.Plotly) {
         try {
           Plotly.relayout(gd, { height: h, autosize: true });
@@ -1796,7 +2685,12 @@
     let _resizeTimer = null;
     function onViewportResize() {
       if (_resizeTimer) clearTimeout(_resizeTimer);
-      _resizeTimer = setTimeout(() => resizeChart(), 80);
+      _resizeTimer = setTimeout(() => {
+        if (uiFontPx == null && $("fontLabel")) {
+          $("fontLabel").textContent = "自动";
+        }
+        resizeChart();
+      }, 80);
     }
 
     async function postCmd(action, extra = {}) {
@@ -1824,6 +2718,10 @@
         $("mergeMsg").textContent = t || "";
         $("mergeMsg").classList.toggle("busy", busy);
       }
+      if ($("libraryMsg")) {
+        $("libraryMsg").textContent = t || "";
+        $("libraryMsg").classList.toggle("busy", busy);
+      }
     }
 
     function setDeleteProgress(s) {
@@ -1838,17 +2736,29 @@
         : (deleting ? "处理中…" : "");
       const isMerge =
         phase === "merge" || /合并/.test(rawMsg) || /合并/.test(String((s && s.message) || ""));
+      const isLibDelete =
+        phase === "delete_datasets" ||
+        /删除数据集/.test(rawMsg) ||
+        /删除 \d+\//.test(rawMsg);
       [
         ["delProgress", "delProgressBar", "delProgressLabel"],
         ["delProgressView", "delProgressBarView", "delProgressLabelView"],
         ["mergeProgress", "mergeProgressBar", "mergeProgressLabel"],
+        ["libraryProgress", "libraryProgressBar", "libraryProgressLabel"],
       ].forEach(([wrapId, barId, labelId]) => {
         const wrap = $(wrapId);
         const bar = $(barId);
         const lab = $(labelId);
         if (!wrap || !bar) return;
-        const show =
-          wrapId === "mergeProgress" ? !!(deleting && isMerge) : !!deleting;
+        let show = !!deleting;
+        if (wrapId === "mergeProgress") show = !!(deleting && isMerge);
+        if (wrapId === "libraryProgress") show = !!(deleting && isLibDelete);
+        if (
+          wrapId === "delProgress" ||
+          wrapId === "delProgressView"
+        ) {
+          show = !!(deleting && !isMerge && !isLibDelete);
+        }
         wrap.classList.toggle("show", show);
         if (show) {
           bar.style.width = pct + "%";
@@ -1864,6 +2774,9 @@
       // 合并进行中：确保停在合并页看进度
       if (deleting && isMerge && !mergePageOpen) {
         showMergePage();
+      }
+      if (deleting && isLibDelete && !libraryPageOpen) {
+        showLibraryPage(libraryRoot || undefined);
       }
     }
 
@@ -1914,6 +2827,8 @@
 
     function showMergePage() {
       mergePageOpen = true;
+      libraryPageOpen = false;
+      if ($("libraryPage")) $("libraryPage").classList.remove("show");
       if ($("mergePage")) $("mergePage").classList.add("show");
       if ($("mainWrap")) $("mainWrap").style.display = "none";
       if ($("hubPage")) $("hubPage").classList.remove("show");
@@ -1929,29 +2844,469 @@
       mergePageOpen = false;
       if ($("mergePage")) $("mergePage").classList.remove("show");
       // 回到数据管理主界面（由后续 applyUiMode / poll 校正）
-      if (!hubMode && $("mainWrap")) $("mainWrap").style.display = "flex";
+      if (!hubMode && !libraryPageOpen && $("mainWrap")) {
+        $("mainWrap").style.display = "flex";
+      }
       $("headerHint").textContent = "数据管理 · 返回入口 · 仅可信局域网";
       $("pageTitle").textContent = "ARX5 Dataset Viewer";
       document.title = "ARX5 Dataset Viewer";
+    }
+
+    function formatLibMtime(ts) {
+      if (ts == null || !Number.isFinite(Number(ts))) return "—";
+      try {
+        const d = new Date(Number(ts) * 1000);
+        if (Number.isNaN(d.getTime())) return "—";
+        const pad = (n) => String(n).padStart(2, "0");
+        return (
+          d.getFullYear() +
+          "-" +
+          pad(d.getMonth() + 1) +
+          "-" +
+          pad(d.getDate()) +
+          " " +
+          pad(d.getHours()) +
+          ":" +
+          pad(d.getMinutes())
+        );
+      } catch (_) {
+        return "—";
+      }
+    }
+
+    function libraryVisibleRows() {
+      const rows = Array.isArray(libraryData.datasets) ? libraryData.datasets : [];
+      if (libraryFmtFilter === "all") return rows.slice();
+      return rows.filter(
+        (d) => String(d.dataset_format || "") === libraryFmtFilter
+      );
+    }
+
+    function librarySelectedRows() {
+      return libraryVisibleRows().filter((d) => librarySelected.has(d.path));
+    }
+
+    function syncLibraryFilterBtns() {
+      document.querySelectorAll("#libraryFmtBtns button[data-lib-fmt]").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.libFmt === libraryFmtFilter);
+      });
+    }
+
+    function syncLibraryBatchUi() {
+      const visible = libraryVisibleRows();
+      const selected = librarySelectedRows();
+      const n = selected.length;
+      const allN = (libraryData.datasets || []).length;
+      const allLerobot =
+        n >= 2 && selected.every((d) => String(d.dataset_format) === "lerobot");
+      if ($("btnLibraryMergeSelected")) {
+        $("btnLibraryMergeSelected").disabled = !allLerobot;
+        $("btnLibraryMergeSelected").title = allLerobot
+          ? `合并 ${n} 个 LeRobot`
+          : "需选择至少 2 个 LeRobot 数据集";
+      }
+      if ($("btnLibraryDeleteSelected")) {
+        $("btnLibraryDeleteSelected").disabled = n < 1;
+      }
+      if ($("libraryFilterCount")) {
+        const filt =
+          libraryFmtFilter === "all"
+            ? `共 ${allN}`
+            : `${libraryFmtFilter} ${visible.length} / 共 ${allN}`;
+        $("libraryFilterCount").textContent = filt;
+      }
+      if ($("libraryHint")) {
+        if (!n) $("libraryHint").textContent = "未选择";
+        else if (!allLerobot && n >= 2) {
+          $("libraryHint").textContent = `已选 ${n} · 合并仅支持全为 LeRobot`;
+        } else {
+          $("libraryHint").textContent = `已选 ${n}`;
+        }
+      }
+      if ($("librarySelectAll")) {
+        const total = visible.length;
+        const nVisSel = selected.length;
+        $("librarySelectAll").checked = total > 0 && nVisSel === total;
+        $("librarySelectAll").indeterminate = nVisSel > 0 && nVisSel < total;
+      }
+    }
+
+    function renderLibraryTable() {
+      const body = $("libraryTableBody");
+      const empty = $("libraryEmpty");
+      if (!body) return;
+      body.innerHTML = "";
+      syncLibraryFilterBtns();
+      const rows = libraryVisibleRows();
+      if (empty) {
+        empty.hidden = rows.length > 0;
+        if (!rows.length) {
+          empty.textContent =
+            libraryFmtFilter === "all"
+              ? "此目录下没有识别到数据集"
+              : `当前筛选下没有 ${libraryFmtFilter} 数据集`;
+        }
+      }
+      rows.forEach((d) => {
+        const tr = document.createElement("tr");
+        const path = d.path;
+        const tdCheck = document.createElement("td");
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = librarySelected.has(path);
+        cb.addEventListener("change", () => {
+          if (cb.checked) librarySelected.add(path);
+          else librarySelected.delete(path);
+          syncLibraryBatchUi();
+        });
+        tdCheck.appendChild(cb);
+
+        const tdName = document.createElement("td");
+        tdName.className = "lib-name";
+        tdName.textContent = d.name || "";
+        tdName.title = path || "";
+
+        const tdFmt = document.createElement("td");
+        const badge = document.createElement("span");
+        const fmt = String(d.dataset_format || "");
+        badge.className =
+          "badge " +
+          (fmt === "lerobot"
+            ? "fmt-lerobot"
+            : fmt === "zarr"
+              ? "fmt-zarr"
+              : "");
+        badge.textContent = fmt || "?";
+        badge.style.display = "inline-block";
+        tdFmt.appendChild(badge);
+
+        const tdEp = document.createElement("td");
+        tdEp.textContent =
+          d.n_episodes != null ? String(d.n_episodes) : "—";
+        const tdFr = document.createElement("td");
+        tdFr.textContent =
+          d.total_frames != null ? String(d.total_frames) : "—";
+        const tdFps = document.createElement("td");
+        tdFps.textContent = d.fps != null ? String(d.fps) : "—";
+        const tdMt = document.createElement("td");
+        tdMt.textContent = formatLibMtime(d.mtime);
+
+        const tdAct = document.createElement("td");
+        const acts = document.createElement("div");
+        acts.className = "lib-actions";
+        const mkBtn = (label, cls, fn) => {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.textContent = label;
+          if (cls) b.className = cls;
+          b.addEventListener("click", fn);
+          acts.appendChild(b);
+        };
+        mkBtn("打开", "ok", () => openLibraryDataset(path));
+        mkBtn("重命名", "", () => openLibraryRename(d));
+        mkBtn("移动", "", () => openLibraryMove(d));
+        mkBtn("删除", "danger", () => openLibraryDelete([path]));
+        tdAct.appendChild(acts);
+
+        tr.appendChild(tdCheck);
+        tr.appendChild(tdName);
+        tr.appendChild(tdFmt);
+        tr.appendChild(tdEp);
+        tr.appendChild(tdFr);
+        tr.appendChild(tdFps);
+        tr.appendChild(tdMt);
+        tr.appendChild(tdAct);
+        body.appendChild(tr);
+      });
+      syncLibraryBatchUi();
+    }
+
+    async function refreshLibrary(path) {
+      const root = (path != null ? path : libraryRoot || "").trim();
+      if ($("libraryRootInput") && root) $("libraryRootInput").value = root;
+      if (!root) {
+        setMsg("请输入库根目录");
+        return;
+      }
+      setMsg("读取库目录…");
+      try {
+        const r = await fetch(
+          "/api/fs/library?path=" + encodeURIComponent(root)
+        );
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || r.statusText);
+        libraryData = data;
+        libraryRoot = data.path || root;
+        if (data.repo_root) repoRoot = data.repo_root;
+        if ($("libraryRootInput")) $("libraryRootInput").value = libraryRoot;
+        // 清掉已不存在的勾选
+        const alive = new Set((data.datasets || []).map((d) => d.path));
+        [...librarySelected].forEach((p) => {
+          if (!alive.has(p)) librarySelected.delete(p);
+        });
+        renderLibraryTable();
+        setMsg(
+          `库 ${libraryRoot} · 数据集 ${(data.datasets || []).length} · 其他文件夹 ${(data.other_dirs || []).length}`
+        );
+      } catch (e) {
+        setMsg("库读取失败: " + e.message);
+      }
+    }
+
+    async function showLibraryPage(path) {
+      libraryPageOpen = true;
+      mergePageOpen = false;
+      document.body.classList.add("library-mode");
+      document.body.classList.remove("viewer-mode");
+      if ($("mergePage")) $("mergePage").classList.remove("show");
+      if ($("libraryPage")) $("libraryPage").classList.add("show");
+      if ($("mainWrap")) $("mainWrap").style.display = "none";
+      if ($("hubPage")) $("hubPage").classList.remove("show");
+      $("headerHint").textContent = "库管理 · 下一层数据集 · 仅可信局域网";
+      $("pageTitle").textContent = "ARX5 Dataset Library";
+      document.title = "ARX5 Dataset Library";
+      let root = (path || "").trim();
+      if (!root) {
+        root =
+          libraryRoot ||
+          ($("libraryRootInput") && $("libraryRootInput").value.trim()) ||
+          "";
+        if (!root && lastOutputDir) {
+          const parts = lastOutputDir.replace(/\/+$/, "").split("/");
+          parts.pop();
+          root = parts.join("/") || "/";
+        }
+        if (!root && repoRoot) root = repoRoot + "/data";
+      }
+      await refreshLibrary(root);
+    }
+
+    function hideLibraryPage() {
+      libraryPageOpen = false;
+      document.body.classList.remove("library-mode");
+      if ($("libraryPage")) $("libraryPage").classList.remove("show");
+      if (!hubMode && !mergePageOpen && $("mainWrap")) {
+        $("mainWrap").style.display = "flex";
+      }
+      $("headerHint").textContent = "数据管理 · 返回入口 · 仅可信局域网";
+      $("pageTitle").textContent = "ARX5 Dataset Viewer";
+      document.title = "ARX5 Dataset Viewer";
+    }
+
+    async function openLibraryDataset(path) {
+      hideLibraryPage();
+      await loadDatasetPath(path);
+    }
+
+    function openLibraryRename(d) {
+      pendingLibraryRename = { path: d.path, name: d.name };
+      if ($("libraryRenameInput")) $("libraryRenameInput").value = d.name || "";
+      if ($("libraryRenameText")) {
+        $("libraryRenameText").textContent = `重命名「${d.name}」`;
+      }
+      if ($("libraryRenameModal")) $("libraryRenameModal").classList.add("show");
+      setTimeout(() => {
+        if ($("libraryRenameInput")) {
+          $("libraryRenameInput").focus();
+          $("libraryRenameInput").select();
+        }
+      }, 0);
+    }
+
+    function openLibraryMove(d) {
+      pendingLibraryMove = { path: d.path, name: d.name };
+      if ($("libraryMoveText")) {
+        $("libraryMoveText").textContent = `移动「${d.name}」到目标父目录（保留同名）`;
+      }
+      const sel = $("libraryMoveSelect");
+      if (sel) {
+        sel.innerHTML = "";
+        const opt0 = document.createElement("option");
+        opt0.value = "";
+        opt0.textContent = "（选择库根下的非数据集文件夹）";
+        sel.appendChild(opt0);
+        (libraryData.other_dirs || []).forEach((od) => {
+          const o = document.createElement("option");
+          o.value = od.path;
+          o.textContent = od.name;
+          sel.appendChild(o);
+        });
+      }
+      if ($("libraryMoveInput")) $("libraryMoveInput").value = "";
+      if ($("libraryMoveModal")) $("libraryMoveModal").classList.add("show");
+    }
+
+    function openLibraryDelete(paths) {
+      pendingLibraryDelete = (paths || []).filter(Boolean);
+      if (!pendingLibraryDelete.length) return;
+      const names = pendingLibraryDelete.map((p) => {
+        const parts = p.replace(/\/+$/, "").split("/");
+        return parts[parts.length - 1] || p;
+      });
+      if ($("libraryDeleteText")) {
+        $("libraryDeleteText").textContent =
+          `将永久删除 ${names.length} 个数据集：\n` + names.slice(0, 12).join("\n") +
+          (names.length > 12 ? `\n…共 ${names.length} 个` : "");
+        $("libraryDeleteText").style.whiteSpace = "pre-wrap";
+      }
+      if ($("libraryDeleteModal")) $("libraryDeleteModal").classList.add("show");
+      postCmd("delete_datasets_request", { paths: pendingLibraryDelete }).catch(
+        (e) => setMsg(e.message)
+      );
+    }
+
+    async function openPathSmart(path) {
+      const p = (path || "").trim();
+      if (!p) {
+        setMsg("请输入路径");
+        return;
+      }
+      try {
+        const r = await fetch(
+          "/api/fs/library?path=" + encodeURIComponent(p)
+        );
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || r.statusText);
+        if (data.repo_root) repoRoot = data.repo_root;
+        if (data.is_dataset) {
+          if (libraryPageOpen) hideLibraryPage();
+          if (mergePageOpen) hideMergePage();
+          await loadDatasetPath(data.path || p);
+          return;
+        }
+        // 普通目录 → 库管理
+        await showLibraryPage(data.path || p);
+      } catch (e) {
+        setMsg("打开失败: " + e.message);
+      }
+    }
+
+    function mountLiveCamForMode(asViewer) {
+      const cam = $("liveCam");
+      const hint = $("frameSourceHint");
+      const home = $("livePanel");
+      const slot = $("vizPreviewSlot");
+      if (!cam || !home) return;
+      if (!liveCamHomeParent) liveCamHomeParent = home;
+      if (asViewer && slot) {
+        if (cam.parentElement !== slot) {
+          slot.appendChild(cam);
+          if (hint) slot.appendChild(hint);
+        }
+      } else if (cam.parentElement !== home) {
+        home.appendChild(cam);
+        if (hint) home.appendChild(hint);
+      }
+    }
+
+    function syncVizHeader(s) {
+      const dir = (s && s.output_dir) || "";
+      if ($("vizPathShort")) {
+        const short = dir ? dir.replace(/\\/g, "/").split("/").filter(Boolean).slice(-2).join("/") : "—";
+        $("vizPathShort").textContent = short || "—";
+        $("vizPathShort").title = dir || "";
+      }
+      if ($("vizEpisodeTitle")) {
+        if (selectedEp != null && selectedEp !== "live") {
+          $("vizEpisodeTitle").textContent = `EPISODE ${selectedEp}`;
+        } else {
+          $("vizEpisodeTitle").textContent = "EPISODE —";
+        }
+      }
+      const nEp = Number((s && s.n_episodes) ?? 0);
+      let nFrames = Number((s && s.total_frames) ?? NaN);
+      if (!Number.isFinite(nFrames)) {
+        // 状态里还没有 total_frames 时，用左侧列表步数加总兜底
+        nFrames = Array.from(document.querySelectorAll("#epList li .meta"))
+          .map((el) => {
+            const m = String(el.textContent || "").match(/(\d+)\s*steps/);
+            return m ? Number(m[1]) : 0;
+          })
+          .reduce((a, b) => a + b, 0);
+      }
+      const fpsRaw =
+        (s && (s.dataset_fps != null ? s.dataset_fps : s.frequency)) ?? null;
+      const fps = fpsRaw != null && Number(fpsRaw) > 0 ? Number(fpsRaw) : null;
+      if ($("nEpisodesView")) $("nEpisodesView").textContent = String(nEp);
+      if ($("vizFrames")) {
+        $("vizFrames").textContent = Number.isFinite(nFrames)
+          ? String(Math.round(nFrames))
+          : "—";
+      }
+      if ($("vizFps")) {
+        $("vizFps").textContent =
+          fps != null ? (Number.isInteger(fps) ? String(fps) : fps.toFixed(1)) : "—";
+      }
+      const busy = !!(s && (s.mode === "DELETING" || s.deleting));
+      const isLerobot = String((s && s.dataset_format) || "") === "lerobot";
+      const hasDir = !!dir;
+      if ($("btnOpenRerun")) {
+        $("btnOpenRerun").disabled = !hasDir || busy || !isLerobot;
+        $("btnOpenRerun").title = !hasDir
+          ? "尚未加载数据目录"
+          : !isLerobot
+            ? "仅支持 LeRobot 目录（请先转换）"
+            : "用本机 Rerun / lerobot-dataset-viz 打开";
+      }
+      if ($("btnEpPrev")) $("btnEpPrev").disabled = busy;
+      if ($("btnEpNext")) $("btnEpNext").disabled = busy;
+    }
+
+    function listEpisodeIdsFromDom() {
+      return Array.from(document.querySelectorAll("#epList li"))
+        .map((li) => Number(li.dataset.id))
+        .filter((n) => Number.isFinite(n));
+    }
+
+    function selectAdjacentEpisode(delta) {
+      const ids = listEpisodeIdsFromDom();
+      if (!ids.length) {
+        setMsg("没有 episode");
+        return;
+      }
+      let idx = 0;
+      if (selectedEp != null && selectedEp !== "live") {
+        const cur = ids.indexOf(Number(selectedEp));
+        idx = cur >= 0 ? cur + delta : 0;
+      } else {
+        idx = delta > 0 ? 0 : ids.length - 1;
+      }
+      idx = Math.max(0, Math.min(ids.length - 1, idx));
+      selectEpisode(ids[idx]);
     }
 
     function applyUiMode(mode, s) {
       const connecting = mode === "CONNECTING";
       hubMode = mode === "HUB" || connecting;
       viewerOnly = !!(s && s.viewer_only) || mode === "VIEW";
-      document.body.classList.toggle("viewer-mode", viewerOnly && !hubMode && !mergePageOpen);
+      document.body.classList.toggle(
+        "viewer-mode",
+        viewerOnly && !hubMode && !mergePageOpen && !libraryPageOpen
+      );
+      document.body.classList.toggle(
+        "library-mode",
+        !!libraryPageOpen && !hubMode
+      );
 
-      // 合并页优先；入口页其次；否则主界面
+      // 库/合并页优先；入口页其次；否则主界面
       if ($("mergePage")) {
         $("mergePage").classList.toggle("show", !!mergePageOpen && !hubMode);
+      }
+      if ($("libraryPage")) {
+        $("libraryPage").classList.toggle(
+          "show",
+          !!libraryPageOpen && !hubMode && !mergePageOpen
+        );
       }
       $("hubPage").classList.toggle("show", hubMode);
       if (hubMode) {
         mergePageOpen = false;
+        libraryPageOpen = false;
         if ($("mergePage")) $("mergePage").classList.remove("show");
+        if ($("libraryPage")) $("libraryPage").classList.remove("show");
       }
       $("mainWrap").style.display =
-        hubMode || mergePageOpen ? "none" : "flex";
+        hubMode || mergePageOpen || libraryPageOpen ? "none" : "flex";
 
       if ($("hubCard")) {
         $("hubCard").classList.toggle("hub-connecting", connecting);
@@ -1965,6 +3320,12 @@
         $("headerHint").textContent = "合并 LeRobot · 返回数据管理 · 仅可信局域网";
         $("pageTitle").textContent = "ARX5 Merge LeRobot";
         document.title = "ARX5 Merge LeRobot";
+        return;
+      }
+      if (libraryPageOpen && !hubMode) {
+        $("headerHint").textContent = "库管理 · 下一层数据集 · 仅可信局域网";
+        $("pageTitle").textContent = "ARX5 Dataset Library";
+        document.title = "ARX5 Dataset Library";
         return;
       }
 
@@ -1991,25 +3352,26 @@
         return;
       }
 
-      // 顶部始终保留唯一视频区；管理页隐藏 Control
-      $("collectRow").style.display = "grid";
+      // 采集：顶部 live+control；管理：Visualizer 布局，预览移入主列
+      $("collectRow").style.display = viewerOnly ? "none" : "grid";
       if ($("controlPanel")) $("controlPanel").style.display = viewerOnly ? "none" : "";
       if ($("livePanel")) {
-        // 管理页单列铺满视频
-        $("collectRow").style.gridTemplateColumns = viewerOnly ? "1fr" : "";
+        $("collectRow").style.gridTemplateColumns = "";
       }
-      $("viewerOnlyBar").style.display = viewerOnly ? "" : "none";
+      if ($("viewerOnlyBar")) $("viewerOnlyBar").style.display = "none";
+      mountLiveCamForMode(!!viewerOnly);
+      syncVizHeader(s);
       $("btnLiveView").style.display = viewerOnly ? "none" : "";
       if ($("btnBackHub")) {
-        $("btnBackHub").style.display = "";
+        $("btnBackHub").style.display = viewerOnly ? "" : "none";
       }
       $("headerHint").textContent = viewerOnly
-        ? "数据管理 · 返回入口 · 仅可信局域网"
+        ? "数据管理 · Space 播放 · 仅可信局域网"
         : "网页快捷键: P/C/S/D/Q · 仅可信局域网";
       $("pageTitle").textContent = viewerOnly ? "ARX5 Dataset Viewer" : "ARX5 ZMQ Collect";
       document.title = $("pageTitle").textContent;
       if ($("videoHeading")) {
-        $("videoHeading").textContent = viewerOnly ? "Episode frame" : "Live preview";
+        $("videoHeading").textContent = "Live preview";
       }
       // 数采默认实时流（只在尚未选 episode 时挂一次）
       if (!viewerOnly && selectedEp == null) {
@@ -2052,7 +3414,8 @@
       }
       el.style.display = "";
       el.textContent = fmt;
-      el.className = "badge " + (fmt === "lerobot" ? "READY" : "VIEW");
+      el.className =
+        "badge " + (fmt === "lerobot" ? "fmt-lerobot" : "fmt-zarr");
     }
 
     function syncConvertLerobotUi(s) {
@@ -2170,6 +3533,7 @@
       const busy = !!(s && (s.mode === "DELETING" || s.deleting));
       const canOpen = !!(s && s.viewer_only) && !hubMode;
       if ($("btnOpenMergePage")) $("btnOpenMergePage").disabled = !canOpen || busy;
+      if ($("btnOpenLibraryPage")) $("btnOpenLibraryPage").disabled = !canOpen || busy;
       [
         "btnMergeLerobot",
         "btnMergeAddSource",
@@ -2365,6 +3729,10 @@
       const prompt =
         ($("convertLerobotPrompt") && $("convertLerobotPrompt").value.trim()) ||
         "Flatten and fold the cloth.";
+      const robotType =
+        ($("convertLerobotRobotType") &&
+          $("convertLerobotRobotType").value.trim()) ||
+        "agilex";
       let fps = 20;
       if ($("convertLerobotFps")) {
         fps = Number($("convertLerobotFps").value) || 20;
@@ -2372,11 +3740,17 @@
       const overwrite = !!(
         $("convertLerobotOverwrite") && $("convertLerobotOverwrite").checked
       );
-      pendingConvert = { out_dir: outDir, fps, prompt, overwrite };
+      pendingConvert = {
+        out_dir: outDir,
+        fps,
+        prompt,
+        robot_type: robotType,
+        overwrite,
+      };
       if ($("convertLerobotText")) {
         $("convertLerobotText").textContent =
           `从 ${status.output_dir || "当前目录"} 转换为 LeRobot → ${outDir}\n` +
-          `fps=${fps} · prompt="${prompt}"` +
+          `fps=${fps} · robot_type="${robotType}" · prompt="${prompt}"` +
           (overwrite ? " · 将覆盖已有输出" : " · 已存在 episode 会跳过（可勾选覆盖）");
       }
       if ($("convertLerobotModal")) $("convertLerobotModal").classList.add("show");
@@ -2468,10 +3842,28 @@
         }
       }
       if (label) {
-        label.textContent = dir || "（未加载）";
-        label.title = dir || "";
+        const focused = document.activeElement === label;
+        const typed =
+          label.tagName === "INPUT" && label.dataset.touched === "1";
+        // 输入中不抢光标；服务端目录变了则同步
+        if (label.tagName === "INPUT") {
+          if (!focused && !typed) {
+            label.value = dir || "";
+          } else if (!focused && dir && dir !== lastOutputDir) {
+            label.value = dir;
+            delete label.dataset.touched;
+          }
+          label.title = dir || label.value || "";
+          label.placeholder = dir
+            ? dir
+            : "输入数据目录绝对路径后回车 / 打开";
+        } else {
+          label.textContent = dir || "（未加载）";
+          label.title = dir || "";
+        }
       }
       if (dir) lastOutputDir = dir;
+      syncVizHeader(s || status);
     }
 
     function resetDaggerPathInputs() {
@@ -2498,6 +3890,10 @@
       stopPlay();
       selectedEp = null;
       series = null;
+      if ($("datasetPathLabel") && $("datasetPathLabel").tagName === "INPUT") {
+        delete $("datasetPathLabel").dataset.touched;
+        if (p) $("datasetPathLabel").value = p;
+      }
       resetDaggerPathInputs();
       resetConvertPathInputs();
       try {
@@ -2521,21 +3917,38 @@
 
     function openFsModal(mode) {
       if (!$("fsModal")) return;
-      fsPickMode = mode === "merge_add" ? "merge_add" : "load";
+      if (mode === "merge_add") fsPickMode = "merge_add";
+      else if (mode === "library_root") fsPickMode = "library_root";
+      else if (mode === "library_move") fsPickMode = "library_move";
+      else fsPickMode = "load";
       if ($("fsModalTitle")) {
         $("fsModalTitle").textContent =
-          fsPickMode === "merge_add" ? "添加要合并的 LeRobot" : "选择数据文件夹";
+          fsPickMode === "merge_add"
+            ? "添加要合并的 LeRobot"
+            : fsPickMode === "library_root"
+              ? "选择库根目录"
+              : fsPickMode === "library_move"
+                ? "选择移动目标父目录"
+                : "选择数据文件夹";
       }
       if ($("fsModalHint")) {
         $("fsModalHint").textContent =
           fsPickMode === "merge_add"
             ? "浏览并选中 LeRobot 数据集目录（含 meta/info.json），点「加入合并列表」。可重复添加多个。"
-            : "单击进入子文件夹（像资源管理器）。含 replay_buffer.zarr 或 LeRobot meta/info.json 的目录会标「数据集」，点「打开此数据集」加载。";
+            : fsPickMode === "library_root"
+              ? "选择包含多个数据集子文件夹的父目录，点「设为库根」。"
+              : fsPickMode === "library_move"
+                ? "选择要把数据集移入的目标父目录（不必是数据集），点「选为移动目标」。"
+                : "单击进入子文件夹（像资源管理器）。含 replay_buffer.zarr 或 LeRobot meta/info.json 的目录会标「数据集」，点「打开此数据集」加载。普通文件夹也可「打开」进入库管理。";
       }
       $("fsModal").classList.add("show");
       // 从当前数据目录的上级开始，便于点进兄弟文件夹；否则仓库 data/
       let start = "";
-      if (lastOutputDir) {
+      if (fsPickMode === "library_root" && libraryRoot) {
+        start = libraryRoot;
+      } else if (fsPickMode === "library_move" && libraryRoot) {
+        start = libraryRoot;
+      } else if (lastOutputDir) {
         const parts = lastOutputDir.replace(/\/+$/, "").split("/");
         parts.pop();
         start = parts.join("/") || "/";
@@ -2606,13 +4019,16 @@
         li.appendChild(name);
         if (ent.is_dataset) {
           const tag = document.createElement("span");
-          tag.className = "fs-tag";
+          const fmt = String(ent.dataset_format || "");
+          tag.className =
+            "fs-tag" +
+            (fmt === "lerobot"
+              ? " fmt-lerobot"
+              : fmt === "zarr"
+                ? " fmt-zarr"
+                : "");
           tag.textContent =
-            ent.dataset_format === "lerobot"
-              ? "LeRobot"
-              : ent.dataset_format === "zarr"
-                ? "zarr"
-                : "数据集";
+            fmt === "lerobot" ? "LeRobot" : fmt === "zarr" ? "zarr" : "数据集";
           li.appendChild(tag);
         } else if (ent.n_children != null) {
           const meta = document.createElement("span");
@@ -2633,10 +4049,17 @@
     }
 
     function fsCanPickCurrent(data) {
-      if (!data || !data.is_dataset) return false;
+      if (!data || !data.path) return false;
       if (fsPickMode === "merge_add") {
-        return String(data.dataset_format || "") === "lerobot";
+        return (
+          !!data.is_dataset &&
+          String(data.dataset_format || "") === "lerobot"
+        );
       }
+      if (fsPickMode === "library_root" || fsPickMode === "library_move") {
+        return true; // 任意目录可作为库根 / 移动目标
+      }
+      // load：数据集或普通目录均可（普通目录进库管理）
       return true;
     }
 
@@ -2647,6 +4070,16 @@
           return;
         }
         addMergeSource(path);
+        closeFsModal();
+        return;
+      }
+      if (fsPickMode === "library_root") {
+        closeFsModal();
+        showLibraryPage(path);
+        return;
+      }
+      if (fsPickMode === "library_move") {
+        if ($("libraryMoveInput")) $("libraryMoveInput").value = path;
         closeFsModal();
         return;
       }
@@ -2673,10 +4106,14 @@
             $("fsOpen").textContent = canPick
               ? "加入合并列表"
               : "请选择 LeRobot 数据集";
+          } else if (fsPickMode === "library_root") {
+            $("fsOpen").textContent = "设为库根";
+          } else if (fsPickMode === "library_move") {
+            $("fsOpen").textContent = "选为移动目标";
           } else {
             $("fsOpen").textContent = data.is_dataset
               ? "打开此数据集"
-              : "打开此数据集（当前不是）";
+              : "打开为库目录";
           }
         }
         if (statusEl) {
@@ -2684,10 +4121,14 @@
             statusEl.textContent = canPick
               ? "当前是 LeRobot，可加入合并列表"
               : `子文件夹 ${(data.entries || []).length} 个 · 请进入 LeRobot 目录`;
+          } else if (fsPickMode === "library_root") {
+            statusEl.textContent = `当前路径可作为库根 · 子文件夹 ${(data.entries || []).length} 个`;
+          } else if (fsPickMode === "library_move") {
+            statusEl.textContent = `选择目标父目录 · 子文件夹 ${(data.entries || []).length} 个`;
           } else {
             statusEl.textContent = data.is_dataset
               ? "当前目录是数据集，可打开"
-              : `子文件夹 ${(data.entries || []).length} 个 · 单击进入`;
+              : `子文件夹 ${(data.entries || []).length} 个 · 可打开为库目录`;
           }
         }
       } catch (e) {
@@ -2698,7 +4139,7 @@
 
     async function openDatasetFromBrowser(path) {
       closeFsModal();
-      await loadDatasetPath(path);
+      await openPathSmart(path);
     }
 
     function updateControls(s) {
@@ -2724,6 +4165,7 @@
       syncMergeLerobotUi(s);
       syncDatasetFormatBadge(s);
       syncEndGripTrimUi(s);
+      syncVizHeader(s);
 
       if (hubMode) return;
 
@@ -2732,21 +4174,22 @@
       const trimEpOk =
         selectedEp != null && selectedEp !== "live" && !deleting;
       const deleteOk =
-        !isLerobot &&
-        selectedEp != null &&
-        selectedEp !== "live" &&
-        !deleting;
+        selectedEp != null && selectedEp !== "live" && !deleting;
 
       // 删除/裁剪/转换结束：强制刷新列表并重选当前 episode（保留高亮）
       if (lastDeleting && !deleting) {
         const keepEp = selectedEp;
         const msg = s.message || "处理完成";
-        pollStatus(true).then(() => {
-          setMsg(msg);
-          if (keepEp != null && keepEp !== "live") {
-            selectEpisode(Number(keepEp));
-          }
-        });
+        if (libraryPageOpen) {
+          refreshLibrary(libraryRoot).then(() => setMsg(msg));
+        } else {
+          pollStatus(true).then(() => {
+            setMsg(msg);
+            if (keepEp != null && keepEp !== "live") {
+              selectEpisode(Number(keepEp));
+            }
+          });
+        }
       }
       lastDeleting = deleting;
 
@@ -2783,7 +4226,7 @@
         if ($(id)) $(id).disabled = rec || busy;
       });
       $("btnDelete").disabled =
-        isLerobot || selectedEp === null || selectedEp === "live" || busy;
+        selectedEp === null || selectedEp === "live" || busy;
       setTrimControlsEnabled(trimEpOk);
       if ($("btnTrimIn")) $("btnTrimIn").disabled = !trimEpOk;
       if ($("btnTrimOut")) $("btnTrimOut").disabled = !trimEpOk;
@@ -2871,6 +4314,8 @@
         ul.appendChild(li);
       });
       ul.scrollTop = scrollTop;
+      // 列表刷新后刷新 Frames 兜底（status.total_frames 尚未到时）
+      if (typeof syncVizHeader === "function") syncVizHeader(status);
     }
 
     function formatPoseHtml(s) {
@@ -2997,7 +4442,11 @@
         (action[0] && action[0].length >= 14) ||
         arms.length > 1;
 
-      const axisCommon = { gridcolor: "#2d3a4d", zeroline: false, color: "#8b9bb4" };
+      const axisCommon = {
+        gridcolor: cssVar("--border", "#2d3a4d"),
+        zeroline: false,
+        color: cssVar("--muted", "#8b9bb4"),
+      };
       let traces = [];
       let layout;
 
@@ -3044,26 +4493,53 @@
           annotations.push(...cursorAnnotations(xi));
         }
         shapes.push(...trimMarkerShapes());
+        const tc = chartThemeColors();
+        const chrome = chartLayoutChrome();
+        // 右侧角标命名子图；All 双臂图例过多 → 默认隐藏（用上方通道按钮筛选）
+        const paneLabels = [
+          { text: "pos", y: 0.99 },
+          { text: "grip", y: 0.72 },
+          { text: "rot", y: 0.46 },
+          { text: "act", y: 0.20 },
+        ].map((p) => ({
+          text: p.text,
+          xref: "paper",
+          yref: "paper",
+          x: 1.0,
+          y: p.y,
+          showarrow: false,
+          xanchor: "right",
+          yanchor: "top",
+          font: { size: chrome.fontSize, color: tc.muted },
+          bgcolor: "rgba(12,16,23,0.55)",
+          borderpad: 1,
+        }));
         layout = {
-          title: { text: title, font: { size: chartFontSize() + 2, color: "#8b9bb4" } },
-          paper_bgcolor: "#121820",
-          plot_bgcolor: "#121820",
-          font: { color: "#c5d0e0", size: chartFontSize() },
-          margin: { t: 48, r: 24, b: 36, l: 64 },
+          title: false,
+          paper_bgcolor: tc.paper,
+          plot_bgcolor: tc.plot,
+          font: { color: tc.font, size: chrome.fontSize },
+          margin: chrome.marginAll,
           height: chartPixelHeight(),
           autosize: true,
-          showlegend: true,
-          legend: { orientation: "h", y: 1.15 },
+          showlegend: false,
           shapes,
-          annotations,
-          xaxis:  { ...axisCommon, domain: [0, 1], anchor: "y" },
-          xaxis2: { ...axisCommon, domain: [0, 1], anchor: "y2", matches: "x" },
-          xaxis3: { ...axisCommon, domain: [0, 1], anchor: "y3", matches: "x" },
-          xaxis4: { ...axisCommon, domain: [0, 1], anchor: "y4", matches: "x", title: "step" },
-          yaxis:  { ...axisCommon, domain: [0.78, 1.00], title: { text: "pos", standoff: 8 }, automargin: true },
-          yaxis2: { ...axisCommon, domain: [0.54, 0.74], title: { text: "grip", standoff: 8 }, automargin: true, tickformat: ".3f" },
-          yaxis3: { ...axisCommon, domain: [0.30, 0.50], title: { text: "rot", standoff: 8 }, automargin: true },
-          yaxis4: { ...axisCommon, domain: [0.00, 0.26], title: { text: "act", standoff: 8 }, automargin: true },
+          annotations: [...paneLabels, ...annotations],
+          xaxis:  { ...axisCommon, domain: [0, 1], anchor: "y", tickfont: { size: chrome.fontSize }, showticklabels: false },
+          xaxis2: { ...axisCommon, domain: [0, 1], anchor: "y2", matches: "x", tickfont: { size: chrome.fontSize }, showticklabels: false },
+          xaxis3: { ...axisCommon, domain: [0, 1], anchor: "y3", matches: "x", tickfont: { size: chrome.fontSize }, showticklabels: false },
+          xaxis4: {
+            ...axisCommon,
+            domain: [0, 1],
+            anchor: "y4",
+            matches: "x",
+            title: "",
+            tickfont: { size: chrome.fontSize },
+          },
+          yaxis:  { ...axisCommon, domain: [0.77, 1.0], title: "", automargin: false, tickfont: { size: 8 }, nticks: 2 },
+          yaxis2: { ...axisCommon, domain: [0.52, 0.73], title: "", automargin: false, tickformat: ".2f", tickfont: { size: 8 }, nticks: 2 },
+          yaxis3: { ...axisCommon, domain: [0.27, 0.48], title: "", automargin: false, tickfont: { size: 8 }, nticks: 2 },
+          yaxis4: { ...axisCommon, domain: [0.02, 0.23], title: "", automargin: false, tickfont: { size: 8 }, nticks: 2 },
           dragmode: false,
         };
       } else {
@@ -3148,24 +4624,61 @@
           action: multi ? "L/R xyz+rotvec+grip" : "xyz+rotvec+grip",
         }[chan] || chan;
         const yTickFormat = chan === "gripper" ? ".4f" : undefined;
+        const tc = chartThemeColors();
+        const chrome = chartLayoutChrome();
         layout = {
-          title: { text: `${title} · ${titleExtra}`, font: { size: chartFontSize() + 2, color: "#8b9bb4" } },
-          paper_bgcolor: "#121820",
-          plot_bgcolor: "#121820",
-          font: { color: "#c5d0e0", size: chartFontSize() },
-          margin: { t: 48, r: 24, b: 40, l: chan === "gripper" ? 92 : 68 },
+          title: false,
+          paper_bgcolor: tc.paper,
+          plot_bgcolor: tc.plot,
+          font: { color: tc.font, size: chrome.fontSize },
+          margin: {
+            ...chrome.marginSingle,
+            l: chan === "gripper" ? 48 : chrome.marginSingle.l,
+          },
           height: chartPixelHeight(),
           autosize: true,
           showlegend: true,
-          legend: { orientation: "h", y: 1.12 },
+          legend: {
+            orientation: "h",
+            y: -0.04,
+            yanchor: "top",
+            x: 0,
+            xanchor: "left",
+            font: { size: chrome.legendSize },
+            bgcolor: "rgba(0,0,0,0)",
+            itemsizing: "constant",
+            itemwidth: 28,
+          },
           shapes,
-          annotations,
-          xaxis: { ...axisCommon, title: "step", automargin: true },
+          annotations: [
+            {
+              text: titleExtra,
+              xref: "paper",
+              yref: "paper",
+              x: 1.0,
+              y: 1.0,
+              showarrow: false,
+              xanchor: "right",
+              yanchor: "top",
+              font: { size: chrome.fontSize, color: tc.muted },
+              bgcolor: "rgba(12,16,23,0.55)",
+              borderpad: 1,
+            },
+            ...annotations,
+          ],
+          xaxis: {
+            ...axisCommon,
+            title: { text: "step", font: { size: chrome.fontSize }, standoff: 2 },
+            automargin: false,
+            tickfont: { size: chrome.fontSize },
+          },
           yaxis: {
             ...axisCommon,
-            title: { text: yTitle, standoff: 16 },
-            automargin: true,
+            title: { text: yTitle, font: { size: chrome.fontSize }, standoff: 2 },
+            automargin: false,
             tickformat: yTickFormat,
+            tickfont: { size: chrome.fontSize },
+            nticks: 5,
           },
           dragmode: false,
         };
@@ -3202,10 +4715,20 @@
       if (series) plotSeries(series, chartTitle, chartFrameIdx);
     }
 
+    function formatScrubTime(frame, fps) {
+      const sec = Math.max(0, Number(frame) || 0) / Math.max(Number(fps) || 20, 1e-6);
+      const m = Math.floor(sec / 60);
+      const s = sec - m * 60;
+      return `${m}:${s.toFixed(2).padStart(5, "0")}`;
+    }
+
     function updateScrubLabel() {
       const v = Number($("scrub").value);
       const max = Number($("scrub").max);
-      $("scrubLabel").textContent = `${v} / ${max}`;
+      const fps = Number(status.frequency) || 20;
+      const tCur = formatScrubTime(v, fps);
+      const tMax = formatScrubTime(max, fps);
+      $("scrubLabel").textContent = `frame ${v} / ${max} · ${tCur} / ${tMax}`;
     }
 
     let chartDragging = false;
@@ -3439,32 +4962,28 @@
     }
 
     function cursorAnnotations(step) {
-      const lines = cursorValueLines(step);
-      // 图上黄线旁短标注（step + 主数值），完整值在下方 readout
-      const short =
-        chartChannel === "gripper"
-          ? lines.slice(0, 2).join("<br>")
-          : lines.slice(0, Math.min(3, lines.length)).join("<br>");
+      // 完整数值在下方 readout；图上只标 step，避免多行大字叠在曲线上
+      const fs = Math.max(9, chartFontSize() - 1);
       return [
         {
           x: step,
           y: 1.0,
-          xref: chartChannel === "all" ? "x" : "x",
+          xref: "x",
           yref: "paper",
-          text: short,
+          text: `t=${step}`,
           showarrow: false,
           xanchor: "left",
-          yanchor: "bottom",
-          xshift: 6,
-          yshift: 2,
+          yanchor: "top",
+          xshift: 4,
+          yshift: -2,
           align: "left",
-          bgcolor: "rgba(18,24,32,0.88)",
-          bordercolor: "#f0b429",
+          bgcolor: chartThemeColors().annotBg,
+          bordercolor: chartThemeColors().warn,
           borderwidth: 1,
-          borderpad: 4,
+          borderpad: 2,
           font: {
-            color: "#f0b429",
-            size: Math.max(chartFontSize(), 11),
+            color: chartThemeColors().warn,
+            size: fs,
             family: "IBM Plex Mono, ui-monospace, monospace",
           },
         },
@@ -3475,7 +4994,9 @@
       const el = $("cursorReadout");
       if (!el) return;
       const lines = cursorValueLines(step);
-      el.textContent = "黄线 · " + lines.join("  ·  ");
+      // 单行省略，避免大段数值把曲线区顶乱
+      el.textContent = lines.slice(0, 4).join(" · ");
+      el.title = lines.join("\n");
     }
 
     function updateCursorLine(step) {
@@ -3485,9 +5006,14 @@
         if (series) plotSeries(series, chartTitle, step);
         return;
       }
+      // 保留子图角标等已有 annotations，只替换光标标注
+      const keep = (gd.layout && gd.layout.annotations
+        ? gd.layout.annotations
+        : []
+      ).filter((a) => !(a && String(a.text || "").startsWith("t=")));
       Plotly.relayout(gd, {
         shapes: cursorShapes(step),
-        annotations: cursorAnnotations(step),
+        annotations: [...keep, ...cursorAnnotations(step)],
       });
     }
 
@@ -3654,6 +5180,7 @@
       setTrimControlsEnabled(true);
       $("viewerMsg").textContent = `Loading episode ${id}…`;
       if ($("videoHeading")) $("videoHeading").textContent = `Episode ${id}`;
+      if ($("vizEpisodeTitle")) $("vizEpisodeTitle").textContent = `EPISODE ${id}`;
       try {
         const r = await fetch(`/api/episodes/${id}/series?max_points=2000`);
         const data = await r.json();
@@ -3665,6 +5192,7 @@
         await loadFrame(0);
         $("viewerMsg").textContent = `Episode ${id} · ${data.n_steps} steps`;
         updateTrimRangeLabel();
+        syncVizHeader(status);
       } catch (e) {
         $("viewerMsg").textContent = "Failed: " + e.message;
       }
@@ -3716,7 +5244,8 @@
       playing = true;
       $("btnPlay").textContent = "Pause";
       const fps = status.frequency || 30;
-      const dt = Math.max(1000 / fps, 30);
+      const rate = Math.max(0.25, Number(playSpeedRate) || 1);
+      const dt = Math.max(1000 / (fps * rate), 16);
       playTimer = setInterval(async () => {
         let v = Number($("scrub").value);
         const max = Number($("scrub").max);
@@ -3836,9 +5365,41 @@
     }
     wireFoldToggle("daggerSplitBox", "daggerFoldToggle", "fold_dagger_split");
     wireFoldToggle("convertLerobotBox", "convertLerobotFoldToggle", "fold_convert_lerobot");
+    wireFoldToggle("vizToolsBox", "vizToolsFoldToggle", "fold_viz_tools");
+
+    if ($("playSpeed")) {
+      $("playSpeed").onchange = () => {
+        playSpeedRate = Number($("playSpeed").value) || 1;
+        if (playing) {
+          stopPlay();
+          togglePlay();
+        }
+      };
+    }
+    if ($("btnEpPrev")) {
+      $("btnEpPrev").onclick = () => selectAdjacentEpisode(-1);
+    }
+    if ($("btnEpNext")) {
+      $("btnEpNext").onclick = () => selectAdjacentEpisode(1);
+    }
+    if ($("btnOpenRerun")) {
+      $("btnOpenRerun").onclick = () => {
+        const payload = {};
+        if (selectedEp != null && selectedEp !== "live") {
+          payload.episode_id = Number(selectedEp);
+        }
+        setMsg("正在启动 Rerun…");
+        postCmd("open_rerun", payload)
+          .then(() => setMsg("已请求打开 Rerun（本机窗口）"))
+          .catch((e) => setMsg(e.message));
+      };
+    }
 
     if ($("btnOpenMergePage")) {
       $("btnOpenMergePage").onclick = () => showMergePage();
+    }
+    if ($("btnOpenLibraryPage")) {
+      $("btnOpenLibraryPage").onclick = () => showLibraryPage();
     }
     if ($("btnMergeBack")) {
       $("btnMergeBack").onclick = () => {
@@ -3850,12 +5411,436 @@
         applyUiMode(status.mode || "VIEW", status);
       };
     }
+    if ($("btnLibraryBack")) {
+      $("btnLibraryBack").onclick = () => {
+        if (status.mode === "DELETING" || status.deleting) {
+          setMsg("正在处理数据，请稍候…");
+          return;
+        }
+        hideLibraryPage();
+        applyUiMode(status.mode || "VIEW", status);
+      };
+    }
+    if ($("btnLibraryOpenRoot")) {
+      $("btnLibraryOpenRoot").onclick = () => {
+        const p =
+          ($("libraryRootInput") && $("libraryRootInput").value.trim()) || "";
+        refreshLibrary(p);
+      };
+    }
+    if ($("libraryRootInput")) {
+      $("libraryRootInput").addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          refreshLibrary($("libraryRootInput").value.trim());
+        }
+      });
+    }
+    if ($("btnLibraryBrowseRoot")) {
+      $("btnLibraryBrowseRoot").onclick = () => openFsModal("library_root");
+    }
+    if ($("btnLibraryRefresh")) {
+      $("btnLibraryRefresh").onclick = () => refreshLibrary(libraryRoot);
+    }
+    if ($("btnLibraryParent")) {
+      $("btnLibraryParent").onclick = () => {
+        if (libraryData.parent) refreshLibrary(libraryData.parent);
+        else setMsg("已到根目录");
+      };
+    }
+    if ($("librarySelectAll")) {
+      $("librarySelectAll").addEventListener("change", () => {
+        const on = !!$("librarySelectAll").checked;
+        const visible = libraryVisibleRows();
+        if (on) {
+          visible.forEach((d) => librarySelected.add(d.path));
+        } else {
+          visible.forEach((d) => librarySelected.delete(d.path));
+        }
+        renderLibraryTable();
+      });
+    }
+    document.querySelectorAll("#libraryFmtBtns button[data-lib-fmt]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        libraryFmtFilter = btn.dataset.libFmt || "all";
+        renderLibraryTable();
+      });
+    });
+    if ($("btnLibraryMergeSelected")) {
+      $("btnLibraryMergeSelected").onclick = () => {
+        const selected = librarySelectedRows();
+        if (
+          selected.length < 2 ||
+          !selected.every((d) => String(d.dataset_format) === "lerobot")
+        ) {
+          setMsg("请选择至少 2 个 LeRobot 数据集再合并");
+          return;
+        }
+        mergeSources = [];
+        selected.forEach((d) => addMergeSource(d.path));
+        hideLibraryPage();
+        showMergePage();
+      };
+    }
+    if ($("btnLibraryDeleteSelected")) {
+      $("btnLibraryDeleteSelected").onclick = () => {
+        const paths = librarySelectedRows().map((d) => d.path);
+        if (!paths.length) {
+          setMsg("请先勾选要删除的数据集");
+          return;
+        }
+        openLibraryDelete(paths);
+      };
+    }
+    if ($("libraryRenameNo")) {
+      $("libraryRenameNo").onclick = () => {
+        if ($("libraryRenameModal")) $("libraryRenameModal").classList.remove("show");
+        pendingLibraryRename = null;
+      };
+    }
+    if ($("libraryRenameYes")) {
+      $("libraryRenameYes").onclick = async () => {
+        if (!pendingLibraryRename) {
+          if ($("libraryRenameModal")) $("libraryRenameModal").classList.remove("show");
+          return;
+        }
+        const newName = ($("libraryRenameInput") && $("libraryRenameInput").value.trim()) || "";
+        if ($("libraryRenameModal")) $("libraryRenameModal").classList.remove("show");
+        try {
+          await postCmd("rename_dataset", {
+            path: pendingLibraryRename.path,
+            new_name: newName,
+          });
+          await new Promise((r) => setTimeout(r, 120));
+          await pollStatus(true);
+          await refreshLibrary(libraryRoot);
+        } catch (e) {
+          setMsg(e.message);
+        }
+        pendingLibraryRename = null;
+      };
+    }
+    if ($("libraryMoveBrowse")) {
+      $("libraryMoveBrowse").onclick = () => openFsModal("library_move");
+    }
+    if ($("libraryMoveSelect")) {
+      $("libraryMoveSelect").addEventListener("change", () => {
+        const v = $("libraryMoveSelect").value;
+        if (v && $("libraryMoveInput")) $("libraryMoveInput").value = v;
+      });
+    }
+    if ($("libraryMoveNo")) {
+      $("libraryMoveNo").onclick = () => {
+        if ($("libraryMoveModal")) $("libraryMoveModal").classList.remove("show");
+        pendingLibraryMove = null;
+      };
+    }
+    if ($("libraryMoveYes")) {
+      $("libraryMoveYes").onclick = async () => {
+        if (!pendingLibraryMove) {
+          if ($("libraryMoveModal")) $("libraryMoveModal").classList.remove("show");
+          return;
+        }
+        const dest =
+          ($("libraryMoveInput") && $("libraryMoveInput").value.trim()) ||
+          ($("libraryMoveSelect") && $("libraryMoveSelect").value) ||
+          "";
+        if (!dest) {
+          setMsg("请选择或输入目标父目录");
+          return;
+        }
+        if ($("libraryMoveModal")) $("libraryMoveModal").classList.remove("show");
+        try {
+          await postCmd("move_dataset", {
+            path: pendingLibraryMove.path,
+            dest_parent: dest,
+          });
+          await new Promise((r) => setTimeout(r, 120));
+          await pollStatus(true);
+          await refreshLibrary(libraryRoot);
+        } catch (e) {
+          setMsg(e.message);
+        }
+        pendingLibraryMove = null;
+      };
+    }
+    if ($("libraryDeleteNo")) {
+      $("libraryDeleteNo").onclick = () => {
+        if ($("libraryDeleteModal")) $("libraryDeleteModal").classList.remove("show");
+        pendingLibraryDelete = null;
+        postCmd("delete_cancel").catch(() => {});
+      };
+    }
+    if ($("libraryDeleteYes")) {
+      $("libraryDeleteYes").onclick = async () => {
+        if (!pendingLibraryDelete || !pendingLibraryDelete.length) {
+          if ($("libraryDeleteModal")) $("libraryDeleteModal").classList.remove("show");
+          return;
+        }
+        if (status.mode === "DELETING" || status.deleting) {
+          if ($("libraryDeleteModal")) $("libraryDeleteModal").classList.remove("show");
+          setMsg("正在处理数据，请稍候…");
+          return;
+        }
+        const paths = pendingLibraryDelete.slice();
+        if ($("libraryDeleteModal")) $("libraryDeleteModal").classList.remove("show");
+        try {
+          await postCmd("delete_datasets_confirm", { paths });
+          setMsg(`正在删除 ${paths.length} 个数据集…`);
+        } catch (e) {
+          setMsg(e.message);
+        }
+        pendingLibraryDelete = null;
+      };
+    }
 
+    function openTypedDatasetPath() {
+      hidePathSuggest();
+      const el = $("datasetPathLabel");
+      const p =
+        el && el.tagName === "INPUT"
+          ? String(el.value || "").trim()
+          : "";
+      if (!p) {
+        setMsg("请输入数据目录路径");
+        return;
+      }
+      if (el) delete el.dataset.touched;
+      openPathSmart(p);
+    }
+
+    let pathSuggestItems = [];
+    let pathSuggestIdx = -1;
+    let pathSuggestTimer = null;
+    let pathSuggestReq = 0;
+    let pathSuggestBlurTimer = null;
+
+    function splitPathForSuggest(raw) {
+      const s = String(raw || "");
+      if (!s) {
+        return { parent: repoRoot || "/", prefix: "", endsWithSlash: false };
+      }
+      const endsWithSlash = /\/$/.test(s);
+      if (endsWithSlash) {
+        const parent = s.replace(/\/+$/, "") || "/";
+        return { parent, prefix: "", endsWithSlash: true };
+      }
+      const i = s.lastIndexOf("/");
+      if (i < 0) {
+        return { parent: repoRoot || "/", prefix: s, endsWithSlash: false };
+      }
+      return {
+        parent: i === 0 ? "/" : s.slice(0, i),
+        prefix: s.slice(i + 1),
+        endsWithSlash: false,
+      };
+    }
+
+    function hidePathSuggest() {
+      const list = $("pathSuggestList");
+      if (list) {
+        list.hidden = true;
+        list.innerHTML = "";
+      }
+      pathSuggestItems = [];
+      pathSuggestIdx = -1;
+    }
+
+    function renderPathSuggest(items, emptyText) {
+      const list = $("pathSuggestList");
+      if (!list) return;
+      pathSuggestItems = items || [];
+      pathSuggestIdx = pathSuggestItems.length ? 0 : -1;
+      list.innerHTML = "";
+      if (!pathSuggestItems.length) {
+        const li = document.createElement("li");
+        li.className = "ps-empty";
+        li.textContent = emptyText || "无匹配文件夹";
+        list.appendChild(li);
+        list.hidden = false;
+        return;
+      }
+      pathSuggestItems.forEach((ent, i) => {
+        const li = document.createElement("li");
+        if (i === pathSuggestIdx) li.classList.add("active");
+        const name = document.createElement("span");
+        name.className = "ps-name";
+        name.textContent = ent.name + "/";
+        name.title = ent.path || "";
+        li.appendChild(name);
+        if (ent.is_dataset) {
+          const tag = document.createElement("span");
+          const fmt = String(ent.dataset_format || "");
+          tag.className =
+            "ps-tag" +
+            (fmt === "lerobot"
+              ? " fmt-lerobot"
+              : fmt === "zarr"
+                ? " fmt-zarr"
+                : "");
+          tag.textContent =
+            fmt === "lerobot" ? "LeRobot" : fmt === "zarr" ? "zarr" : "数据集";
+          li.appendChild(tag);
+        }
+        li.addEventListener("mousedown", (ev) => {
+          ev.preventDefault();
+          applyPathSuggest(i, { enter: false });
+        });
+        list.appendChild(li);
+      });
+      list.hidden = false;
+    }
+
+    function highlightPathSuggest(idx) {
+      const list = $("pathSuggestList");
+      if (!list || !pathSuggestItems.length) return;
+      pathSuggestIdx =
+        ((idx % pathSuggestItems.length) + pathSuggestItems.length) %
+        pathSuggestItems.length;
+      const kids = list.querySelectorAll("li:not(.ps-empty)");
+      kids.forEach((li, i) => {
+        li.classList.toggle("active", i === pathSuggestIdx);
+      });
+      const active = kids[pathSuggestIdx];
+      if (active && active.scrollIntoView) {
+        active.scrollIntoView({ block: "nearest" });
+      }
+    }
+
+    function applyPathSuggest(idx, opts) {
+      const el = $("datasetPathLabel");
+      const ent = pathSuggestItems[idx];
+      if (!el || !ent) return;
+      const enter = !!(opts && opts.enter);
+      el.dataset.touched = "1";
+      if (ent.is_dataset) {
+        el.value = ent.path;
+        hidePathSuggest();
+        if (enter) {
+          delete el.dataset.touched;
+          loadDatasetPath(ent.path);
+        }
+        return;
+      }
+      // 普通文件夹：补全并带上 /，继续列出子目录
+      el.value = String(ent.path || "").replace(/\/+$/, "") + "/";
+      el.focus();
+      const pos = el.value.length;
+      try {
+        el.setSelectionRange(pos, pos);
+      } catch (_) {}
+      refreshPathSuggest(true);
+    }
+
+    async function refreshPathSuggest(immediate) {
+      const el = $("datasetPathLabel");
+      const list = $("pathSuggestList");
+      if (!el || el.tagName !== "INPUT" || !list) return;
+      if (document.activeElement !== el) {
+        hidePathSuggest();
+        return;
+      }
+      const run = async () => {
+        const raw = String(el.value || "");
+        const { parent, prefix } = splitPathForSuggest(raw);
+        const reqId = ++pathSuggestReq;
+        try {
+          const q = "?path=" + encodeURIComponent(parent || "/");
+          const r = await fetch("/api/fs/list" + q);
+          const data = await r.json();
+          if (reqId !== pathSuggestReq) return;
+          if (!r.ok) {
+            renderPathSuggest([], data.error || "目录不存在");
+            return;
+          }
+          if (data.repo_root) repoRoot = data.repo_root;
+          const pref = String(prefix || "").toLowerCase();
+          let entries = Array.isArray(data.entries) ? data.entries.slice() : [];
+          if (pref) {
+            entries = entries.filter((e) =>
+              String(e.name || "")
+                .toLowerCase()
+                .startsWith(pref)
+            );
+          }
+          entries = entries.slice(0, 40);
+          renderPathSuggest(
+            entries,
+            pref ? `无匹配「${prefix}」` : "此目录下无子文件夹"
+          );
+        } catch (e) {
+          if (reqId !== pathSuggestReq) return;
+          renderPathSuggest([], e.message || "读取失败");
+        }
+      };
+      if (pathSuggestTimer) {
+        clearTimeout(pathSuggestTimer);
+        pathSuggestTimer = null;
+      }
+      if (immediate) {
+        await run();
+      } else {
+        pathSuggestTimer = setTimeout(run, 120);
+      }
+    }
+
+    if ($("datasetPathLabel") && $("datasetPathLabel").tagName === "INPUT") {
+      $("datasetPathLabel").addEventListener("input", () => {
+        $("datasetPathLabel").dataset.touched = "1";
+        refreshPathSuggest(false);
+      });
+      $("datasetPathLabel").addEventListener("focus", () => {
+        refreshPathSuggest(true);
+      });
+      $("datasetPathLabel").addEventListener("blur", () => {
+        if (pathSuggestBlurTimer) clearTimeout(pathSuggestBlurTimer);
+        pathSuggestBlurTimer = setTimeout(() => hidePathSuggest(), 160);
+      });
+      $("datasetPathLabel").addEventListener("keydown", (ev) => {
+        const list = $("pathSuggestList");
+        const open = list && !list.hidden && pathSuggestItems.length > 0;
+        if (ev.key === "ArrowDown" && open) {
+          ev.preventDefault();
+          highlightPathSuggest(pathSuggestIdx + 1);
+          return;
+        }
+        if (ev.key === "ArrowUp" && open) {
+          ev.preventDefault();
+          highlightPathSuggest(pathSuggestIdx - 1);
+          return;
+        }
+        if (ev.key === "Tab" && open && pathSuggestIdx >= 0) {
+          ev.preventDefault();
+          applyPathSuggest(pathSuggestIdx, { enter: false });
+          return;
+        }
+        if (ev.key === "Escape") {
+          if (open) {
+            ev.preventDefault();
+            hidePathSuggest();
+          }
+          return;
+        }
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          if (open && pathSuggestIdx >= 0) {
+            applyPathSuggest(pathSuggestIdx, { enter: true });
+          } else {
+            openTypedDatasetPath();
+          }
+        }
+      });
+    }
+    if ($("btnOpenDatasetPath")) {
+      $("btnOpenDatasetPath").onclick = () => openTypedDatasetPath();
+    }
     if ($("btnBrowseDataset")) {
       $("btnBrowseDataset").onclick = () => openFsModal("load");
     }
     if ($("btnResetDataset")) {
       $("btnResetDataset").onclick = () => {
+        const el = $("datasetPathLabel");
+        if (el) delete el.dataset.touched;
         const fallback = defaultOutputDir || "";
         loadDatasetPath(fallback);
       };
@@ -4034,7 +6019,17 @@
     }
     if ($("fsOpen")) {
       $("fsOpen").onclick = () => {
-        if (!fsBrowse.is_dataset || !fsBrowse.path) return;
+        if (!fsBrowse.path) return;
+        if (
+          fsPickMode === "library_root" ||
+          fsPickMode === "library_move" ||
+          fsPickMode === "load"
+        ) {
+          // load：数据集打开；普通目录进库管理
+          pickFsDataset(fsBrowse.path, fsBrowse.dataset_format);
+          return;
+        }
+        if (!fsBrowse.is_dataset) return;
         pickFsDataset(fsBrowse.path, fsBrowse.dataset_format);
       };
     }
@@ -4255,6 +6250,16 @@
         return;
       }
       if (viewerOnly) {
+        if (k === "arrowleft" || k === "arrowup") {
+          ev.preventDefault();
+          selectAdjacentEpisode(-1);
+          return;
+        }
+        if (k === "arrowright" || k === "arrowdown") {
+          ev.preventDefault();
+          selectAdjacentEpisode(1);
+          return;
+        }
         if (k === "b" || k === "escape") {
           ev.preventDefault();
           if ($("btnBackHub")) $("btnBackHub").click();
@@ -4505,9 +6510,14 @@
       const isLast = nEp > 0 && Number(selectedEp) === nEp - 1;
       const speedHint = isLast
         ? "这是最后一条，删除通常很快。"
-        : "这不是最后一条：需要把后面所有相机数据在磁盘上前移，可能要数分钟，页面会显示进度。";
+        : "这不是最后一条：需要把后面的数据/视频在磁盘上前移并重编号，可能较慢，页面会显示进度。";
+      const fmt = String(status.dataset_format || "zarr");
+      const what =
+        fmt === "lerobot"
+          ? "将删除对应 parquet / 三路视频，并重写 meta（后续 episode 会重编号）。"
+          : "将移除对应视频与 zarr 片段。";
       $("delText").textContent =
-        `删除已保存的 episode ${selectedEp}？将移除对应视频与 zarr 片段。${speedHint}`;
+        `删除已保存的 episode ${selectedEp}？${what}${speedHint}`;
       $("delModal").classList.add("show");
     };
     $("delNo").onclick = () => {
@@ -4582,17 +6592,35 @@
     }
     requestAnimationFrame(() => resizeChart());
 
-    $("fontDown").onclick = () => applyFontSize(uiFontPx - FONT_STEP);
-    $("fontUp").onclick = () => applyFontSize(uiFontPx + FONT_STEP);
+    $("fontDown").onclick = () => {
+      const cur = resolvedUiFontPx();
+      applyFontSize(cur - FONT_STEP);
+    };
+    $("fontUp").onclick = () => {
+      const cur = resolvedUiFontPx();
+      applyFontSize(cur + FONT_STEP);
+    };
+    if ($("fontLabel")) {
+      $("fontLabel").title = "点击恢复随屏幕自动缩放";
+      $("fontLabel").style.cursor = "pointer";
+      $("fontLabel").onclick = () => applyFontAuto({ replot: true });
+    }
+    document.querySelectorAll(".theme-btns button[data-theme]").forEach((btn) => {
+      btn.onclick = () => applyTheme(btn.dataset.theme, { replot: true });
+    });
     try {
       const raw = localStorage.getItem("collect_ui_font_px");
-      const saved = parseInt(raw || "20", 10);
-      // 旧默认 16 偏小：自动抬到 20
-      const px = Number.isFinite(saved) ? (saved < 18 ? 20 : saved) : 20;
-      applyFontSize(px, { replot: false });
+      const saved = parseInt(raw || "", 10);
+      // 旧偏大偏好一律回到紧凑自动；仅保留用户明确调到 ≤13 的值
+      if (raw === "auto" || !raw || !Number.isFinite(saved) || saved > 13) {
+        applyFontAuto({ replot: false });
+      } else {
+        applyFontSize(saved, { replot: false });
+      }
     } catch (_) {
-      applyFontSize(20, { replot: false });
+      applyFontAuto({ replot: false });
     }
+    applyTheme(uiPrefs.theme, { replot: false });
     syncTrimHotkeyUi();
   </script>
 </body>

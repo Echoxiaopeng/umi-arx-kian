@@ -920,7 +920,41 @@ _DELETE_LOCK = threading.Lock()
 
 
 def delete_saved_episode(env, episode_id: int, progress_cb=None) -> bool:
-    """删除已写入 zarr 的指定 episode，并重编号后续 videos/{id} 以保持连续。"""
+    """删除已保存 episode（zarr 或 LeRobot），并重编号后续条目以保持连续。"""
+    fmt = getattr(env, "dataset_format", "zarr")
+
+    def _cb(info):
+        if progress_cb is not None:
+            progress_cb(info)
+        msg = info.get("message") if isinstance(info, dict) else None
+        if msg:
+            print(msg, flush=True)
+
+    if fmt == "lerobot":
+        from modules.lerobot_dataset_io import delete_lerobot_episode
+
+        rb = env.replay_buffer
+        eid = int(episode_id)
+        if not getattr(rb, "has_episode", lambda _e: False)(eid):
+            print(f"Episode {eid} does not exist (lerobot).")
+            return False
+        print(f"Deleting lerobot episode {eid}…")
+        ok = bool(
+            delete_lerobot_episode(
+                Path(env.output_dir),
+                eid,
+                progress_cb=_cb,
+            )
+        )
+        if ok and hasattr(rb, "refresh"):
+            rb.refresh()
+        if ok:
+            print(
+                f"Deleted lerobot episode {eid}. "
+                f"Remaining: {int(rb.n_episodes)}."
+            )
+        return ok
+
     n_episodes = env.replay_buffer.n_episodes
     if n_episodes <= 0:
         print("No saved episode to delete.")
@@ -931,13 +965,6 @@ def delete_saved_episode(env, episode_id: int, progress_cb=None) -> bool:
             f"(valid: 0..{n_episodes - 1})."
         )
         return False
-
-    def _cb(info):
-        if progress_cb is not None:
-            progress_cb(info)
-        msg = info.get("message") if isinstance(info, dict) else None
-        if msg:
-            print(msg, flush=True)
 
     env.replay_buffer.delete_episode(episode_id, progress_cb=_cb)
 
@@ -997,12 +1024,6 @@ def schedule_delete_episode(
         if web_state is not None:
             web_state.update(message="尚未加载数据目录")
         return False
-    if getattr(env, "dataset_format", "zarr") == "lerobot":
-        msg = "LeRobot 模式暂不支持删除 episode（可用裁剪）"
-        print(msg)
-        if web_state is not None:
-            web_state.update(message=msg)
-        return False
     if not _DELETE_LOCK.acquire(blocking=False):
         msg = "正在删除中，请等当前删除完成后再操作"
         print(msg)
@@ -1011,12 +1032,18 @@ def schedule_delete_episode(
         return False
 
     try:
-        n_episodes = int(env.replay_buffer.n_episodes)
+        rb = env.replay_buffer
+        n_episodes = int(rb.n_episodes)
         eid = int(episode_id)
-        if n_episodes <= 0 or eid < 0 or eid >= n_episodes:
+        has_ep = getattr(rb, "has_episode", None)
+        if has_ep is not None:
+            ok_id = bool(has_ep(eid))
+        else:
+            ok_id = n_episodes > 0 and 0 <= eid < n_episodes
+        if n_episodes <= 0 or not ok_id:
             print(
                 f"Episode {eid} does not exist "
-                f"(valid: 0..{max(n_episodes - 1, 0)})."
+                f"(n_episodes={n_episodes})."
             )
             if web_state is not None:
                 web_state.update(
@@ -1033,7 +1060,12 @@ def schedule_delete_episode(
         return False
 
     n_left_hint = n_episodes - 1
-    is_tail = eid == n_episodes - 1
+    # LeRobot / zarr：末条通常只需删文件；中间条要重编号
+    ids = getattr(rb, "_ids", None)
+    if isinstance(ids, list) and ids:
+        is_tail = eid == int(ids[-1])
+    else:
+        is_tail = eid == n_episodes - 1
     hint = (
         "末条截断，通常很快"
         if is_tail
@@ -2867,15 +2899,19 @@ def schedule_convert_to_lerobot(
     out_dir: str | Path,
     fps: int = 20,
     prompt: str = "Flatten and fold the cloth.",
+    robot_type: str = "agilex",
     overwrite: bool = False,
     web_state=None,
     done_mode: str = "VIEW",
 ) -> bool:
     """后台把当前 zarr 数据集转成 LeRobot；完成后自动加载输出目录。"""
     from modules.convert_zarr_bimanual_to_lerobot import (
+        DEFAULT_ROBOT_TYPE,
         convert_one_zarr,
         find_zarr,
     )
+
+    robot = str(robot_type or "").strip() or DEFAULT_ROBOT_TYPE
 
     src = Path(src_dir).expanduser().resolve()
     dst = Path(out_dir).expanduser().resolve()
@@ -2928,13 +2964,14 @@ def schedule_convert_to_lerobot(
         try:
             print(
                 f"[convert-lerobot] {zpath} → {dst} "
-                f"fps={fps} overwrite={overwrite}"
+                f"fps={fps} robot_type={robot!r} overwrite={overwrite}"
             )
             n_eps, n_frames = convert_one_zarr(
                 zpath,
                 dst,
                 prompt=str(prompt),
                 fps=int(fps),
+                robot_type=robot,
                 overwrite=bool(overwrite),
                 progress_cb=_on_progress,
             )
@@ -3032,6 +3069,7 @@ def handle_convert_lerobot_web_cmd(
         except (TypeError, ValueError):
             fps = 20
         prompt = str(cmd.get("prompt") or "Flatten and fold the cloth.")
+        robot_type = str(cmd.get("robot_type") or "agilex").strip() or "agilex"
         overwrite = bool(cmd.get("overwrite", False))
         return bool(
             schedule_convert_to_lerobot(
@@ -3039,6 +3077,7 @@ def handle_convert_lerobot_web_cmd(
                 out_dir=out_raw,
                 fps=fps,
                 prompt=prompt,
+                robot_type=robot_type,
                 overwrite=overwrite,
                 web_state=web_state,
                 done_mode=done_mode,
@@ -3228,6 +3267,271 @@ def handle_merge_lerobot_web_cmd(
                 done_mode=done_mode,
             )
         )
+    return False
+
+
+def _paths_equal(a: str | Path | None, b: str | Path | None) -> bool:
+    if a is None or b is None:
+        return False
+    try:
+        return Path(a).expanduser().resolve() == Path(b).expanduser().resolve()
+    except OSError:
+        return str(a) == str(b)
+
+
+def clear_loaded_dataset(web_state, *, message: str = "") -> None:
+    """卸掉当前已加载的整库（改名/移动/删除前调用）。"""
+    if web_state is None:
+        return
+    web_state.env = None
+    try:
+        web_state.output_dir = None
+    except Exception:  # noqa: BLE001
+        pass
+    if hasattr(web_state, "clear_live_series"):
+        try:
+            web_state.clear_live_series()
+        except Exception:  # noqa: BLE001
+            pass
+    web_state.update(
+        mode="VIEW",
+        viewer_only=True,
+        recording=False,
+        n_episodes=0,
+        n_steps=0,
+        t_elapsed=0.0,
+        delete_pending=None,
+        deleting=False,
+        delete_progress=None,
+        has_intervention=False,
+        dagger_stats=None,
+        dataset_format="",
+        message=message or "已卸载数据集",
+    )
+
+
+def unload_if_loaded_path(web_state, path: Path, *, reason: str = "") -> bool:
+    """若当前加载目录正是 path，则卸载。返回是否卸载。"""
+    if web_state is None:
+        return False
+    cur = getattr(web_state, "output_dir", None)
+    if cur is None and getattr(web_state, "env", None) is not None:
+        cur = getattr(web_state.env, "output_dir", None)
+    if not _paths_equal(cur, path):
+        return False
+    msg = reason or f"已卸载（路径变更）: {path}"
+    clear_loaded_dataset(web_state, message=msg)
+    return True
+
+
+def _require_dataset_dir(path: str | Path) -> tuple[Path, str]:
+    from modules.lerobot_dataset_io import detect_dataset_format
+
+    p = resolve_dataset_dir(path)
+    if not p.is_dir():
+        raise FileNotFoundError(f"目录不存在: {p}")
+    fmt = detect_dataset_format(p)
+    if fmt is None:
+        raise ValueError(f"不是数据集目录: {p}")
+    return p, fmt
+
+
+def _validate_new_basename(name: str) -> str:
+    n = str(name or "").strip()
+    if not n:
+        raise ValueError("新名称不能为空")
+    if "/" in n or "\\" in n:
+        raise ValueError("新名称不能包含路径分隔符")
+    if n in (".", "..") or n.startswith("."):
+        raise ValueError("非法名称")
+    return n
+
+
+def handle_rename_dataset_cmd(web_state, cmd: dict, *, done_mode: str = "VIEW") -> bool:
+    """同父目录重命名整库数据集。"""
+    if is_delete_busy():
+        if web_state is not None:
+            web_state.update(message="正在处理数据，请稍候…")
+        return False
+    try:
+        src, fmt = _require_dataset_dir(cmd.get("path", ""))
+        new_name = _validate_new_basename(cmd.get("new_name", ""))
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        if web_state is not None:
+            web_state.update(message=f"重命名失败: {exc}")
+        return False
+    dest = src.parent / new_name
+    if dest.exists():
+        if web_state is not None:
+            web_state.update(message=f"目标已存在: {dest}")
+        return False
+    unload_if_loaded_path(web_state, src, reason=f"重命名前卸载: {src.name}")
+    try:
+        src.rename(dest)
+    except OSError as exc:
+        if web_state is not None:
+            web_state.update(mode=done_mode, message=f"重命名失败: {exc}")
+        return False
+    msg = f"已重命名 {src.name} → {new_name}（{fmt}）"
+    print(f"[library] {msg}")
+    if web_state is not None:
+        web_state.update(mode=done_mode, message=msg)
+    return True
+
+
+def handle_move_dataset_cmd(web_state, cmd: dict, *, done_mode: str = "VIEW") -> bool:
+    """将整库移到已存在的目标父目录下（保留 basename）。"""
+    if is_delete_busy():
+        if web_state is not None:
+            web_state.update(message="正在处理数据，请稍候…")
+        return False
+    try:
+        src, fmt = _require_dataset_dir(cmd.get("path", ""))
+        dest_parent = resolve_dataset_dir(cmd.get("dest_parent", ""))
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        if web_state is not None:
+            web_state.update(message=f"移动失败: {exc}")
+        return False
+    if not dest_parent.is_dir():
+        if web_state is not None:
+            web_state.update(message=f"目标父目录不存在: {dest_parent}")
+        return False
+    dest = dest_parent / src.name
+    if _paths_equal(src, dest):
+        if web_state is not None:
+            web_state.update(message="目标与源相同，无需移动")
+        return False
+    if dest.exists():
+        if web_state is not None:
+            web_state.update(message=f"目标已存在: {dest}")
+        return False
+    unload_if_loaded_path(web_state, src, reason=f"移动前卸载: {src.name}")
+    try:
+        shutil.move(str(src), str(dest))
+    except OSError as exc:
+        if web_state is not None:
+            web_state.update(mode=done_mode, message=f"移动失败: {exc}")
+        return False
+    msg = f"已移动 {src.name} → {dest}（{fmt}）"
+    print(f"[library] {msg}")
+    if web_state is not None:
+        web_state.update(mode=done_mode, message=msg)
+    return True
+
+
+def handle_delete_datasets_web_cmd(
+    web_state,
+    cmd: dict,
+    *,
+    done_mode: str = "VIEW",
+) -> bool:
+    """处理 delete_datasets_request / delete_datasets_confirm（批量删整库）。"""
+    action = cmd.get("action")
+    raw_paths = cmd.get("paths") or []
+    if not isinstance(raw_paths, list):
+        raw_paths = [raw_paths]
+    paths = [str(p).strip() for p in raw_paths if str(p).strip()]
+    if not paths:
+        if web_state is not None:
+            web_state.update(message="请选择要删除的数据集")
+        return False
+
+    validated: list[tuple[Path, str]] = []
+    try:
+        for p in paths:
+            validated.append(_require_dataset_dir(p))
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        if web_state is not None:
+            web_state.update(message=f"删除校验失败: {exc}")
+        return False
+
+    if action == "delete_datasets_request":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+        names = ", ".join(p.name for p, _ in validated[:5])
+        more = f" 等 {len(validated)} 个" if len(validated) > 5 else ""
+        if web_state is not None:
+            web_state.update(
+                message=f"confirm delete datasets · {names}{more}",
+            )
+        print(f"Confirm delete {len(validated)} datasets? (web Yes)")
+        return True
+
+    if action == "delete_datasets_confirm":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+        if not _DELETE_LOCK.acquire(blocking=False):
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+
+        for p, _ in validated:
+            unload_if_loaded_path(web_state, p, reason=f"删除前卸载: {p.name}")
+
+        if web_state is not None:
+            web_state.update(
+                mode="DELETING",
+                deleting=True,
+                delete_pending=None,
+                delete_progress={
+                    "phase": "delete_datasets",
+                    "frac": 0.0,
+                    "message": f"删除数据集 0/{len(validated)}…",
+                },
+                message=f"删除数据集 · 共 {len(validated)} 个…",
+            )
+
+        def _worker() -> None:
+            ok_n = 0
+            err = ""
+            try:
+                total = len(validated)
+                for i, (p, fmt) in enumerate(validated):
+                    frac = float(i) / float(max(total, 1))
+                    if web_state is not None:
+                        web_state.update(
+                            mode="DELETING",
+                            deleting=True,
+                            delete_progress={
+                                "phase": "delete_datasets",
+                                "frac": frac,
+                                "message": f"删除 {p.name}（{fmt}）…",
+                            },
+                            message=f"删除 {i + 1}/{total}: {p.name}",
+                        )
+                    print(f"[library] rmtree {p} ({fmt})")
+                    shutil.rmtree(str(p))
+                    ok_n += 1
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                print(f"[library] delete failed: {exc}")
+            finally:
+                if web_state is not None:
+                    if err:
+                        web_state.update(
+                            mode=done_mode,
+                            deleting=False,
+                            delete_progress=None,
+                            message=f"删除中断（已删 {ok_n}）: {err}",
+                        )
+                    else:
+                        web_state.update(
+                            mode=done_mode,
+                            deleting=False,
+                            delete_progress=None,
+                            message=f"已删除 {ok_n} 个数据集",
+                        )
+                _DELETE_LOCK.release()
+
+        threading.Thread(
+            target=_worker, name="delete-datasets", daemon=True
+        ).start()
+        return True
+
     return False
 
 
@@ -3565,6 +3869,106 @@ def handle_end_grip_trim_web_cmd(
     return False
 
 
+def handle_open_rerun_web_cmd(web_state, cmd: dict) -> bool:
+    """本机弹出 Rerun / lerobot-dataset-viz 检查当前 LeRobot 数据集。"""
+    import subprocess
+
+    env = getattr(web_state, "env", None) if web_state is not None else None
+    if env is None:
+        if web_state is not None:
+            web_state.update(message="尚未加载数据目录")
+        return False
+
+    fmt = str(getattr(env, "dataset_format", "") or "")
+    out_dir = Path(getattr(env, "output_dir", "") or "")
+    if fmt != "lerobot":
+        msg = "用 Rerun 打开需要 LeRobot 目录（请先「转换为 LeRobot」）"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+    if not out_dir.is_dir():
+        msg = f"数据目录不存在: {out_dir}"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+
+    eid = cmd.get("episode_id", None)
+    try:
+        eid_i = int(eid) if eid is not None and str(eid).strip() != "" else 0
+    except (TypeError, ValueError):
+        eid_i = 0
+    eid_i = max(0, eid_i)
+    repo_name = out_dir.name or "local_dataset"
+
+    def _popen(argv: list[str]) -> None:
+        print(f"[open_rerun] {' '.join(argv)}")
+        subprocess.Popen(
+            argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    # 1) lerobot-dataset-viz（官方 episode 可视化 → Rerun）
+    viz_bin = shutil.which("lerobot-dataset-viz")
+    if viz_bin:
+        try:
+            _popen(
+                [
+                    viz_bin,
+                    "--repo-id",
+                    f"local/{repo_name}",
+                    "--root",
+                    str(out_dir),
+                    "--mode",
+                    "local",
+                    "--episode-index",
+                    str(eid_i),
+                ]
+            )
+            msg = f"已启动 lerobot-dataset-viz · ep{eid_i} → {out_dir}"
+            print(msg)
+            if web_state is not None:
+                web_state.update(message=msg)
+            return True
+        except OSError as exc:
+            print(f"[open_rerun] lerobot-dataset-viz failed: {exc}")
+
+    # 2) rerun CLI 直读 LeRobot 目录
+    rerun_bin = shutil.which("rerun")
+    if rerun_bin:
+        try:
+            _popen([rerun_bin, str(out_dir)])
+            msg = f"已启动 rerun → {out_dir}"
+            print(msg)
+            if web_state is not None:
+                web_state.update(message=msg)
+            return True
+        except OSError as exc:
+            print(f"[open_rerun] rerun failed: {exc}")
+
+    # 3) python -m rerun
+    try:
+        _popen([sys.executable, "-m", "rerun", str(out_dir)])
+        msg = f"已启动 python -m rerun → {out_dir}"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return True
+    except OSError as exc:
+        msg = (
+            "未找到 Rerun / lerobot-dataset-viz。"
+            "请安装: pip install rerun-sdk  或  pip install 'lerobot[dataset_viz]'"
+            f"（{exc}）"
+        )
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+
+
 def run_viewer_only(
     *,
     output: str,
@@ -3649,29 +4053,32 @@ def run_viewer_only(
                     if env is None:
                         web_state.update(message="尚未加载数据目录")
                         continue
-                    if getattr(env, "dataset_format", "zarr") == "lerobot":
-                        web_state.update(
-                            message="LeRobot 模式暂不支持删除 episode（可用裁剪）"
-                        )
-                        continue
                     eid = cmd.get("episode_id")
-                    n = int(env.replay_buffer.n_episodes)
-                    if eid is None or int(eid) < 0 or int(eid) >= n:
+                    rb = env.replay_buffer
+                    has_ep = getattr(rb, "has_episode", None)
+                    try:
+                        eid_i = int(eid)
+                    except (TypeError, ValueError):
+                        eid_i = -1
+                    ok_id = (
+                        bool(has_ep(eid_i))
+                        if has_ep is not None
+                        else (
+                            int(rb.n_episodes) > 0
+                            and 0 <= eid_i < int(rb.n_episodes)
+                        )
+                    )
+                    if not ok_id:
                         web_state.update(message=f"invalid episode_id {eid}")
                     else:
                         web_state.update(
-                            delete_pending=int(eid),
-                            message=f"confirm delete ep {eid}",
+                            delete_pending=eid_i,
+                            message=f"confirm delete ep {eid_i}",
                         )
                     continue
                 if action == "delete_confirm":
                     env = web_state.env
                     if env is None:
-                        continue
-                    if getattr(env, "dataset_format", "zarr") == "lerobot":
-                        web_state.update(
-                            message="LeRobot 模式暂不支持删除 episode"
-                        )
                         continue
                     eid = cmd.get("episode_id", web_state.delete_pending)
                     if eid is not None:
@@ -3709,6 +4116,24 @@ def run_viewer_only(
                         web_state, cmd, done_mode="VIEW"
                     )
                     continue
+                if action == "rename_dataset":
+                    handle_rename_dataset_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
+                if action == "move_dataset":
+                    handle_move_dataset_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
+                if action in (
+                    "delete_datasets_request",
+                    "delete_datasets_confirm",
+                ):
+                    handle_delete_datasets_web_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
                 if action in (
                     "end_grip_trim_request",
                     "end_grip_trim_confirm",
@@ -3716,6 +4141,9 @@ def run_viewer_only(
                     handle_end_grip_trim_web_cmd(
                         web_state, cmd, done_mode="VIEW"
                     )
+                    continue
+                if action == "open_rerun":
+                    handle_open_rerun_web_cmd(web_state, cmd)
                     continue
                 if action in ("drag_toggle", "start", "save", "drop"):
                     web_state.update(
@@ -3964,29 +4392,32 @@ def run_web_hub(
                     if env is None:
                         web_state.update(message="尚未加载数据目录")
                         continue
-                    if getattr(env, "dataset_format", "zarr") == "lerobot":
-                        web_state.update(
-                            message="LeRobot 模式暂不支持删除 episode（可用裁剪）"
-                        )
-                        continue
                     eid = cmd.get("episode_id")
-                    n = int(env.replay_buffer.n_episodes)
-                    if eid is None or int(eid) < 0 or int(eid) >= n:
+                    rb = env.replay_buffer
+                    has_ep = getattr(rb, "has_episode", None)
+                    try:
+                        eid_i = int(eid)
+                    except (TypeError, ValueError):
+                        eid_i = -1
+                    ok_id = (
+                        bool(has_ep(eid_i))
+                        if has_ep is not None
+                        else (
+                            int(rb.n_episodes) > 0
+                            and 0 <= eid_i < int(rb.n_episodes)
+                        )
+                    )
+                    if not ok_id:
                         web_state.update(message=f"invalid episode_id {eid}")
                     else:
                         web_state.update(
-                            delete_pending=int(eid),
-                            message=f"confirm delete ep {eid}",
+                            delete_pending=eid_i,
+                            message=f"confirm delete ep {eid_i}",
                         )
                     continue
                 if action == "delete_confirm":
                     env = web_state.env
                     if env is None:
-                        continue
-                    if getattr(env, "dataset_format", "zarr") == "lerobot":
-                        web_state.update(
-                            message="LeRobot 模式暂不支持删除 episode"
-                        )
                         continue
                     eid = cmd.get("episode_id", web_state.delete_pending)
                     if eid is not None:
@@ -4024,6 +4455,24 @@ def run_web_hub(
                         web_state, cmd, done_mode="VIEW"
                     )
                     continue
+                if action == "rename_dataset":
+                    handle_rename_dataset_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
+                if action == "move_dataset":
+                    handle_move_dataset_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
+                if action in (
+                    "delete_datasets_request",
+                    "delete_datasets_confirm",
+                ):
+                    handle_delete_datasets_web_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
                 if action in (
                     "end_grip_trim_request",
                     "end_grip_trim_confirm",
@@ -4031,6 +4480,9 @@ def run_web_hub(
                     handle_end_grip_trim_web_cmd(
                         web_state, cmd, done_mode="VIEW"
                     )
+                    continue
+                if action == "open_rerun":
+                    handle_open_rerun_web_cmd(web_state, cmd)
                     continue
                 if is_delete_busy() and action in (
                     "load_dataset",
@@ -4889,6 +5341,36 @@ def run_collect_session(
                                 ),
                             )
                             continue
+                        if action == "rename_dataset":
+                            handle_rename_dataset_cmd(
+                                web_state,
+                                cmd,
+                                done_mode=(
+                                    "READY" if no_zero_force else "IDLE"
+                                ),
+                            )
+                            continue
+                        if action == "move_dataset":
+                            handle_move_dataset_cmd(
+                                web_state,
+                                cmd,
+                                done_mode=(
+                                    "READY" if no_zero_force else "IDLE"
+                                ),
+                            )
+                            continue
+                        if action in (
+                            "delete_datasets_request",
+                            "delete_datasets_confirm",
+                        ):
+                            handle_delete_datasets_web_cmd(
+                                web_state,
+                                cmd,
+                                done_mode=(
+                                    "READY" if no_zero_force else "IDLE"
+                                ),
+                            )
+                            continue
                         if action in (
                             "end_grip_trim_request",
                             "end_grip_trim_confirm",
@@ -4900,6 +5382,9 @@ def run_collect_session(
                                     "READY" if no_zero_force else "IDLE"
                                 ),
                             )
+                            continue
+                        if action == "open_rerun":
+                            handle_open_rerun_web_cmd(web_state, cmd)
                             continue
                         if is_delete_busy() and action not in (
                             "quit",

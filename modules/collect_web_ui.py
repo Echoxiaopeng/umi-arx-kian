@@ -101,6 +101,113 @@ def list_fs_dir(path: str | Path | None = None) -> dict:
     }
 
 
+def _resolve_fs_path(path: str | Path | None = None) -> Path:
+    if path is None or str(path).strip() == "":
+        return _REPO_ROOT
+    p = Path(str(path).strip()).expanduser()
+    if not p.is_absolute():
+        p = (_REPO_ROOT / p).resolve()
+    else:
+        p = p.resolve()
+    return p
+
+
+def _dataset_light_summary(path: Path, fmt: str) -> dict:
+    """Cheap per-dataset stats for the library table (no full env open)."""
+    out: dict[str, Any] = {
+        "n_episodes": None,
+        "total_frames": None,
+        "fps": None,
+    }
+    try:
+        if fmt == "lerobot":
+            from modules.lerobot_dataset_io import load_info
+
+            info = load_info(path)
+            out["n_episodes"] = int(info.get("total_episodes") or 0) or None
+            out["total_frames"] = int(info.get("total_frames") or 0) or None
+            if info.get("fps") is not None:
+                out["fps"] = float(info["fps"])
+            return out
+        if fmt == "zarr":
+            import zarr
+
+            zpath = path / "replay_buffer.zarr"
+            if not zpath.exists() and path.name == "replay_buffer.zarr":
+                zpath = path
+            root = zarr.open(str(zpath), mode="r")
+            ends = None
+            try:
+                ends = root["meta"]["episode_ends"][:]
+            except Exception:  # noqa: BLE001
+                ends = None
+            if ends is not None and len(ends) > 0:
+                out["n_episodes"] = int(len(ends))
+                out["total_frames"] = int(ends[-1])
+            return out
+    except Exception:  # noqa: BLE001
+        return out
+    return out
+
+
+def list_library_datasets(path: str | Path | None = None) -> dict:
+    """
+    库管理：列出父目录下一层子目录中的数据集 + 非数据集文件夹。
+    返回 path / parent / datasets[] / other_dirs[] / repo_root。
+    """
+    target = _resolve_fs_path(path)
+    if not target.exists():
+        raise FileNotFoundError(f"路径不存在: {target}")
+    if not target.is_dir():
+        raise NotADirectoryError(f"不是目录: {target}")
+
+    from modules.lerobot_dataset_io import detect_dataset_format
+
+    parent = target.parent if target.parent != target else None
+    datasets: list[dict] = []
+    other_dirs: list[dict] = []
+    try:
+        children = sorted(target.iterdir(), key=lambda x: x.name.lower())
+    except PermissionError as exc:
+        raise PermissionError(f"无权限读取: {target}") from exc
+
+    for child in children:
+        name = child.name
+        if name.startswith(".") or not child.is_dir() or name.endswith(".zarr"):
+            continue
+        fmt = detect_dataset_format(child)
+        try:
+            mtime = float(child.stat().st_mtime)
+        except OSError:
+            mtime = None
+        if fmt is None:
+            other_dirs.append({"name": name, "path": str(child), "mtime": mtime})
+            continue
+        summary = _dataset_light_summary(child, fmt)
+        datasets.append(
+            {
+                "name": name,
+                "path": str(child),
+                "dataset_format": fmt,
+                "is_dataset": True,
+                "n_episodes": summary.get("n_episodes"),
+                "total_frames": summary.get("total_frames"),
+                "fps": summary.get("fps"),
+                "mtime": mtime,
+            }
+        )
+
+    return {
+        "path": str(target),
+        "parent": str(parent) if parent is not None else None,
+        "is_dataset": detect_dataset_format(target) is not None,
+        "dataset_format": detect_dataset_format(target),
+        "repo_root": str(_REPO_ROOT),
+        "datasets": datasets,
+        "other_dirs": other_dirs,
+    }
+
+
 class CommandQueue:
     """线程安全命令队列：网页 POST → 主循环 drain。"""
 
@@ -525,6 +632,52 @@ def episode_series_from_buffer(
     }
 
 
+def dataset_summary(env, *, frequency_fallback: float = 20.0) -> dict:
+    """Dataset-level Frames / Episodes / FPS for the viewer header."""
+    fmt = str(getattr(env, "dataset_format", "zarr") or "zarr")
+    fps = float(frequency_fallback) if frequency_fallback else 20.0
+    n_episodes = 0
+    total_frames = 0
+
+    if fmt == "lerobot":
+        from modules.lerobot_dataset_io import (
+            episode_length,
+            list_episode_ids,
+            load_info,
+        )
+
+        root = Path(env.output_dir)
+        info = load_info(root)
+        fps = float(info.get("fps") or fps)
+        ids = list_episode_ids(root, info)
+        n_episodes = int(info.get("total_episodes") or len(ids))
+        total_frames = int(info.get("total_frames") or 0)
+        if total_frames <= 0:
+            total_frames = int(
+                sum(int(episode_length(root, eid, info)) for eid in ids)
+            )
+        if n_episodes <= 0:
+            n_episodes = len(ids)
+        return {
+            "n_episodes": int(n_episodes),
+            "total_frames": int(total_frames),
+            "fps": float(fps),
+            "dataset_format": "lerobot",
+        }
+
+    rb = env.replay_buffer
+    n_episodes = int(rb.n_episodes)
+    for eid in range(n_episodes):
+        sl = rb.get_episode_slice(eid)
+        total_frames += int(sl.stop - sl.start)
+    return {
+        "n_episodes": int(n_episodes),
+        "total_frames": int(total_frames),
+        "fps": float(fps),
+        "dataset_format": "zarr",
+    }
+
+
 def list_episodes(env) -> list[dict]:
     fmt = getattr(env, "dataset_format", "zarr")
     if fmt == "lerobot":
@@ -809,10 +962,41 @@ class CollectWebServer:
                                     or snap.get("dataset_format")
                                     or ""
                                 )
+                                try:
+                                    summary = dataset_summary(
+                                        state.env,
+                                        frequency_fallback=float(
+                                            getattr(state, "frequency", 20.0)
+                                            or 20.0
+                                        ),
+                                    )
+                                    snap["n_episodes"] = int(
+                                        summary.get("n_episodes")
+                                        or snap["n_episodes"]
+                                    )
+                                    snap["total_frames"] = int(
+                                        summary.get("total_frames") or 0
+                                    )
+                                    snap["dataset_fps"] = float(
+                                        summary.get("fps")
+                                        or snap.get("frequency")
+                                        or 20.0
+                                    )
+                                    # keep frequency aligned for scrub time labels
+                                    if snap.get("dataset_fps"):
+                                        snap["frequency"] = float(snap["dataset_fps"])
+                                except Exception as exc:  # noqa: BLE001
+                                    snap["dataset_summary_error"] = str(exc)
                                 if include_eps:
                                     snap["episodes"] = list_episodes(state.env)
                             except Exception as exc:  # noqa: BLE001
                                 snap["episodes_error"] = str(exc)
+                        else:
+                            snap.setdefault("total_frames", 0)
+                            snap.setdefault(
+                                "dataset_fps",
+                                float(snap.get("frequency") or 20.0),
+                            )
                         self._send_json(200, snap)
                         return
 
@@ -827,6 +1011,22 @@ class CollectWebServer:
                         raw_path = qs.get("path", [""])[0]
                         try:
                             self._send_json(200, list_fs_dir(raw_path or None))
+                        except FileNotFoundError as exc:
+                            self._send_json(404, {"error": str(exc)})
+                        except NotADirectoryError as exc:
+                            self._send_json(400, {"error": str(exc)})
+                        except PermissionError as exc:
+                            self._send_json(403, {"error": str(exc)})
+                        except OSError as exc:
+                            self._send_json(500, {"error": str(exc)})
+                        return
+
+                    if path == "/api/fs/library":
+                        raw_path = qs.get("path", [""])[0]
+                        try:
+                            self._send_json(
+                                200, list_library_datasets(raw_path or None)
+                            )
                         except FileNotFoundError as exc:
                             self._send_json(404, {"error": str(exc)})
                         except NotADirectoryError as exc:
