@@ -3086,6 +3086,242 @@ def handle_convert_lerobot_web_cmd(
     return False
 
 
+def schedule_convert_batch_to_lerobot(
+    sources: list[str | Path],
+    *,
+    fps: int = 20,
+    prompt: str = "Flatten and fold the cloth.",
+    robot_type: str = "agilex",
+    overwrite: bool = False,
+    web_state=None,
+    done_mode: str = "VIEW",
+) -> bool:
+    """库管理：批量把所选 zarr 转成同级 `{name}_lerobot`。"""
+    from modules.convert_zarr_bimanual_to_lerobot import (
+        DEFAULT_ROBOT_TYPE,
+        convert_one_zarr,
+        default_lerobot_out_dir,
+        find_zarr,
+    )
+
+    robot = str(robot_type or "").strip() or DEFAULT_ROBOT_TYPE
+    jobs: list[tuple[Path, Path]] = []
+    for raw in sources:
+        try:
+            src, fmt = _require_dataset_dir(raw)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            msg = f"转换校验失败: {exc}"
+            print(msg)
+            if web_state is not None:
+                web_state.update(message=msg)
+            return False
+        if fmt != "zarr":
+            msg = f"仅支持 zarr 转换（跳过非 zarr）: {src.name} ({fmt})"
+            print(msg)
+            if web_state is not None:
+                web_state.update(message=msg)
+            return False
+        try:
+            zpath = find_zarr(src)
+        except FileNotFoundError as exc:
+            msg = str(exc)
+            print(msg)
+            if web_state is not None:
+                web_state.update(message=msg)
+            return False
+        jobs.append((src, default_lerobot_out_dir(src)))
+
+    if not jobs:
+        if web_state is not None:
+            web_state.update(message="请选择要转换的 zarr 数据集")
+        return False
+
+    if not _DELETE_LOCK.acquire(blocking=False):
+        msg = "正在处理数据（删除/裁剪/转换），请稍候…"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+
+    for src, _dst in jobs:
+        unload_if_loaded_path(web_state, src, reason=f"转换前卸载: {src.name}")
+
+    total = len(jobs)
+    if web_state is not None:
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            delete_pending=None,
+            delete_progress={
+                "phase": "convert_batch",
+                "frac": 0.0,
+                "message": f"批量转换 LeRobot 0/{total}…",
+            },
+            message=f"批量转换为 LeRobot · 共 {total} 个…",
+        )
+
+    def _on_progress(info: dict, *, index: int, name: str) -> None:
+        if web_state is None or not isinstance(info, dict):
+            return
+        local = info.get("frac")
+        try:
+            local_f = float(local) if local is not None else 0.0
+        except (TypeError, ValueError):
+            local_f = 0.0
+        local_f = max(0.0, min(1.0, local_f))
+        frac = (float(index) + local_f) / float(max(total, 1))
+        detail = str(info.get("message") or "转换中…")
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            delete_progress={
+                "phase": "convert_batch",
+                "frac": frac,
+                "message": f"[{index + 1}/{total}] {name}: {detail}",
+            },
+            message=f"转换 {index + 1}/{total}: {name}",
+        )
+
+    def _worker() -> None:
+        ok_n = 0
+        fail_n = 0
+        errors: list[str] = []
+        try:
+            for i, (src, dst) in enumerate(jobs):
+                try:
+                    zpath = find_zarr(src)
+                    print(
+                        f"[convert-batch] ({i + 1}/{total}) {zpath} → {dst} "
+                        f"fps={fps} robot_type={robot!r} overwrite={overwrite}"
+                    )
+                    n_eps, n_frames = convert_one_zarr(
+                        zpath,
+                        dst,
+                        prompt=str(prompt),
+                        fps=int(fps),
+                        robot_type=robot,
+                        overwrite=bool(overwrite),
+                        progress_cb=lambda info, _i=i, _n=src.name: _on_progress(
+                            info, index=_i, name=_n
+                        ),
+                    )
+                    ok_n += 1
+                    print(
+                        f"[convert-batch] ok {src.name}: "
+                        f"{n_eps} ep / {n_frames} frames → {dst}"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    fail_n += 1
+                    err = f"{src.name}: {exc}"
+                    errors.append(err)
+                    print(f"[convert-batch] failed: {err}")
+                    if web_state is not None:
+                        web_state.update(
+                            mode="DELETING",
+                            deleting=True,
+                            delete_progress={
+                                "phase": "convert_batch",
+                                "frac": float(i + 1) / float(max(total, 1)),
+                                "message": f"[{i + 1}/{total}] 失败: {src.name}",
+                            },
+                            message=f"转换失败 {i + 1}/{total}: {src.name}",
+                        )
+        finally:
+            if web_state is not None:
+                if fail_n == 0:
+                    msg = f"已转换 {ok_n} 个 zarr → LeRobot"
+                elif ok_n == 0:
+                    tip = errors[0] if errors else "未知错误"
+                    msg = f"批量转换全部失败: {tip}"
+                else:
+                    tip = errors[0] if errors else ""
+                    msg = f"批量转换完成：成功 {ok_n} · 失败 {fail_n}" + (
+                        f" · {tip}" if tip else ""
+                    )
+                web_state.update(
+                    mode=done_mode,
+                    deleting=False,
+                    delete_pending=None,
+                    delete_progress=None,
+                    message=msg,
+                )
+            _DELETE_LOCK.release()
+
+    threading.Thread(
+        target=_worker, name="convert-batch-lerobot", daemon=True
+    ).start()
+    return True
+
+
+def handle_convert_batch_web_cmd(
+    web_state,
+    cmd: dict,
+    *,
+    done_mode: str = "VIEW",
+) -> bool:
+    """处理 convert_batch_request / convert_batch_confirm（库管理批量转 LeRobot）。"""
+    action = cmd.get("action")
+    raw_paths = cmd.get("paths") or []
+    if not isinstance(raw_paths, list):
+        raw_paths = [raw_paths]
+    paths = [str(p).strip() for p in raw_paths if str(p).strip()]
+    if not paths:
+        if web_state is not None:
+            web_state.update(message="请选择要转换的 zarr 数据集")
+        return False
+
+    validated: list[tuple[Path, str]] = []
+    try:
+        for p in paths:
+            src, fmt = _require_dataset_dir(p)
+            if fmt != "zarr":
+                raise ValueError(f"仅支持 zarr：{src.name} 是 {fmt}")
+            validated.append((src, fmt))
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        if web_state is not None:
+            web_state.update(message=f"转换校验失败: {exc}")
+        return False
+
+    if action == "convert_batch_request":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+        names = ", ".join(p.name for p, _ in validated[:5])
+        more = f" 等 {len(validated)} 个" if len(validated) > 5 else ""
+        if web_state is not None:
+            web_state.update(
+                message=f"confirm convert batch → LeRobot · {names}{more}",
+            )
+        print(f"Confirm convert {len(validated)} zarr → LeRobot? (web Yes)")
+        return True
+
+    if action == "convert_batch_confirm":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+        try:
+            fps = int(cmd.get("fps", 20))
+        except (TypeError, ValueError):
+            fps = 20
+        prompt = str(cmd.get("prompt") or "Flatten and fold the cloth.")
+        robot_type = str(cmd.get("robot_type") or "agilex").strip() or "agilex"
+        overwrite = bool(cmd.get("overwrite", False))
+        return bool(
+            schedule_convert_batch_to_lerobot(
+                [p for p, _ in validated],
+                fps=fps,
+                prompt=prompt,
+                robot_type=robot_type,
+                overwrite=overwrite,
+                web_state=web_state,
+                done_mode=done_mode,
+            )
+        )
+    return False
+
+
 def schedule_merge_lerobot(
     sources: list[str | Path],
     *,
@@ -3201,6 +3437,253 @@ def schedule_merge_lerobot(
 
     threading.Thread(target=_worker, name="merge-lerobot", daemon=True).start()
     return True
+
+
+def schedule_sync_remote(
+    paths: list[str | Path],
+    *,
+    remote_dest: str,
+    delete: bool = False,
+    password: str | None = None,
+    web_state=None,
+    done_mode: str = "VIEW",
+) -> bool:
+    """后台 rsync 所选数据集到远程；密码仅存于本线程局部变量，结束后丢弃。"""
+    from modules.sync_dataset_remote import SyncRemoteError, sync_datasets
+
+    locals_ = [str(p).strip() for p in paths if str(p).strip()]
+    dest = str(remote_dest or "").strip()
+    if not locals_:
+        if web_state is not None:
+            web_state.update(message="未选择要同步的数据集")
+        return False
+    if not dest:
+        if web_state is not None:
+            web_state.update(message="请填写远程目标 user@host:/path/")
+        return False
+
+    if not _DELETE_LOCK.acquire(blocking=False):
+        msg = "正在处理数据（删除/裁剪/转换/合并/同步），请稍候…"
+        print(msg)
+        if web_state is not None:
+            web_state.update(message=msg)
+        return False
+
+    if web_state is not None:
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            viewer_only=True,
+            delete_pending=None,
+            sync_remote_status=None,
+            delete_progress={
+                "phase": "sync",
+                "frac": 0.0,
+                "message": f"同步到远程 → {dest}…",
+            },
+            message=f"同步 {len(locals_)} 个数据集 → {dest}…",
+        )
+
+    pw = password  # local alias; cleared in finally
+
+    def _on_progress(info: dict) -> None:
+        if web_state is None or not isinstance(info, dict):
+            return
+        payload = dict(info)
+        msg = str(payload.get("message") or "同步中…")
+        web_state.update(
+            mode="DELETING",
+            deleting=True,
+            delete_progress=payload,
+            message=msg,
+        )
+
+    def _worker() -> None:
+        nonlocal pw
+        ok = False
+        err = ""
+        summary: dict = {}
+        try:
+            # Do not print password.
+            print(
+                f"[sync-remote] {len(locals_)} datasets → {dest} "
+                f"delete={bool(delete)} auth={'password' if pw else 'key/agent'}"
+            )
+            summary = sync_datasets(
+                locals_,
+                dest,
+                delete=bool(delete),
+                password=pw,
+                progress_cb=_on_progress,
+            )
+            ok = True
+        except SyncRemoteError as exc:
+            err = str(exc)
+            print(f"[sync-remote] failed: {exc}")
+            ok = False
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            print(f"[sync-remote] failed: {exc}")
+            ok = False
+        finally:
+            pw = None
+            if web_state is not None:
+                if ok:
+                    remote = summary.get("remote_dest") or dest
+                    n = int(summary.get("n_datasets") or len(locals_))
+                    web_state.update(
+                        mode=done_mode,
+                        deleting=False,
+                        delete_pending=None,
+                        delete_progress=None,
+                        message=f"同步完成 · {n} 个数据集 → {remote}",
+                    )
+                else:
+                    web_state.update(
+                        mode=done_mode,
+                        deleting=False,
+                        delete_pending=None,
+                        delete_progress=None,
+                        message=f"同步失败: {err}" if err else "同步失败",
+                    )
+            _DELETE_LOCK.release()
+
+    threading.Thread(target=_worker, name="sync-remote", daemon=True).start()
+    return True
+
+
+def handle_sync_remote_web_cmd(
+    web_state,
+    cmd: dict,
+    *,
+    done_mode: str = "VIEW",
+) -> bool:
+    """处理 sync_remote_probe / sync_remote_confirm。"""
+    from modules.sync_dataset_remote import (
+        SyncRemoteError,
+        probe_ssh_auth,
+        validate_remote_dest_string,
+    )
+
+    action = cmd.get("action")
+    raw_paths = cmd.get("paths") or cmd.get("sources") or []
+    if not isinstance(raw_paths, list):
+        raw_paths = [raw_paths]
+    paths = [str(p).strip() for p in raw_paths if str(p).strip()]
+    dest = str(cmd.get("dest") or cmd.get("remote_dest") or "").strip()
+    delete = bool(cmd.get("delete", False))
+
+    if action == "sync_remote_probe":
+        if web_state is not None:
+            web_state.update(sync_remote_status=None)
+        if not paths:
+            if web_state is not None:
+                web_state.update(
+                    message="未选择要同步的数据集",
+                    sync_remote_status={
+                        "ok": False,
+                        "need_password": False,
+                        "dest": dest,
+                        "error": "未选择要同步的数据集",
+                    },
+                )
+            return False
+        if not dest:
+            if web_state is not None:
+                web_state.update(
+                    message="请填写远程目标 user@host:/path/",
+                    sync_remote_status={
+                        "ok": False,
+                        "need_password": False,
+                        "dest": "",
+                        "error": "请填写远程目标",
+                    },
+                )
+            return False
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(
+                    message="正在处理数据，请稍候…",
+                    sync_remote_status={
+                        "ok": False,
+                        "need_password": False,
+                        "dest": dest,
+                        "error": "正在处理数据，请稍候…",
+                    },
+                )
+            return False
+        try:
+            validate_remote_dest_string(dest)
+            result = probe_ssh_auth(dest)
+        except SyncRemoteError as exc:
+            if web_state is not None:
+                web_state.update(
+                    message=str(exc),
+                    sync_remote_status={
+                        "ok": False,
+                        "need_password": False,
+                        "dest": dest,
+                        "error": str(exc),
+                    },
+                )
+            return False
+        # Never attach passwords here.
+        status = {
+            "ok": bool(result.get("ok")),
+            "need_password": bool(result.get("need_password")),
+            "dest": result.get("dest") or dest,
+            "error": result.get("error"),
+            "sshpass_missing": bool(result.get("sshpass_missing")),
+            "n_paths": len(paths),
+            "ts": time.time(),
+        }
+        if web_state is not None:
+            if status["ok"] and status["need_password"]:
+                msg = (
+                    result.get("error")
+                    or "免密失败，请输入 SSH 密码后继续同步"
+                )
+            elif status["ok"]:
+                msg = f"SSH 免密可用 · 可同步到 {status['dest']}"
+            else:
+                msg = str(status.get("error") or "SSH 探测失败")
+            web_state.update(message=msg, sync_remote_status=status)
+        return bool(status["ok"])
+
+    if action == "sync_remote_confirm":
+        if is_delete_busy():
+            if web_state is not None:
+                web_state.update(message="正在处理数据，请稍候…")
+            return False
+        if not paths:
+            if web_state is not None:
+                web_state.update(message="未选择要同步的数据集")
+            return False
+        if not dest:
+            if web_state is not None:
+                web_state.update(message="请填写远程目标 user@host:/path/")
+            return False
+        raw_pw = cmd.get("password", None)
+        password = None
+        if raw_pw is not None and str(raw_pw) != "":
+            password = str(raw_pw)
+        # Drop password from cmd dict ASAP (best-effort; queue item may linger).
+        if isinstance(cmd, dict) and "password" in cmd:
+            try:
+                cmd["password"] = None
+            except Exception:  # noqa: BLE001
+                pass
+        return bool(
+            schedule_sync_remote(
+                paths,
+                remote_dest=dest,
+                delete=delete,
+                password=password,
+                web_state=web_state,
+                done_mode=done_mode,
+            )
+        )
+    return False
 
 
 def handle_merge_lerobot_web_cmd(
@@ -4109,10 +4592,26 @@ def run_viewer_only(
                     )
                     continue
                 if action in (
+                    "convert_batch_request",
+                    "convert_batch_confirm",
+                ):
+                    handle_convert_batch_web_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
+                if action in (
                     "merge_lerobot_request",
                     "merge_lerobot_confirm",
                 ):
                     handle_merge_lerobot_web_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
+                if action in (
+                    "sync_remote_probe",
+                    "sync_remote_confirm",
+                ):
+                    handle_sync_remote_web_cmd(
                         web_state, cmd, done_mode="VIEW"
                     )
                     continue
@@ -4448,10 +4947,26 @@ def run_web_hub(
                     )
                     continue
                 if action in (
+                    "convert_batch_request",
+                    "convert_batch_confirm",
+                ):
+                    handle_convert_batch_web_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
+                if action in (
                     "merge_lerobot_request",
                     "merge_lerobot_confirm",
                 ):
                     handle_merge_lerobot_web_cmd(
+                        web_state, cmd, done_mode="VIEW"
+                    )
+                    continue
+                if action in (
+                    "sync_remote_probe",
+                    "sync_remote_confirm",
+                ):
+                    handle_sync_remote_web_cmd(
                         web_state, cmd, done_mode="VIEW"
                     )
                     continue
@@ -5330,10 +5845,34 @@ def run_collect_session(
                             )
                             continue
                         if action in (
+                            "convert_batch_request",
+                            "convert_batch_confirm",
+                        ):
+                            handle_convert_batch_web_cmd(
+                                web_state,
+                                cmd,
+                                done_mode=(
+                                    "READY" if no_zero_force else "IDLE"
+                                ),
+                            )
+                            continue
+                        if action in (
                             "merge_lerobot_request",
                             "merge_lerobot_confirm",
                         ):
                             handle_merge_lerobot_web_cmd(
+                                web_state,
+                                cmd,
+                                done_mode=(
+                                    "READY" if no_zero_force else "IDLE"
+                                ),
+                            )
+                            continue
+                        if action in (
+                            "sync_remote_probe",
+                            "sync_remote_confirm",
+                        ):
+                            handle_sync_remote_web_cmd(
                                 web_state,
                                 cmd,
                                 done_mode=(

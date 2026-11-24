@@ -68,6 +68,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import click
@@ -596,6 +597,8 @@ def run_rtc_v2(
     web_state: SharedEvalState | None = None,
     web_cmds: CommandQueue | None = None,
     traj_recorder: ModelTrajRecorder | None = None,
+    on_episode_start: Callable[[], None] | None = None,
+    on_episode_end: Callable[[], None] | None = None,
 ) -> None:
     """Official-style: infer thread fills buffer; control pops 1 action / tick."""
     dt = 1.0 / float(frequency)
@@ -725,6 +728,10 @@ def run_rtc_v2(
         )
         obs, state = _get_obs_state()
 
+    # Drop throw-away warmup frames from server-side MEM history.
+    if on_episode_end is not None:
+        on_episode_end()
+
     if chunk_size != action_horizon:
         print(
             f"[v2] NOTE: --chunk-size={chunk_size} vs model H={action_horizon}; "
@@ -820,6 +827,8 @@ def run_rtc_v2(
                         saved = recorder.finish_episode()
                         if saved is not None:
                             _log(f"[traj] saved {saved}")
+                        if on_episode_end is not None:
+                            on_episode_end()
                     if web_state is not None:
                         web_state.update(mode="HOME")
                     try:
@@ -847,6 +856,8 @@ def run_rtc_v2(
                             _log(f"[traj] saved {saved}")
                         else:
                             _log("[traj] empty episode; nothing saved")
+                        if on_episode_end is not None:
+                            on_episode_end()
                     _hold()
                     _log(
                         "Policy stopped; holding measured joints "
@@ -890,10 +901,12 @@ def run_rtc_v2(
                     if observe_only:
                         _log("Ignoring C: --observe-only")
                     else:
+                        if not recorder.active:
+                            if on_episode_start is not None:
+                                on_episode_start()
+                            recorder.start_episode()
                         executing = True
                         empty_streak = 0
-                        if not recorder.active:
-                            recorder.start_episode()
                         mode = "tick" if use_immediate else "schedule"
                         _log(
                             f"Policy execution started (RTC v2 async+buffer, "
@@ -988,6 +1001,8 @@ def run_rtc_v2(
             saved = recorder.finish_episode()
             if saved is not None:
                 print(f"[traj] flushed on exit: {saved}", flush=True)
+            if on_episode_end is not None:
+                on_episode_end()
         print(
             f"[v2] session: steps={step_count} infers={infer_count} "
             f"last_delay={delay_tracker.pred_delay_steps}"
@@ -1024,6 +1039,8 @@ def run_dagger_v2(
     web_state: SharedEvalState | None = None,
     web_cmds: CommandQueue | None = None,
     traj_recorder: ModelTrajRecorder | None = None,
+    on_episode_start: Callable[[], None] | None = None,
+    on_episode_end: Callable[[], None] | None = None,
 ) -> None:
     """RTC v2 async buffer + DAgger episode / drag intervene / UMI zarr."""
     dt = 1.0 / float(frequency)
@@ -1414,6 +1431,8 @@ def run_dagger_v2(
                 )
             return
         episode_id = env.replay_buffer.n_episodes
+        if on_episode_start is not None:
+            on_episode_start()
         env.start_episode(time.time() + 0.5)
         recording = True
         drag_mode = False
@@ -1624,6 +1643,8 @@ def run_dagger_v2(
         recording = False
         intervention_labels = []
         last_rotvecs = [None, None]
+        if on_episode_end is not None:
+            on_episode_end()
         _return_to_init(reason="save")
 
     def _abort() -> None:
@@ -1643,6 +1664,8 @@ def run_dagger_v2(
         recording = False
         intervention_labels = []
         last_rotvecs = [None, None]
+        if on_episode_end is not None:
+            on_episode_end()
         try:
             _hold()
         except Exception as exc:  # noqa: BLE001
@@ -1662,6 +1685,8 @@ def run_dagger_v2(
             abort_episode(env)
             recorder.discard_episode()
             recording = False
+            if on_episode_end is not None:
+                on_episode_end()
         try:
             _hold()
         except Exception as exc:  # noqa: BLE001
@@ -1728,6 +1753,10 @@ def run_dagger_v2(
             rtc_max_guidance_weight=rtc_max_guidance_weight,
         )
         obs, state = _get_obs_state()
+
+    # Drop throw-away warmup frames from server-side MEM history.
+    if on_episode_end is not None:
+        on_episode_end()
 
     if chunk_size != action_horizon:
         _log(
@@ -2058,6 +2087,8 @@ def run_dagger_v2(
             except Exception:  # noqa: BLE001
                 pass
             recorder.discard_episode()
+            if on_episode_end is not None:
+                on_episode_end()
         print(
             f"[dagger] session: steps={step_count} infers={infer_count} "
             f"last_delay={delay_tracker.pred_delay_steps}"

@@ -269,6 +269,9 @@ class SharedCollectState:
         self.dagger_stats: Optional[dict] = None
         # zarr | lerobot | ""
         self.dataset_format: str = ""
+        # 远程同步探测结果（不存密码）:
+        # {ok, need_password, dest, error, sshpass_missing?, ts}
+        self.sync_remote_status: Optional[dict] = None
         self._jpeg: bytes = b""
         self._live_series: list[dict] = []
         self.logs: list[str] = []
@@ -384,6 +387,11 @@ class SharedCollectState:
                     getattr(self, "dataset_format", "")
                     or getattr(getattr(self, "env", None), "dataset_format", "")
                     or ""
+                ),
+                "sync_remote_status": (
+                    dict(self.sync_remote_status)
+                    if isinstance(getattr(self, "sync_remote_status", None), dict)
+                    else None
                 ),
                 "output_dir": str(out_dir) if out_dir is not None else "",
                 "repo_root": str(_REPO_ROOT),
@@ -1158,15 +1166,78 @@ class CollectWebServer:
             def do_POST(self) -> None:  # noqa: N802
                 try:
                     parsed = urlparse(self.path)
-                    if parsed.path != "/api/cmd":
-                        self._send_json(404, {"error": "unknown path"})
-                        return
                     length = int(self.headers.get("Content-Length", "0"))
                     raw = self.rfile.read(length) if length > 0 else b"{}"
                     try:
                         payload = json.loads(raw.decode("utf-8") or "{}")
                     except json.JSONDecodeError:
                         self._send_json(400, {"error": "invalid json"})
+                        return
+
+                    # Synchronous remote browse / probe (password only in this request).
+                    if parsed.path in (
+                        "/api/sync/remote_probe",
+                        "/api/sync/remote_ls",
+                    ):
+                        import importlib
+
+                        import modules.sync_dataset_remote as _sync_remote
+
+                        # Pick up on-disk fixes without restarting the hub process.
+                        _sync_remote = importlib.reload(_sync_remote)
+                        SyncRemoteError = _sync_remote.SyncRemoteError
+                        list_remote_dirs = _sync_remote.list_remote_dirs
+                        probe_ssh_auth = _sync_remote.probe_ssh_auth
+
+                        target = str(
+                            payload.get("target")
+                            or payload.get("dest")
+                            or ""
+                        ).strip()
+                        password = payload.get("password", None)
+                        if password is not None and str(password) == "":
+                            password = None
+                        elif password is not None:
+                            password = str(password)
+                        try:
+                            if parsed.path == "/api/sync/remote_probe":
+                                result = probe_ssh_auth(
+                                    target, password=password
+                                )
+                                self._send_json(200, result)
+                                return
+                            path = payload.get("path", None)
+                            result = list_remote_dirs(
+                                target,
+                                path=path,
+                                password=password,
+                            )
+                            self._send_json(200, result)
+                            return
+                        except SyncRemoteError as exc:
+                            msg = str(exc)
+                            # Only ask for password if caller did not already send one.
+                            had_password = password is not None
+                            need_pw = (not had_password) and (
+                                "需要密码" in msg
+                                or "permission denied" in msg.lower()
+                            )
+                            self._send_json(
+                                401 if need_pw else 400,
+                                {
+                                    "ok": False,
+                                    "need_password": need_pw,
+                                    "error": msg,
+                                },
+                            )
+                            return
+                        except Exception as exc:  # noqa: BLE001
+                            traceback.print_exc()
+                            self._send_json(500, {"error": str(exc)})
+                            return
+
+                    if parsed.path != "/api/cmd":
+                        self._send_json(404, {"error": "unknown path"})
                         return
                     action = payload.get("action")
                     if not action:

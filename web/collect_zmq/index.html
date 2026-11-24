@@ -154,6 +154,71 @@
     body.library-mode header .hint {
       display: none;
     }
+    /* 顶栏「库管理」：仅数据管理 Viewer 时显示，比普通按钮更醒目 */
+    #btnOpenLibraryPage {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 12px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      border-radius: 6px;
+      border: 1px solid color-mix(in srgb, var(--ok, #2ecc71) 55%, var(--border));
+      background: color-mix(in srgb, var(--ok, #2ecc71) 22%, var(--panel));
+      color: var(--text);
+      cursor: pointer;
+      white-space: nowrap;
+      flex: 0 0 auto;
+    }
+    #btnOpenLibraryPage:hover:not(:disabled) {
+      filter: brightness(1.08);
+    }
+    #btnOpenLibraryPage:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    body.viewer-mode #btnOpenLibraryPage {
+      display: inline-flex;
+    }
+    #btnOpenLibraryPage .lib-ico {
+      width: 14px;
+      height: 14px;
+      flex: 0 0 auto;
+    }
+    /* 顶栏「返回数据管理」：仅库管理页显示 */
+    #btnHeaderLibraryBack {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 12px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      cursor: pointer;
+      white-space: nowrap;
+      flex: 0 0 auto;
+    }
+    #btnHeaderLibraryBack:hover:not(:disabled) {
+      filter: brightness(1.08);
+      border-color: color-mix(in srgb, var(--text) 25%, var(--border));
+    }
+    #btnHeaderLibraryBack:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    body.library-mode #btnHeaderLibraryBack {
+      display: inline-flex;
+    }
+    #btnHeaderLibraryBack .lib-ico {
+      width: 14px;
+      height: 14px;
+      flex: 0 0 auto;
+    }
     .font-btns {
       display: inline-flex;
       align-items: center;
@@ -1059,6 +1124,30 @@
       font-weight: 700;
     }
     .msg { margin-top: 4px; color: var(--muted); font-size: 0.8rem; min-height: 1.1em; }
+    #libraryMsg.sync-err {
+      color: #c0392b;
+      font-weight: 600;
+      font-size: 0.9rem;
+      white-space: pre-wrap;
+    }
+    #libraryMsg.sync-busy {
+      color: #1f6feb;
+      font-weight: 600;
+    }
+    #librarySyncStatus {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: rgba(127,127,127,0.12);
+      color: var(--text);
+      font-size: 0.9rem;
+      min-height: 1.2em;
+      white-space: pre-wrap;
+      display: none;
+    }
+    #librarySyncStatus.show { display: block; }
+    #librarySyncStatus.err { background: rgba(192,57,43,0.15); color: #c0392b; font-weight: 600; }
+    #librarySyncStatus.busy { background: rgba(31,111,235,0.12); color: #1f6feb; }
 
     .viewer {
       flex: 1 1 auto;
@@ -1650,6 +1739,38 @@
   <header>
     <div class="left">
       <h1 id="pageTitle">ARX5 ZMQ Collect</h1>
+      <button
+        type="button"
+        id="btnOpenLibraryPage"
+        class="primary"
+        title="管理父目录下一层的多个数据集（打开 / 合并 / 同步 / 删除）"
+      >
+        <svg class="lib-ico" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path
+            d="M4 6.5A2.5 2.5 0 0 1 6.5 4H20v14.5A2.5 2.5 0 0 1 17.5 21H6.5A2.5 2.5 0 0 1 4 18.5v-12Z"
+            stroke="currentColor"
+            stroke-width="1.8"
+          />
+          <path d="M8 8h8M8 12h8M8 16h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+        </svg>
+        库管理
+      </button>
+      <button
+        type="button"
+        id="btnHeaderLibraryBack"
+        title="返回数据管理（Esc）"
+      >
+        <svg class="lib-ico" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path
+            d="M15 18l-6-6 6-6"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+        返回数据管理
+      </button>
       <div class="hint" id="headerHint">网页快捷键: P/C/S/D/Q · 仅可信局域网</div>
     </div>
     <div class="right">
@@ -1703,7 +1824,7 @@
     <div class="library-card panel" id="libraryCard">
       <h2>数据集库管理</h2>
       <p class="merge-sub" id="libraryPageHint">
-        浏览父目录下一层子文件夹中的数据集：打开、重命名、移动、删除；多选后可批量删除，或将 ≥2 个 LeRobot 送入合并页。
+        浏览父目录下一层子文件夹中的数据集：打开、重命名、移动、删除；多选后可批量删除、rsync 同步，或勾选 ≥2 个 LeRobot 点「合并所选」。
       </p>
       <div class="path-row" style="margin:0">
         <label>库根目录</label>
@@ -1740,8 +1861,25 @@
         </table>
         <div class="library-empty" id="libraryEmpty" hidden>此目录下没有识别到数据集</div>
       </div>
+      <div class="path-row" id="librarySyncRow" style="margin:12px 0 0;flex-wrap:wrap;align-items:center">
+        <label title="可只填 user@ip，再点「浏览远端」选目录；或直接填 user@host:/path/">远程目标</label>
+        <input id="librarySyncDest" type="text" list="librarySyncDestList" style="flex:1;min-width:220px" spellcheck="false" autocomplete="off" placeholder="user@ip 回车浏览远端目录，或填 user@host:/path/" title="输入 user@ip 后按回车开始选择远端目录" />
+        <datalist id="librarySyncDestList"></datalist>
+        <button id="btnLibrarySyncBrowse" type="button" class="ok" title="连接远端并浏览目录">浏览远端…</button>
+        <select id="librarySyncSaved" title="常用地址" style="max-width:200px">
+          <option value="">常用地址…</option>
+        </select>
+        <button id="btnLibrarySyncSaveDest" type="button" title="把当前目标保存到常用地址（不存密码）">保存地址</button>
+        <button id="btnLibrarySyncRemoveDest" type="button" title="从常用地址删除当前选中项">删除地址</button>
+        <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted);margin:0" title="危险：会删除远端有而本地没有的文件">
+          <input id="librarySyncDelete" type="checkbox" /> rsync --delete
+        </label>
+      </div>
+      <div id="librarySyncStatus" aria-live="polite"></div>
       <div class="library-batch">
         <button id="btnLibraryMergeSelected" type="button" class="primary" disabled title="所选须全部为 LeRobot 且至少 2 个">合并所选</button>
+        <button id="btnLibraryConvertSelected" type="button" class="ok" disabled title="所选须全部为 zarr">转 LeRobot</button>
+        <button id="btnLibrarySyncSelected" type="button" class="ok" disabled title="rsync 同步所选数据集到远程">同步所选</button>
         <button id="btnLibraryDeleteSelected" type="button" class="danger" disabled>删除所选</button>
         <span class="msg" id="libraryHint" style="margin:0">未选择</span>
         <button id="btnLibraryBack" type="button" title="返回数据管理">返回数据管理</button>
@@ -1905,8 +2043,6 @@
             <button id="btnEpNext" type="button" title="下一条 episode">›</button>
             <button id="btnOpenRerun" type="button" class="primary" title="用本机 Rerun / lerobot-dataset-viz 打开当前数据集">用 Rerun 打开</button>
             <button id="btnBackHub" type="button">返回入口</button>
-            <button id="btnOpenLibraryPage" type="button" title="管理父目录下一层的多个数据集">库管理</button>
-            <button id="btnOpenMergePage" type="button" title="进入合并 LeRobot 页面">合并</button>
             <div class="msg" id="msgView" style="margin:0"></div>
           </div>
           <div class="path-row viz-path-bar" id="vizPathBar" title="输入时会提示子文件夹；回车或点打开加载">
@@ -2246,6 +2382,79 @@
     </div>
   </div>
 
+  <div class="modal-bg" id="libraryConvertModal">
+    <div class="modal">
+      <h3>批量转换为 LeRobot？</h3>
+      <p id="libraryConvertText">将把所选 zarr 写成同级 `{name}_lerobot`。</p>
+      <div class="path-row" style="margin-top:10px">
+        <label>prompt</label>
+        <input id="libraryConvertPrompt" type="text" style="flex:1;min-width:180px" value="Flatten and fold the cloth." />
+      </div>
+      <div class="path-row" style="margin-top:8px">
+        <label>robot_type</label>
+        <input id="libraryConvertRobotType" type="text" style="flex:1;min-width:120px" value="agilex" placeholder="agilex" list="convertRobotTypeHints" />
+      </div>
+      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:10px">
+        <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted);margin:0">
+          fps
+          <input id="libraryConvertFps" type="number" min="1" max="120" value="20" style="width:64px" />
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted);margin:0">
+          <input id="libraryConvertOverwrite" type="checkbox" /> 覆盖已有输出
+        </label>
+      </div>
+      <div class="btns" style="margin-top:14px">
+        <button id="libraryConvertYes" class="ok">确认转换</button>
+        <button id="libraryConvertNo">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-bg" id="librarySyncModal">
+    <div class="modal">
+      <h3>同步到远程？</h3>
+      <p id="librarySyncText">将用 rsync 同步所选数据集。</p>
+      <div class="btns">
+        <button id="librarySyncYes" class="ok">确认同步</button>
+        <button id="librarySyncNo">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-bg" id="librarySyncPasswordModal">
+    <div class="modal">
+      <h3>需要 SSH 密码</h3>
+      <p id="librarySyncPasswordText">免密失败，请输入远程密码（将记住该主机密码；连续错误 3 次需重新输入）。</p>
+      <div class="path-row" style="margin:12px 0 0">
+        <label for="librarySyncPassword">密码</label>
+        <input id="librarySyncPassword" type="password" style="flex:1;min-width:180px" autocomplete="current-password" />
+      </div>
+      <div class="btns" style="margin-top:14px">
+        <button id="librarySyncPasswordYes" class="ok">确认</button>
+        <button id="librarySyncPasswordNo">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-bg" id="remoteFsModal">
+    <div class="modal fs-modal">
+      <h3 id="remoteFsTitle">选择远端目录</h3>
+      <p class="fs-hint" id="remoteFsHint">连接远端后单击进入子目录，点「选择此目录」填入同步目标。</p>
+      <div class="fs-toolbar">
+        <button type="button" id="remoteFsUp" title="上级目录">↑ 上级</button>
+        <button type="button" id="remoteFsHome" title="远端家目录">~</button>
+        <button type="button" id="remoteFsRoot" title="根目录">/</button>
+        <div class="fs-crumb" id="remoteFsCrumb"></div>
+      </div>
+      <ul class="fs-list" id="remoteFsList"></ul>
+      <div class="fs-footer">
+        <div class="fs-status" id="remoteFsStatus"></div>
+        <button type="button" id="remoteFsSelect" class="ok" disabled>选择此目录</button>
+        <button type="button" id="remoteFsCancel">取消</button>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-bg" id="fsModal">
     <div class="modal fs-modal">
       <h3 id="fsModalTitle">选择数据文件夹</h3>
@@ -2298,7 +2507,19 @@
     let pendingLibraryRename = null; // {path, name}
     let pendingLibraryMove = null; // {path, name}
     let pendingLibraryDelete = null; // string[] paths
+    let pendingLibraryConvert = null; // {paths, fps, prompt, robot_type, overwrite}
+    let pendingLibrarySync = null; // {paths, dest, delete}
+    let syncPasswordPurpose = null; // "sync" | "browse" | null
+    let remoteBrowsePassword = null; // session password for current browse
+    let remoteBrowseTarget = ""; // user@host
+    let remoteBrowse = { path: "", parent: null, entries: [] };
+    let lastSyncProbeTs = 0;
     let lastDeleting = false;
+    const SYNC_REMOTE_LAST_KEY = "collect_zmq_sync_remote_last";
+    const SYNC_REMOTE_SAVED_KEY = "collect_zmq_sync_remotes";
+    // { [user@host]: { password, failCount, updatedAt } } — local only, per host
+    const SYNC_REMOTE_PW_KEY = "collect_zmq_sync_passwords";
+    const SYNC_PW_MAX_FAIL = 3;
     let lastUiMode = "";
     let lastOutputDir = "";
     let defaultOutputDir = "";
@@ -2704,23 +2925,79 @@
       return j;
     }
 
-    function setMsg(t) {
+    let localMsgStickyUntil = 0;
+    let localMsgStickyText = "";
+
+    function setMsg(t, opts) {
+      const text = t || "";
+      const stickyMs = opts && typeof opts.stickyMs === "number" ? opts.stickyMs : 0;
+      const force = !!(opts && opts.force);
+      if (stickyMs > 0) {
+        localMsgStickyUntil = Date.now() + stickyMs;
+        localMsgStickyText = text;
+      }
+      // Status polling can wipe ephemeral errors; keep sticky sync/browse messages.
+      if (
+        !force &&
+        Date.now() < localMsgStickyUntil &&
+        text &&
+        text !== localMsgStickyText &&
+        !/同步|SSH|远端|密码|探测|连接|浏览|rsync|OpenSSL/i.test(text)
+      ) {
+        return;
+      }
       const el = $("msg");
-      el.textContent = t || "";
-      const busy = /保存|丢弃|稍候|写盘|回放|删除|合并|转换|裁剪/.test(t || "");
+      el.textContent = text;
+      const busy = /保存|丢弃|稍候|写盘|回放|删除|合并|转换|裁剪|同步|探测|连接|浏览/.test(
+        text
+      );
       el.classList.toggle("busy", busy);
       if ($("msgView")) {
-        $("msgView").textContent = t || "";
+        $("msgView").textContent = text;
         $("msgView").classList.toggle("busy", busy);
       }
-      if ($("hubMsg")) $("hubMsg").textContent = t || "";
+      if ($("hubMsg")) $("hubMsg").textContent = text;
       if ($("mergeMsg")) {
-        $("mergeMsg").textContent = t || "";
+        $("mergeMsg").textContent = text;
         $("mergeMsg").classList.toggle("busy", busy);
       }
       if ($("libraryMsg")) {
-        $("libraryMsg").textContent = t || "";
+        $("libraryMsg").textContent = text;
         $("libraryMsg").classList.toggle("busy", busy);
+      }
+    }
+
+    function setLibrarySyncStatus(text, kind) {
+      const el = $("librarySyncStatus");
+      if (!el) return;
+      const t = String(text || "").trim();
+      if (!t) {
+        el.className = "";
+        el.textContent = "";
+        return;
+      }
+      el.textContent = t;
+      el.className = "show" + (kind === "err" ? " err" : kind === "busy" ? " busy" : "");
+    }
+
+    function setSyncErr(t) {
+      const text = String(t || "未知错误");
+      setMsg(text, { stickyMs: 30000, force: true });
+      setLibrarySyncStatus(text, "err");
+      if ($("libraryMsg")) {
+        $("libraryMsg").classList.add("sync-err");
+        $("libraryMsg").classList.remove("sync-busy");
+      }
+      if ($("remoteFsStatus")) $("remoteFsStatus").textContent = text;
+    }
+
+    function setSyncBusy(t) {
+      const text = String(t || "");
+      setMsg(text, { stickyMs: 20000, force: true });
+      setLibrarySyncStatus(text, "busy");
+      if ($("libraryMsg")) {
+        $("libraryMsg").classList.add("sync-busy");
+        $("libraryMsg").classList.remove("sync-err");
       }
     }
 
@@ -2740,6 +3017,16 @@
         phase === "delete_datasets" ||
         /删除数据集/.test(rawMsg) ||
         /删除 \d+\//.test(rawMsg);
+      const isLibSync =
+        phase === "sync" ||
+        /同步/.test(rawMsg) ||
+        /同步/.test(String((s && s.message) || ""));
+      const isLibConvert =
+        phase === "convert_batch" ||
+        /批量转换/.test(rawMsg) ||
+        /批量转换/.test(String((s && s.message) || "")) ||
+        (/转换 \d+\//.test(rawMsg) && libraryPageOpen);
+      const isLibOp = isLibDelete || isLibSync || isLibConvert;
       [
         ["delProgress", "delProgressBar", "delProgressLabel"],
         ["delProgressView", "delProgressBarView", "delProgressLabelView"],
@@ -2752,12 +3039,12 @@
         if (!wrap || !bar) return;
         let show = !!deleting;
         if (wrapId === "mergeProgress") show = !!(deleting && isMerge);
-        if (wrapId === "libraryProgress") show = !!(deleting && isLibDelete);
+        if (wrapId === "libraryProgress") show = !!(deleting && isLibOp);
         if (
           wrapId === "delProgress" ||
           wrapId === "delProgressView"
         ) {
-          show = !!(deleting && !isMerge && !isLibDelete);
+          show = !!(deleting && !isMerge && !isLibOp);
         }
         wrap.classList.toggle("show", show);
         if (show) {
@@ -2775,7 +3062,7 @@
       if (deleting && isMerge && !mergePageOpen) {
         showMergePage();
       }
-      if (deleting && isLibDelete && !libraryPageOpen) {
+      if (deleting && isLibOp && !libraryPageOpen) {
         showLibraryPage(libraryRoot || undefined);
       }
     }
@@ -2899,14 +3186,27 @@
       const allN = (libraryData.datasets || []).length;
       const allLerobot =
         n >= 2 && selected.every((d) => String(d.dataset_format) === "lerobot");
+      const allZarr =
+        n >= 1 && selected.every((d) => String(d.dataset_format) === "zarr");
       if ($("btnLibraryMergeSelected")) {
         $("btnLibraryMergeSelected").disabled = !allLerobot;
         $("btnLibraryMergeSelected").title = allLerobot
           ? `合并 ${n} 个 LeRobot`
           : "需选择至少 2 个 LeRobot 数据集";
       }
+      if ($("btnLibraryConvertSelected")) {
+        $("btnLibraryConvertSelected").disabled = !allZarr;
+        $("btnLibraryConvertSelected").title = allZarr
+          ? `转换 ${n} 个 zarr → LeRobot`
+          : "需选择至少 1 个 zarr 数据集";
+      }
       if ($("btnLibraryDeleteSelected")) {
         $("btnLibraryDeleteSelected").disabled = n < 1;
+      }
+      if ($("btnLibrarySyncSelected")) {
+        $("btnLibrarySyncSelected").disabled = n < 1;
+        $("btnLibrarySyncSelected").title =
+          n < 1 ? "请先勾选要同步的数据集" : `rsync 同步 ${n} 个数据集到远程`;
       }
       if ($("libraryFilterCount")) {
         const filt =
@@ -2917,7 +3217,11 @@
       }
       if ($("libraryHint")) {
         if (!n) $("libraryHint").textContent = "未选择";
-        else if (!allLerobot && n >= 2) {
+        else if (!allLerobot && n >= 2 && !allZarr) {
+          $("libraryHint").textContent = `已选 ${n} · 合并需全 LeRobot / 转换需全 zarr`;
+        } else if (allZarr) {
+          $("libraryHint").textContent = `已选 ${n} · 可转 LeRobot`;
+        } else if (!allLerobot && n >= 2) {
           $("libraryHint").textContent = `已选 ${n} · 合并仅支持全为 LeRobot`;
         } else {
           $("libraryHint").textContent = `已选 ${n}`;
@@ -3003,6 +3307,9 @@
           acts.appendChild(b);
         };
         mkBtn("打开", "ok", () => openLibraryDataset(path));
+        if (fmt === "zarr") {
+          mkBtn("转 LeRobot", "ok", () => openLibraryConvert([path]));
+        }
         mkBtn("重命名", "", () => openLibraryRename(d));
         mkBtn("移动", "", () => openLibraryMove(d));
         mkBtn("删除", "danger", () => openLibraryDelete([path]));
@@ -3062,7 +3369,7 @@
       if ($("libraryPage")) $("libraryPage").classList.add("show");
       if ($("mainWrap")) $("mainWrap").style.display = "none";
       if ($("hubPage")) $("hubPage").classList.remove("show");
-      $("headerHint").textContent = "库管理 · 下一层数据集 · 仅可信局域网";
+      $("headerHint").textContent = "库管理 · Esc 返回数据管理 · 仅可信局域网";
       $("pageTitle").textContent = "ARX5 Dataset Library";
       document.title = "ARX5 Dataset Library";
       let root = (path || "").trim();
@@ -3091,6 +3398,28 @@
       $("headerHint").textContent = "数据管理 · 返回入口 · 仅可信局域网";
       $("pageTitle").textContent = "ARX5 Dataset Viewer";
       document.title = "ARX5 Dataset Viewer";
+    }
+
+    function exitLibraryToViewer() {
+      if (!libraryPageOpen) return false;
+      if (status.mode === "DELETING" || status.deleting) {
+        setMsg("正在处理数据，请稍候…");
+        return false;
+      }
+      // Close library-related overlays first if any.
+      if ($("librarySyncPasswordModal")) {
+        $("librarySyncPasswordModal").classList.remove("show");
+      }
+      if ($("librarySyncModal")) $("librarySyncModal").classList.remove("show");
+      if ($("libraryDeleteModal")) $("libraryDeleteModal").classList.remove("show");
+      if ($("libraryConvertModal")) $("libraryConvertModal").classList.remove("show");
+      if ($("libraryRenameModal")) $("libraryRenameModal").classList.remove("show");
+      if ($("libraryMoveModal")) $("libraryMoveModal").classList.remove("show");
+      if ($("remoteFsModal")) $("remoteFsModal").classList.remove("show");
+      pendingLibraryConvert = null;
+      hideLibraryPage();
+      applyUiMode(status.mode || "VIEW", status);
+      return true;
     }
 
     async function openLibraryDataset(path) {
@@ -3153,6 +3482,698 @@
       postCmd("delete_datasets_request", { paths: pendingLibraryDelete }).catch(
         (e) => setMsg(e.message)
       );
+    }
+
+    function openLibraryConvert(paths) {
+      if (status.mode === "DELETING" || status.deleting) {
+        setMsg("正在处理数据，请稍候…");
+        return;
+      }
+      const list = (paths || []).filter(Boolean);
+      if (!list.length) {
+        setMsg("请先勾选要转换的 zarr 数据集");
+        return;
+      }
+      const prompt =
+        ($("libraryConvertPrompt") && $("libraryConvertPrompt").value.trim()) ||
+        "Flatten and fold the cloth.";
+      const robotType =
+        ($("libraryConvertRobotType") &&
+          $("libraryConvertRobotType").value.trim()) ||
+        "agilex";
+      let fps = 20;
+      if ($("libraryConvertFps")) {
+        fps = Number($("libraryConvertFps").value) || 20;
+      }
+      const overwrite = !!(
+        $("libraryConvertOverwrite") && $("libraryConvertOverwrite").checked
+      );
+      pendingLibraryConvert = {
+        paths: list,
+        fps,
+        prompt,
+        robot_type: robotType,
+        overwrite,
+      };
+      const names = list.map((p) => {
+        const parts = p.replace(/\/+$/, "").split("/");
+        return parts[parts.length - 1] || p;
+      });
+      if ($("libraryConvertText")) {
+        $("libraryConvertText").textContent =
+          `将转换 ${names.length} 个 zarr → 同级 {name}_lerobot：\n` +
+          names.slice(0, 10).join("\n") +
+          (names.length > 10 ? `\n…共 ${names.length} 个` : "") +
+          `\n\nfps=${fps} · robot_type="${robotType}" · prompt="${prompt}"` +
+          (overwrite ? " · 将覆盖已有输出" : " · 已存在 episode 会跳过（可勾选覆盖）");
+        $("libraryConvertText").style.whiteSpace = "pre-wrap";
+      }
+      if ($("libraryConvertModal")) $("libraryConvertModal").classList.add("show");
+      postCmd("convert_batch_request", { paths: list }).catch((e) =>
+        setMsg(e.message)
+      );
+    }
+
+    function loadSyncRemotes() {
+      try {
+        const raw = localStorage.getItem(SYNC_REMOTE_SAVED_KEY);
+        const arr = raw ? JSON.parse(raw) : [];
+        if (!Array.isArray(arr)) return [];
+        return arr
+          .map((x) => {
+            if (typeof x === "string") return { dest: x.trim(), label: "" };
+            if (x && typeof x === "object") {
+              return {
+                dest: String(x.dest || "").trim(),
+                label: String(x.label || "").trim(),
+              };
+            }
+            return null;
+          })
+          .filter((x) => x && x.dest);
+      } catch (_) {
+        return [];
+      }
+    }
+
+    function saveSyncRemotes(list) {
+      try {
+        localStorage.setItem(SYNC_REMOTE_SAVED_KEY, JSON.stringify(list || []));
+      } catch (_) {}
+    }
+
+    function isValidSyncHost(dest) {
+      const d = String(dest || "").trim();
+      // user@host  OR  user@host:/path  OR  host:/path
+      return /^(?:[^@/\s]+@)?[^:/\s]+(?::.*)?$/.test(d);
+    }
+
+    function isValidSyncDest(dest) {
+      const d = String(dest || "").trim();
+      // Must include a non-empty path after ':'
+      const m = /^(?:[^@/\s]+@)?[^:/\s]+:.+$/.exec(d);
+      if (!m) return false;
+      const path = d.slice(d.indexOf(":") + 1).trim();
+      return !!path && path !== "~";
+    }
+
+    function parseSyncHostTarget(dest) {
+      const d = String(dest || "").trim();
+      if (!d) return "";
+      const idx = d.indexOf(":");
+      return idx >= 0 ? d.slice(0, idx) : d;
+    }
+
+    function parseSyncStartPath(dest) {
+      const d = String(dest || "").trim();
+      const idx = d.indexOf(":");
+      if (idx < 0) return null;
+      const path = d.slice(idx + 1).trim();
+      return path || null;
+    }
+
+    async function postSyncApi(path, body) {
+      const r = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {}),
+      });
+      let j = {};
+      try {
+        j = await r.json();
+      } catch (_) {
+        j = {};
+      }
+      if (!r.ok) {
+        let msg = j.error || r.statusText || "request failed";
+        if (r.status === 404 || /unknown path/i.test(String(msg))) {
+          msg =
+            "远端浏览接口未加载：请重启采集脚本（Ctrl+C 后重新 --web），再强制刷新页面（Ctrl+Shift+R）";
+        }
+        const err = new Error(msg);
+        err.status = r.status;
+        err.payload = j;
+        throw err;
+      }
+      return j;
+    }
+
+    function renderSyncRemoteUi() {
+      const list = loadSyncRemotes();
+      const dl = $("librarySyncDestList");
+      const sel = $("librarySyncSaved");
+      if (dl) {
+        dl.innerHTML = "";
+        list.forEach((item) => {
+          const opt = document.createElement("option");
+          opt.value = item.dest;
+          if (item.label) opt.label = item.label;
+          dl.appendChild(opt);
+        });
+      }
+      if (sel) {
+        const cur = sel.value;
+        sel.innerHTML = "";
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = "常用地址…";
+        sel.appendChild(placeholder);
+        list.forEach((item) => {
+          const opt = document.createElement("option");
+          opt.value = item.dest;
+          opt.textContent = item.label
+            ? `${item.label} · ${item.dest}`
+            : item.dest;
+          sel.appendChild(opt);
+        });
+        if (cur && list.some((x) => x.dest === cur)) sel.value = cur;
+      }
+    }
+
+    function initSyncRemoteDestInput() {
+      renderSyncRemoteUi();
+      if (!$("librarySyncDest")) return;
+      if ($("librarySyncDest").dataset.inited) return;
+      try {
+        const last = localStorage.getItem(SYNC_REMOTE_LAST_KEY) || "";
+        if (last) $("librarySyncDest").value = last;
+      } catch (_) {}
+      $("librarySyncDest").dataset.inited = "1";
+    }
+
+    function rememberSyncDest(dest) {
+      const d = String(dest || "").trim();
+      if (!d) return;
+      try {
+        localStorage.setItem(SYNC_REMOTE_LAST_KEY, d);
+      } catch (_) {}
+    }
+
+    function saveCurrentSyncDest() {
+      const dest = ($("librarySyncDest") && $("librarySyncDest").value.trim()) || "";
+      if (!isValidSyncHost(dest)) {
+        setMsg("地址格式无效，例如 user@ip 或 user@host:/path/");
+        return;
+      }
+      const list = loadSyncRemotes();
+      if (!list.some((x) => x.dest === dest)) {
+        list.push({ dest, label: "" });
+        saveSyncRemotes(list);
+      }
+      rememberSyncDest(dest);
+      renderSyncRemoteUi();
+      if ($("librarySyncSaved")) $("librarySyncSaved").value = dest;
+      setMsg(`已保存常用地址: ${dest}`);
+    }
+
+    function removeSelectedSyncDest() {
+      const dest =
+        ($("librarySyncSaved") && $("librarySyncSaved").value) ||
+        ($("librarySyncDest") && $("librarySyncDest").value.trim()) ||
+        "";
+      if (!dest) {
+        setMsg("没有可删除的常用地址");
+        return;
+      }
+      const next = loadSyncRemotes().filter((x) => x.dest !== dest);
+      saveSyncRemotes(next);
+      renderSyncRemoteUi();
+      setMsg(`已从常用地址删除: ${dest}`);
+    }
+
+    function openLibrarySync(paths) {
+      const dest = ($("librarySyncDest") && $("librarySyncDest").value.trim()) || "";
+      if (!paths || !paths.length) {
+        setMsg("请先勾选要同步的数据集");
+        return;
+      }
+      if (!isValidSyncDest(dest)) {
+        setMsg("请先点「浏览远端…」选择目录，或填写完整目标 user@host:/path/");
+        return;
+      }
+      pendingLibrarySync = {
+        paths: paths.slice(),
+        dest,
+        delete: !!( $("librarySyncDelete") && $("librarySyncDelete").checked ),
+      };
+      const names = paths.map((p) => {
+        const parts = p.replace(/\/+$/, "").split("/");
+        return parts[parts.length - 1] || p;
+      });
+      const delNote = pendingLibrarySync.delete
+        ? "\n\n已开启 rsync --delete（远端多余文件会被删除）"
+        : "";
+      if ($("librarySyncText")) {
+        $("librarySyncText").textContent =
+          `将 rsync ${names.length} 个数据集 →\n${dest}\n\n` +
+          names.slice(0, 12).join("\n") +
+          (names.length > 12 ? `\n…共 ${names.length} 个` : "") +
+          delNote;
+        $("librarySyncText").style.whiteSpace = "pre-wrap";
+      }
+      if ($("librarySyncModal")) $("librarySyncModal").classList.add("show");
+    }
+
+    function closeLibrarySyncModals() {
+      if ($("librarySyncModal")) $("librarySyncModal").classList.remove("show");
+      if ($("librarySyncPasswordModal")) {
+        $("librarySyncPasswordModal").classList.remove("show");
+      }
+      if ($("librarySyncPassword")) $("librarySyncPassword").value = "";
+      syncPasswordPurpose = null;
+    }
+
+    function clearRemoteBrowseSession() {
+      remoteBrowsePassword = null;
+      remoteBrowseTarget = "";
+      remoteBrowse = { path: "", parent: null, entries: [] };
+      if ($("remoteFsModal")) $("remoteFsModal").classList.remove("show");
+      if ($("remoteFsList")) $("remoteFsList").innerHTML = "";
+      if ($("remoteFsStatus")) $("remoteFsStatus").textContent = "";
+      if ($("remoteFsSelect")) $("remoteFsSelect").disabled = true;
+    }
+
+    function loadSyncPasswordMap() {
+      try {
+        const raw = localStorage.getItem(SYNC_REMOTE_PW_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        return obj && typeof obj === "object" ? obj : {};
+      } catch (_) {
+        return {};
+      }
+    }
+
+    function saveSyncPasswordMap(map) {
+      try {
+        localStorage.setItem(SYNC_REMOTE_PW_KEY, JSON.stringify(map || {}));
+      } catch (_) {}
+    }
+
+    function syncHostKey(targetOrDest) {
+      return parseSyncHostTarget(String(targetOrDest || "").trim());
+    }
+
+    function getSavedSyncPassword(targetOrDest) {
+      const key = syncHostKey(targetOrDest);
+      if (!key) return null;
+      const row = loadSyncPasswordMap()[key];
+      if (!row || !row.password) return null;
+      const fails = Number(row.failCount || 0);
+      if (fails >= SYNC_PW_MAX_FAIL) return null;
+      return {
+        host: key,
+        password: String(row.password),
+        failCount: fails,
+      };
+    }
+
+    function rememberSyncPassword(targetOrDest, password) {
+      const key = syncHostKey(targetOrDest);
+      const pw = String(password || "");
+      if (!key || !pw) return;
+      const map = loadSyncPasswordMap();
+      map[key] = {
+        password: pw,
+        failCount: 0,
+        updatedAt: Date.now(),
+      };
+      saveSyncPasswordMap(map);
+    }
+
+    function clearSavedSyncPassword(targetOrDest) {
+      const key = syncHostKey(targetOrDest);
+      if (!key) return;
+      const map = loadSyncPasswordMap();
+      if (map[key]) {
+        delete map[key];
+        saveSyncPasswordMap(map);
+      }
+    }
+
+    /** @returns {{ failCount: number, cleared: boolean, host: string }} */
+    function noteSyncPasswordFailure(targetOrDest) {
+      const key = syncHostKey(targetOrDest);
+      if (!key) return { failCount: 0, cleared: false, host: "" };
+      const map = loadSyncPasswordMap();
+      const prev = map[key] || { password: "", failCount: 0 };
+      const failCount = Number(prev.failCount || 0) + 1;
+      if (failCount >= SYNC_PW_MAX_FAIL) {
+        delete map[key];
+        saveSyncPasswordMap(map);
+        return { failCount, cleared: true, host: key };
+      }
+      map[key] = {
+        password: String(prev.password || ""),
+        failCount,
+        updatedAt: Date.now(),
+      };
+      saveSyncPasswordMap(map);
+      return { failCount, cleared: false, host: key };
+    }
+
+    function isSyncAuthFailure(errOrMsg, payload) {
+      const msg = String(
+        (payload && payload.error) || errOrMsg || ""
+      ).toLowerCase();
+      if (payload && payload.need_password) return true;
+      return /密码错误|无权登录|需要密码|permission denied|authentication failed|auth/i.test(
+        msg
+      );
+    }
+
+    function openSyncPasswordModal(purpose, message) {
+      syncPasswordPurpose = purpose || "sync";
+      if ($("librarySyncPasswordText")) {
+        $("librarySyncPasswordText").textContent =
+          message ||
+          "免密失败，请输入 SSH 密码（将记住该主机密码；连续错误 3 次需重新输入）。";
+      }
+      if ($("librarySyncPassword")) $("librarySyncPassword").value = "";
+      if ($("librarySyncPasswordYes")) {
+        $("librarySyncPasswordYes").textContent =
+          purpose === "browse" ? "连接并浏览" : "用密码同步";
+      }
+      if ($("librarySyncPasswordModal")) {
+        $("librarySyncPasswordModal").classList.add("show");
+      }
+      setTimeout(() => {
+        if ($("librarySyncPassword")) $("librarySyncPassword").focus();
+      }, 0);
+    }
+
+    async function trySavedPasswordThenPrompt(purpose, target, startPath) {
+      const saved = getSavedSyncPassword(target);
+      if (!saved) {
+        openSyncPasswordModal(
+          purpose,
+          `请输入 ${target} 的 SSH 密码（将自动保存；连续错误 ${SYNC_PW_MAX_FAIL} 次需重输）。`
+        );
+        return false;
+      }
+      setSyncBusy(
+        `使用已保存密码连接 ${target}（失败 ${saved.failCount}/${SYNC_PW_MAX_FAIL}）…`
+      );
+      try {
+        const probe = await postSyncApi("/api/sync/remote_probe", {
+          target,
+          password: saved.password,
+        });
+        if (probe.ok) {
+          rememberSyncPassword(target, saved.password);
+          remoteBrowsePassword = saved.password;
+          if (purpose === "browse") {
+            await browseRemoteFs(startPath);
+          } else if (purpose === "sync") {
+            await confirmLibrarySyncWithPassword(saved.password);
+          }
+          return true;
+        }
+        const note = noteSyncPasswordFailure(target);
+        remoteBrowsePassword = null;
+        if (note.cleared) {
+          openSyncPasswordModal(
+            purpose,
+            `已保存密码连续错误 ${SYNC_PW_MAX_FAIL} 次，已清除。请重新输入 ${target} 的密码。`
+          );
+        } else {
+          openSyncPasswordModal(
+            purpose,
+            `已保存密码不正确（${note.failCount}/${SYNC_PW_MAX_FAIL}）。请重新输入 ${target} 的密码。`
+          );
+        }
+        setSyncErr(
+          note.cleared
+            ? `密码连续错误 ${SYNC_PW_MAX_FAIL} 次，请重新输入`
+            : `已保存密码错误（${note.failCount}/${SYNC_PW_MAX_FAIL}）`
+        );
+        return false;
+      } catch (e) {
+        if (isSyncAuthFailure(e.message, e.payload)) {
+          const note = noteSyncPasswordFailure(target);
+          remoteBrowsePassword = null;
+          openSyncPasswordModal(
+            purpose,
+            note.cleared
+              ? `已保存密码连续错误 ${SYNC_PW_MAX_FAIL} 次，已清除。请重新输入 ${target} 的密码。`
+              : `已保存密码不正确（${note.failCount}/${SYNC_PW_MAX_FAIL}）。请重新输入 ${target} 的密码。`
+          );
+          setSyncErr(e.message || "密码认证失败");
+          return false;
+        }
+        setSyncErr(e.message || "SSH 连接失败");
+        return false;
+      }
+    }
+
+    function renderRemoteFs() {
+      const list = $("remoteFsList");
+      const crumb = $("remoteFsCrumb");
+      const statusEl = $("remoteFsStatus");
+      const selectBtn = $("remoteFsSelect");
+      if (!list) return;
+      list.innerHTML = "";
+      const path = remoteBrowse.path || "";
+      if (crumb) {
+        crumb.textContent = remoteBrowseTarget
+          ? `${remoteBrowseTarget}:${path || "~"}`
+          : path || "—";
+      }
+      if (statusEl) {
+        const n = (remoteBrowse.entries || []).length;
+        statusEl.textContent = path
+          ? `${n} 个子目录 · 选择后同步到此路径`
+          : "未连接";
+      }
+      if (selectBtn) selectBtn.disabled = !path;
+      (remoteBrowse.entries || []).forEach((ent) => {
+        const li = document.createElement("li");
+        li.className = "fs-entry dir";
+        li.textContent = (ent.name || "") + "/";
+        li.title = ent.path || "";
+        li.onclick = () => browseRemoteFs(ent.path);
+        list.appendChild(li);
+      });
+      if (!(remoteBrowse.entries || []).length) {
+        const li = document.createElement("li");
+        li.className = "fs-empty";
+        li.textContent = "（无子目录）";
+        list.appendChild(li);
+      }
+    }
+
+    async function browseRemoteFs(path) {
+      if (!remoteBrowseTarget) {
+        setMsg("请先填写 user@ip");
+        return;
+      }
+      setSyncBusy(`正在列出远端目录 ${remoteBrowseTarget}:${path || "~"} …`);
+      if ($("remoteFsStatus")) $("remoteFsStatus").textContent = "加载中…";
+      if ($("remoteFsModal")) $("remoteFsModal").classList.add("show");
+      try {
+        const body = {
+          target: remoteBrowseTarget,
+          path: path == null ? undefined : path,
+        };
+        if (remoteBrowsePassword) body.password = remoteBrowsePassword;
+        const data = await postSyncApi("/api/sync/remote_ls", body);
+        remoteBrowse = {
+          path: data.path || "",
+          parent: data.parent || null,
+          entries: Array.isArray(data.entries) ? data.entries : [],
+        };
+        renderRemoteFs();
+        setSyncBusy(`远端目录: ${remoteBrowseTarget}:${remoteBrowse.path}`);
+        setLibrarySyncStatus(
+          `已打开 ${remoteBrowseTarget}:${remoteBrowse.path}`,
+          "busy"
+        );
+      } catch (e) {
+        const payload = e.payload || {};
+        if (isSyncAuthFailure(e.message, payload)) {
+          if (remoteBrowsePassword) {
+            const note = noteSyncPasswordFailure(remoteBrowseTarget);
+            remoteBrowsePassword = null;
+            openSyncPasswordModal(
+              "browse",
+              note.cleared
+                ? `密码连续错误 ${SYNC_PW_MAX_FAIL} 次，已清除。请重新输入 ${remoteBrowseTarget} 的密码。`
+                : `密码不正确（${note.failCount}/${SYNC_PW_MAX_FAIL}）。请重新输入 ${remoteBrowseTarget} 的密码。`
+            );
+          } else {
+            await trySavedPasswordThenPrompt(
+              "browse",
+              remoteBrowseTarget,
+              path
+            );
+          }
+          return;
+        }
+        setSyncErr(e.message || "远端浏览失败");
+      }
+    }
+
+    async function startRemoteBrowse() {
+      const raw = ($("librarySyncDest") && $("librarySyncDest").value.trim()) || "";
+      if (!isValidSyncHost(raw)) {
+        setSyncErr("请先填写 user@ip（可选 :/起始路径）");
+        return;
+      }
+      if ($("btnLibrarySyncBrowse")) {
+        $("btnLibrarySyncBrowse").disabled = true;
+        $("btnLibrarySyncBrowse").textContent = "连接中…";
+      }
+      remoteBrowseTarget = parseSyncHostTarget(raw);
+      const startPath = parseSyncStartPath(raw);
+      remoteBrowsePassword = null;
+      setSyncBusy(`探测 SSH: ${remoteBrowseTarget}…`);
+      try {
+        const probe = await postSyncApi("/api/sync/remote_probe", {
+          target: remoteBrowseTarget,
+        });
+        if (!probe.ok) {
+          setSyncErr(probe.error || "SSH 探测失败");
+          return;
+        }
+        if (probe.need_password) {
+          if (probe.sshpass_missing) {
+            setSyncErr(
+              probe.error ||
+                "免密失败且未安装 sshpass；请安装 sshpass 或配置 SSH 公钥"
+            );
+            return;
+          }
+          setSyncBusy(`免密失败，尝试已保存密码 / 等待输入…`);
+          await trySavedPasswordThenPrompt(
+            "browse",
+            remoteBrowseTarget,
+            startPath
+          );
+          return;
+        }
+        await browseRemoteFs(startPath);
+      } catch (e) {
+        setSyncErr(e.message || "SSH 探测失败");
+      } finally {
+        if ($("btnLibrarySyncBrowse")) {
+          $("btnLibrarySyncBrowse").disabled = false;
+          $("btnLibrarySyncBrowse").textContent = "浏览远端…";
+        }
+      }
+    }
+
+    function selectRemoteFsDir() {
+      if (!remoteBrowseTarget || !remoteBrowse.path) {
+        setMsg("尚未选择远端目录");
+        return;
+      }
+      const dest = `${remoteBrowseTarget}:${remoteBrowse.path}`;
+      if ($("librarySyncDest")) $("librarySyncDest").value = dest;
+      rememberSyncDest(dest);
+      clearRemoteBrowseSession();
+      setMsg(`已选择远端目录: ${dest}`);
+    }
+
+    async function waitSyncProbeResult(prevTs, timeoutMs) {
+      const t0 = Date.now();
+      const deadline = t0 + (timeoutMs || 20000);
+      while (Date.now() < deadline) {
+        await pollStatus(false);
+        const st = status && status.sync_remote_status;
+        if (st && typeof st === "object") {
+          const ts = Number(st.ts || 0);
+          if (ts > prevTs) return st;
+        }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      throw new Error("SSH 探测超时");
+    }
+
+    async function confirmLibrarySyncWithPassword(password) {
+      if (!pendingLibrarySync) return;
+      const dest = pendingLibrarySync.dest;
+      const host = syncHostKey(dest);
+      const payload = {
+        paths: pendingLibrarySync.paths,
+        dest,
+        delete: !!pendingLibrarySync.delete,
+      };
+      if (password != null && String(password) !== "") {
+        payload.password = String(password);
+      }
+      rememberSyncDest(dest);
+      try {
+        // Verify password first so we can count failures before starting rsync.
+        if (password != null && String(password) !== "") {
+          const probe = await postSyncApi("/api/sync/remote_probe", {
+            target: host,
+            password: String(password),
+          });
+          if (!probe.ok) {
+            const note = noteSyncPasswordFailure(host);
+            if (note.cleared) {
+              openSyncPasswordModal(
+                "sync",
+                `密码连续错误 ${SYNC_PW_MAX_FAIL} 次，已清除。请重新输入 ${host} 的密码。`
+              );
+            } else {
+              openSyncPasswordModal(
+                "sync",
+                `密码不正确（${note.failCount}/${SYNC_PW_MAX_FAIL}）。请重新输入 ${host} 的密码。`
+              );
+            }
+            setSyncErr(probe.error || "密码认证失败");
+            return;
+          }
+          rememberSyncPassword(host, password);
+        }
+        await postCmd("sync_remote_confirm", payload);
+        setSyncBusy(`开始同步 → ${dest}`);
+        pendingLibrarySync = null;
+      } catch (e) {
+        setSyncErr(e.message);
+      } finally {
+        if ($("librarySyncPassword")) $("librarySyncPassword").value = "";
+      }
+    }
+
+    async function startLibrarySyncAfterConfirm() {
+      if (!pendingLibrarySync) return;
+      closeLibrarySyncModals();
+      if ($("librarySyncModal")) $("librarySyncModal").classList.remove("show");
+      const prevTs = lastSyncProbeTs;
+      const dest = pendingLibrarySync.dest;
+      const host = syncHostKey(dest);
+      setSyncBusy(`探测 SSH: ${dest}…`);
+      try {
+        await postCmd("sync_remote_probe", {
+          paths: pendingLibrarySync.paths,
+          dest,
+        });
+        const st = await waitSyncProbeResult(prevTs, 25000);
+        if (st.ts) lastSyncProbeTs = Number(st.ts) || lastSyncProbeTs;
+        if (!st.ok) {
+          setSyncErr(st.error || "SSH 探测失败");
+          pendingLibrarySync = null;
+          return;
+        }
+        if (st.need_password) {
+          if (st.sshpass_missing) {
+            setSyncErr(
+              st.error ||
+                "免密失败且未安装 sshpass；请安装 sshpass 或配置 SSH 公钥"
+            );
+            pendingLibrarySync = null;
+            return;
+          }
+          setSyncBusy(`免密失败，尝试已保存密码 / 等待输入…`);
+          await trySavedPasswordThenPrompt("sync", host, null);
+          return;
+        }
+        await confirmLibrarySyncWithPassword(null);
+      } catch (e) {
+        setSyncErr(e.message);
+        pendingLibrarySync = null;
+      }
     }
 
     async function openPathSmart(path) {
@@ -3323,7 +4344,7 @@
         return;
       }
       if (libraryPageOpen && !hubMode) {
-        $("headerHint").textContent = "库管理 · 下一层数据集 · 仅可信局域网";
+        $("headerHint").textContent = "库管理 · Esc 返回数据管理 · 仅可信局域网";
         $("pageTitle").textContent = "ARX5 Dataset Library";
         document.title = "ARX5 Dataset Library";
         return;
@@ -3532,7 +4553,6 @@
     function syncMergeLerobotUi(s) {
       const busy = !!(s && (s.mode === "DELETING" || s.deleting));
       const canOpen = !!(s && s.viewer_only) && !hubMode;
-      if ($("btnOpenMergePage")) $("btnOpenMergePage").disabled = !canOpen || busy;
       if ($("btnOpenLibraryPage")) $("btnOpenLibraryPage").disabled = !canOpen || busy;
       [
         "btnMergeLerobot",
@@ -4157,8 +5177,23 @@
       $("liveN").textContent = s.live_n ?? 0;
       $("poseBox").innerHTML = formatPoseHtml(s);
       if ($("camLagBox")) $("camLagBox").innerHTML = formatCamLagHtml(s);
-      if (s.message) setMsg(s.message);
+      if (s.message) {
+        // Don't let hub status clobber a recent sync/browse error.
+        if (Date.now() < localMsgStickyUntil) {
+          /* keep sticky */
+        } else {
+          setMsg(s.message);
+        }
+      }
       setDeleteProgress(s);
+      if (
+        s.sync_remote_status &&
+        typeof s.sync_remote_status === "object" &&
+        s.sync_remote_status.ts
+      ) {
+        const ts = Number(s.sync_remote_status.ts) || 0;
+        if (ts > lastSyncProbeTs) lastSyncProbeTs = ts;
+      }
       syncDatasetPathLabel(s);
       syncDaggerSplitUi(s);
       syncConvertLerobotUi(s);
@@ -5395,9 +6430,6 @@
       };
     }
 
-    if ($("btnOpenMergePage")) {
-      $("btnOpenMergePage").onclick = () => showMergePage();
-    }
     if ($("btnOpenLibraryPage")) {
       $("btnOpenLibraryPage").onclick = () => showLibraryPage();
     }
@@ -5413,12 +6445,12 @@
     }
     if ($("btnLibraryBack")) {
       $("btnLibraryBack").onclick = () => {
-        if (status.mode === "DELETING" || status.deleting) {
-          setMsg("正在处理数据，请稍候…");
-          return;
-        }
-        hideLibraryPage();
-        applyUiMode(status.mode || "VIEW", status);
+        exitLibraryToViewer();
+      };
+    }
+    if ($("btnHeaderLibraryBack")) {
+      $("btnHeaderLibraryBack").onclick = () => {
+        exitLibraryToViewer();
       };
     }
     if ($("btnLibraryOpenRoot")) {
@@ -5482,6 +6514,19 @@
         showMergePage();
       };
     }
+    if ($("btnLibraryConvertSelected")) {
+      $("btnLibraryConvertSelected").onclick = () => {
+        const selected = librarySelectedRows();
+        if (
+          !selected.length ||
+          !selected.every((d) => String(d.dataset_format) === "zarr")
+        ) {
+          setMsg("请选择至少 1 个 zarr 数据集再转换");
+          return;
+        }
+        openLibraryConvert(selected.map((d) => d.path));
+      };
+    }
     if ($("btnLibraryDeleteSelected")) {
       $("btnLibraryDeleteSelected").onclick = () => {
         const paths = librarySelectedRows().map((d) => d.path);
@@ -5491,6 +6536,184 @@
         }
         openLibraryDelete(paths);
       };
+    }
+    initSyncRemoteDestInput();
+    if ($("btnLibrarySyncSelected")) {
+      $("btnLibrarySyncSelected").onclick = () => {
+        const paths = librarySelectedRows().map((d) => d.path);
+        if (!paths.length) {
+          setMsg("请先勾选要同步的数据集");
+          return;
+        }
+        openLibrarySync(paths);
+      };
+    }
+    if ($("btnLibrarySyncBrowse")) {
+      $("btnLibrarySyncBrowse").onclick = () => {
+        startRemoteBrowse().catch((e) => setMsg(e.message));
+      };
+    }
+    if ($("btnLibrarySyncSaveDest")) {
+      $("btnLibrarySyncSaveDest").onclick = () => saveCurrentSyncDest();
+    }
+    if ($("btnLibrarySyncRemoveDest")) {
+      $("btnLibrarySyncRemoveDest").onclick = () => removeSelectedSyncDest();
+    }
+    if ($("librarySyncSaved")) {
+      $("librarySyncSaved").addEventListener("change", () => {
+        const v = $("librarySyncSaved").value;
+        if (v && $("librarySyncDest")) $("librarySyncDest").value = v;
+      });
+    }
+    if ($("librarySyncDest")) {
+      $("librarySyncDest").addEventListener("change", () => {
+        const v = $("librarySyncDest").value.trim();
+        if (v) rememberSyncDest(v);
+      });
+      const onSyncDestEnter = (ev) => {
+        if (ev.key !== "Enter") return;
+        // datalist 选中时也可能触发 Enter；统一开始浏览
+        ev.preventDefault();
+        ev.stopPropagation();
+        const v = $("librarySyncDest").value.trim();
+        if (!v) {
+          setMsg("请先填写 user@ip");
+          return;
+        }
+        rememberSyncDest(v);
+        startRemoteBrowse().catch((e) => setMsg(e.message));
+      };
+      $("librarySyncDest").addEventListener("keydown", onSyncDestEnter);
+      // 部分浏览器 datalist 会吃掉 keydown Enter，补一层 keyup
+      $("librarySyncDest").addEventListener("keyup", (ev) => {
+        if (ev.key !== "Enter") return;
+        // 若 keydown 已处理过，这里再触发一次也无妨（startRemoteBrowse 可重入）
+        onSyncDestEnter(ev);
+      });
+    }
+    if ($("librarySyncNo")) {
+      $("librarySyncNo").onclick = () => {
+        closeLibrarySyncModals();
+        pendingLibrarySync = null;
+      };
+    }
+    if ($("librarySyncYes")) {
+      $("librarySyncYes").onclick = () => {
+        startLibrarySyncAfterConfirm().catch((e) => setMsg(e.message));
+      };
+    }
+    if ($("librarySyncPasswordNo")) {
+      $("librarySyncPasswordNo").onclick = () => {
+        const purpose = syncPasswordPurpose;
+        closeLibrarySyncModals();
+        if (purpose === "browse") {
+          clearRemoteBrowseSession();
+        } else {
+          pendingLibrarySync = null;
+        }
+      };
+    }
+    if ($("librarySyncPasswordYes")) {
+      $("librarySyncPasswordYes").onclick = async () => {
+        const pw =
+          ($("librarySyncPassword") && $("librarySyncPassword").value) || "";
+        if (!pw) {
+          setMsg("请输入 SSH 密码");
+          return;
+        }
+        const purpose = syncPasswordPurpose || "sync";
+        if ($("librarySyncPasswordModal")) {
+          $("librarySyncPasswordModal").classList.remove("show");
+        }
+        if ($("librarySyncPassword")) $("librarySyncPassword").value = "";
+        syncPasswordPurpose = null;
+        if (purpose === "browse") {
+          const raw =
+            ($("librarySyncDest") && $("librarySyncDest").value.trim()) || "";
+          const startPath = parseSyncStartPath(raw);
+          const target =
+            remoteBrowseTarget || parseSyncHostTarget(raw);
+          remoteBrowseTarget = target;
+          remoteBrowsePassword = pw;
+          setSyncBusy(`正在用密码连接 ${target}…`);
+          if ($("btnLibrarySyncBrowse")) {
+            $("btnLibrarySyncBrowse").disabled = true;
+            $("btnLibrarySyncBrowse").textContent = "连接中…";
+          }
+          try {
+            const probe = await postSyncApi("/api/sync/remote_probe", {
+              target,
+              password: pw,
+            });
+            if (!probe.ok) {
+              remoteBrowsePassword = null;
+              const note = noteSyncPasswordFailure(target);
+              openSyncPasswordModal(
+                "browse",
+                note.cleared
+                  ? `密码连续错误 ${SYNC_PW_MAX_FAIL} 次，已清除。请重新输入 ${target} 的密码。`
+                  : `密码不正确（${note.failCount}/${SYNC_PW_MAX_FAIL}）。请重新输入 ${target} 的密码。`
+              );
+              setSyncErr(probe.error || "密码认证失败");
+              return;
+            }
+            rememberSyncPassword(target, pw);
+            setSyncBusy(`已连通 ${target}，正在列出目录…`);
+            await browseRemoteFs(startPath);
+          } catch (e) {
+            remoteBrowsePassword = null;
+            if (isSyncAuthFailure(e.message, e.payload)) {
+              const note = noteSyncPasswordFailure(target);
+              openSyncPasswordModal(
+                "browse",
+                note.cleared
+                  ? `密码连续错误 ${SYNC_PW_MAX_FAIL} 次，已清除。请重新输入 ${target} 的密码。`
+                  : `密码不正确（${note.failCount}/${SYNC_PW_MAX_FAIL}）。请重新输入 ${target} 的密码。`
+              );
+            }
+            setSyncErr(e.message || "连接失败");
+          } finally {
+            if ($("btnLibrarySyncBrowse")) {
+              $("btnLibrarySyncBrowse").disabled = false;
+              $("btnLibrarySyncBrowse").textContent = "浏览远端…";
+            }
+          }
+          return;
+        }
+        setSyncBusy("正在用密码开始同步…");
+        await confirmLibrarySyncWithPassword(pw);
+      };
+    }
+    if ($("librarySyncPassword")) {
+      let _pwEnterLock = false;
+      $("librarySyncPassword").addEventListener("keydown", (ev) => {
+        if (ev.key !== "Enter") return;
+        ev.preventDefault();
+        if (_pwEnterLock) return;
+        _pwEnterLock = true;
+        setTimeout(() => {
+          _pwEnterLock = false;
+        }, 800);
+        if ($("librarySyncPasswordYes")) $("librarySyncPasswordYes").click();
+      });
+    }
+    if ($("remoteFsUp")) {
+      $("remoteFsUp").onclick = () => {
+        if (remoteBrowse.parent) browseRemoteFs(remoteBrowse.parent);
+        else setMsg("已到根目录");
+      };
+    }
+    if ($("remoteFsHome")) {
+      $("remoteFsHome").onclick = () => browseRemoteFs("~");
+    }
+    if ($("remoteFsRoot")) {
+      $("remoteFsRoot").onclick = () => browseRemoteFs("/");
+    }
+    if ($("remoteFsSelect")) {
+      $("remoteFsSelect").onclick = () => selectRemoteFsDir();
+    }
+    if ($("remoteFsCancel")) {
+      $("remoteFsCancel").onclick = () => clearRemoteBrowseSession();
     }
     if ($("libraryRenameNo")) {
       $("libraryRenameNo").onclick = () => {
@@ -5591,6 +6814,56 @@
           setMsg(e.message);
         }
         pendingLibraryDelete = null;
+      };
+    }
+    if ($("libraryConvertNo")) {
+      $("libraryConvertNo").onclick = () => {
+        if ($("libraryConvertModal")) $("libraryConvertModal").classList.remove("show");
+        pendingLibraryConvert = null;
+      };
+    }
+    if ($("libraryConvertYes")) {
+      $("libraryConvertYes").onclick = async () => {
+        if (!pendingLibraryConvert || !pendingLibraryConvert.paths.length) {
+          if ($("libraryConvertModal")) $("libraryConvertModal").classList.remove("show");
+          return;
+        }
+        if (status.mode === "DELETING" || status.deleting) {
+          if ($("libraryConvertModal")) $("libraryConvertModal").classList.remove("show");
+          setMsg("正在处理数据，请稍候…");
+          return;
+        }
+        const prompt =
+          ($("libraryConvertPrompt") && $("libraryConvertPrompt").value.trim()) ||
+          pendingLibraryConvert.prompt ||
+          "Flatten and fold the cloth.";
+        const robotType =
+          ($("libraryConvertRobotType") &&
+            $("libraryConvertRobotType").value.trim()) ||
+          pendingLibraryConvert.robot_type ||
+          "agilex";
+        let fps = pendingLibraryConvert.fps || 20;
+        if ($("libraryConvertFps")) {
+          fps = Number($("libraryConvertFps").value) || fps;
+        }
+        const overwrite = !!(
+          $("libraryConvertOverwrite") && $("libraryConvertOverwrite").checked
+        );
+        const payload = {
+          paths: pendingLibraryConvert.paths.slice(),
+          fps,
+          prompt,
+          robot_type: robotType,
+          overwrite,
+        };
+        if ($("libraryConvertModal")) $("libraryConvertModal").classList.remove("show");
+        try {
+          await postCmd("convert_batch_confirm", payload);
+          setMsg(`正在转换 ${payload.paths.length} 个 zarr → LeRobot…`);
+        } catch (e) {
+          setMsg(e.message);
+        }
+        pendingLibraryConvert = null;
       };
     }
 
@@ -6120,6 +7393,77 @@
       if (k === "," && (ev.ctrlKey || ev.metaKey)) {
         ev.preventDefault();
         openSettings();
+        return;
+      }
+
+      const librarySyncPwOpen =
+        $("librarySyncPasswordModal") &&
+        $("librarySyncPasswordModal").classList.contains("show");
+      const librarySyncConfirmOpen =
+        $("librarySyncModal") && $("librarySyncModal").classList.contains("show");
+      const libraryDeleteOpen =
+        $("libraryDeleteModal") &&
+        $("libraryDeleteModal").classList.contains("show");
+      const libraryConvertOpen =
+        $("libraryConvertModal") &&
+        $("libraryConvertModal").classList.contains("show");
+      const libraryRenameOpen =
+        $("libraryRenameModal") &&
+        $("libraryRenameModal").classList.contains("show");
+      const libraryMoveOpen =
+        $("libraryMoveModal") && $("libraryMoveModal").classList.contains("show");
+      const remoteFsOpen =
+        $("remoteFsModal") && $("remoteFsModal").classList.contains("show");
+      const mergeModalOpen =
+        $("mergeLerobotModal") &&
+        $("mergeLerobotModal").classList.contains("show");
+
+      // 库管理页：Esc 优先关弹窗，否则返回数据管理（输入框内也生效）
+      if (libraryPageOpen && k === "escape") {
+        ev.preventDefault();
+        if (librarySyncPwOpen) {
+          if ($("librarySyncPasswordNo")) $("librarySyncPasswordNo").click();
+          else if ($("librarySyncPasswordModal")) {
+            $("librarySyncPasswordModal").classList.remove("show");
+          }
+          return;
+        }
+        if (librarySyncConfirmOpen) {
+          if ($("librarySyncNo")) $("librarySyncNo").click();
+          return;
+        }
+        if (libraryConvertOpen) {
+          if ($("libraryConvertNo")) $("libraryConvertNo").click();
+          return;
+        }
+        if (libraryDeleteOpen) {
+          if ($("libraryDeleteNo")) $("libraryDeleteNo").click();
+          return;
+        }
+        if (libraryRenameOpen) {
+          if ($("libraryRenameNo")) $("libraryRenameNo").click();
+          return;
+        }
+        if (libraryMoveOpen) {
+          if ($("libraryMoveNo")) $("libraryMoveNo").click();
+          return;
+        }
+        if (remoteFsOpen) {
+          if ($("remoteFsCancel")) $("remoteFsCancel").click();
+          else if ($("remoteFsModal")) $("remoteFsModal").classList.remove("show");
+          return;
+        }
+        if (mergeModalOpen) {
+          if ($("mergeLerobotNo")) $("mergeLerobotNo").click();
+          return;
+        }
+        const fsOpenEarly =
+          $("fsModal") && $("fsModal").classList.contains("show");
+        if (fsOpenEarly) {
+          closeFsModal();
+          return;
+        }
+        exitLibraryToViewer();
         return;
       }
 
