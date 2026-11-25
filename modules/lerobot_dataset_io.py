@@ -152,10 +152,120 @@ def episode_length(root: Path, episode_index: int, info: Optional[dict] = None) 
     return len(pq.read_table(pq_path, columns=["frame_index"]))
 
 
+def load_tasks(root: Path) -> list[dict]:
+    """Load ``meta/tasks.jsonl`` rows: ``{task_index, task}``."""
+    path = Path(root) / "meta" / "tasks.jsonl"
+    rows: list[dict] = []
+    if not path.is_file():
+        return rows
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        rows.append(row)
+    return rows
+
+
+def load_episode_meta_rows(root: Path) -> dict[int, dict]:
+    """Map ``episode_index`` → row from ``meta/episodes.jsonl``."""
+    path = Path(root) / "meta" / "episodes.jsonl"
+    out: dict[int, dict] = {}
+    if not path.is_file():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+            out[int(row["episode_index"])] = row
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _tasks_index_map(root: Path) -> dict[int, str]:
+    mapping: dict[int, str] = {}
+    for row in load_tasks(root):
+        try:
+            idx = int(row.get("task_index", 0))
+        except (TypeError, ValueError):
+            continue
+        text = str(row.get("task") or "").strip()
+        if text:
+            mapping[idx] = text
+    return mapping
+
+
+def episode_task_texts(
+    root: Path,
+    episode_id: int,
+    *,
+    ep_row: Optional[dict] = None,
+    tasks_by_idx: Optional[dict[int, str]] = None,
+) -> list[str]:
+    """
+    Resolve task / prompt strings for one episode.
+
+    Prefer ``episodes.jsonl`` ``tasks`` list; fall back to parquet ``task_index``
+    looked up in ``tasks.jsonl``.
+    """
+    root = Path(root)
+    eid = int(episode_id)
+    row = ep_row
+    if row is None:
+        row = load_episode_meta_rows(root).get(eid)
+    texts: list[str] = []
+    if isinstance(row, dict):
+        raw = row.get("tasks")
+        if isinstance(raw, list):
+            texts = [str(t).strip() for t in raw if str(t).strip()]
+        elif isinstance(raw, str) and raw.strip():
+            texts = [raw.strip()]
+    if texts:
+        return texts
+
+    mapping = tasks_by_idx if tasks_by_idx is not None else _tasks_index_map(root)
+    task_index: Optional[int] = None
+    if isinstance(row, dict) and row.get("task_index") is not None:
+        try:
+            task_index = int(row["task_index"])
+        except (TypeError, ValueError):
+            task_index = None
+    if task_index is None:
+        try:
+            info = load_info(root)
+            pq_path = episode_parquet_path(root, eid, info)
+            if pq_path.is_file():
+                _pa, pq = _require_pyarrow()
+                table = pq.read_table(pq_path, columns=["task_index"])
+                if table.num_rows > 0 and "task_index" in table.column_names:
+                    task_index = int(table.column("task_index")[0].as_py())
+        except Exception:
+            task_index = None
+    if task_index is not None and task_index in mapping:
+        return [mapping[task_index]]
+    if task_index is not None and mapping:
+        # single-task datasets often only define index 0
+        if 0 in mapping:
+            return [mapping[0]]
+    if len(mapping) == 1:
+        return [next(iter(mapping.values()))]
+    return []
+
+
 def list_lerobot_episodes(root: Path) -> list[dict]:
     root = Path(root)
     info = load_info(root)
     fps = float(info.get("fps") or 20.0)
+    ep_rows = load_episode_meta_rows(root)
+    tasks_by_idx = _tasks_index_map(root)
     out: list[dict] = []
     for eid in list_episode_ids(root, info):
         n_steps = episode_length(root, eid, info)
@@ -163,12 +273,19 @@ def list_lerobot_episodes(root: Path) -> list[dict]:
             episode_video_path(root, eid, k, info).is_file() for k in LEROBOT_CAM_KEYS
         )
         duration = (n_steps - 1) / fps if n_steps >= 2 and fps > 1e-6 else None
+        tasks = episode_task_texts(
+            root,
+            eid,
+            ep_row=ep_rows.get(eid),
+            tasks_by_idx=tasks_by_idx,
+        )
         out.append(
             {
                 "id": int(eid),
                 "n_steps": int(n_steps),
                 "duration": duration,
                 "has_video": bool(has_video),
+                "tasks": tasks,
             }
         )
     return out
@@ -204,6 +321,7 @@ def episode_series_lerobot(
     _pa, pq = _require_pyarrow()
     table = pq.read_table(pq_path)
     n = table.num_rows
+    tasks = episode_task_texts(root, episode_id)
     if n <= 0:
         return {
             "episode_id": int(episode_id),
@@ -216,6 +334,7 @@ def episode_series_lerobot(
             "grip": [],
             "robots": [],
             "action": [],
+            "tasks": tasks,
         }
 
     state = _fixed_list_to_np(table["observation.state"])
@@ -272,6 +391,127 @@ def episode_series_lerobot(
         "grip": r0["grip"],
         "robots": robots_out,
         "action": action[idx].tolist(),
+        "tasks": tasks,
+    }
+
+
+def _pa_type_is_text(pa_type) -> bool:
+    try:
+        import pyarrow as pa
+    except ImportError:  # pragma: no cover
+        return False
+    if pa.types.is_string(pa_type) or pa.types.is_large_string(pa_type):
+        return True
+    if pa.types.is_dictionary(pa_type):
+        return _pa_type_is_text(pa_type.value_type)
+    return False
+
+
+def _raw_sample_value(val) -> str:
+    """Serialize a parquet cell as original text (no truncation / ellipsis)."""
+    if val is None:
+        return "null"
+    if isinstance(val, (bytes, bytearray)):
+        return f"<bytes {len(val)}>"
+    if isinstance(val, str):
+        return val
+    if isinstance(val, (np.floating, float)):
+        # Keep JSON-compatible number text without forcing scientific truncation.
+        return json.dumps(float(val), ensure_ascii=False)
+    if isinstance(val, (np.integer, int)):
+        return str(int(val))
+    if isinstance(val, (np.bool_, bool)):
+        return "true" if bool(val) else "false"
+    if isinstance(val, (list, tuple)):
+        try:
+            return json.dumps(list(val), ensure_ascii=False)
+        except TypeError:
+            return str(list(val))
+    try:
+        return json.dumps(val, ensure_ascii=False)
+    except TypeError:
+        return str(val)
+
+
+def episode_parquet_fields(
+    root: Path, episode_id: int, *, sample_rows: int = 3
+) -> dict:
+    """
+    Schema + raw sample values for one episode parquet.
+
+    Returns ``{episode_id, path, n_rows, tasks, columns:[{name,dtype,shape,is_text,samples}]}``.
+    Samples are full original cell text (no truncation).
+    """
+    root = Path(root)
+    eid = int(episode_id)
+    info = load_info(root)
+    pq_path = episode_parquet_path(root, eid, info)
+    if not pq_path.is_file():
+        raise IndexError(f"episode {eid} parquet missing: {pq_path}")
+
+    pa, pq = _require_pyarrow()
+    sample_rows = max(1, min(int(sample_rows), 32))
+    # Read a small prefix for samples; schema from file metadata when possible.
+    pf = pq.ParquetFile(str(pq_path))
+    schema = pf.schema_arrow
+    n_rows = int(pf.metadata.num_rows) if pf.metadata is not None else 0
+    table = pq.read_table(pq_path)
+    if table.num_rows > 0:
+        n_rows = int(table.num_rows)
+    take_n = min(sample_rows, n_rows) if n_rows > 0 else 0
+    sample_table = table.slice(0, take_n) if take_n else table.slice(0, 0)
+
+    columns: list[dict] = []
+    for field in schema:
+        name = field.name
+        pa_type = field.type
+        is_text = _pa_type_is_text(pa_type)
+        shape = None
+        dtype_str = str(pa_type)
+        if pa.types.is_fixed_size_list(pa_type):
+            shape = [int(pa_type.list_size)]
+            dtype_str = f"{pa_type.value_type}[{pa_type.list_size}]"
+        elif pa.types.is_list(pa_type) or pa.types.is_large_list(pa_type):
+            dtype_str = f"list<{pa_type.value_type}>"
+
+        samples: list[str] = []
+        if take_n > 0 and name in sample_table.column_names:
+            col = sample_table.column(name)
+            seen: set[str] = set()
+            for j in range(col.length()):
+                try:
+                    val = col[j].as_py()
+                except Exception:
+                    continue
+                s = _raw_sample_value(val)
+                if is_text:
+                    if s in seen:
+                        continue
+                    seen.add(s)
+                    samples.append(s)
+                    if len(samples) >= sample_rows:
+                        break
+                else:
+                    samples.append(s)
+                    if len(samples) >= min(sample_rows, 3):
+                        break
+
+        columns.append(
+            {
+                "name": name,
+                "dtype": dtype_str,
+                "shape": shape,
+                "is_text": bool(is_text),
+                "samples": samples,
+            }
+        )
+
+    return {
+        "episode_id": eid,
+        "path": str(pq_path),
+        "n_rows": n_rows,
+        "tasks": episode_task_texts(root, eid),
+        "columns": columns,
     }
 
 

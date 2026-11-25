@@ -735,6 +735,109 @@ def episode_series(env, episode_id: int, *, max_points: int = 2000) -> dict:
     )
 
 
+def _zarr_cell_raw(val) -> str:
+    """Raw-ish sample for one zarr frame cell (images → shape tag)."""
+    from modules.lerobot_dataset_io import _raw_sample_value
+
+    arr = np.asarray(val)
+    if arr.ndim >= 2 and arr.size > 64:
+        return f"<{arr.dtype.name} shape={list(arr.shape)}>"
+    if arr.ndim == 0:
+        return _raw_sample_value(arr.item())
+    try:
+        return _raw_sample_value(arr.tolist())
+    except Exception:
+        return f"<{arr.dtype.name} shape={list(arr.shape)}>"
+
+
+def episode_zarr_fields(env, episode_id: int, *, sample_rows: int = 3) -> dict:
+    """List zarr replay_buffer keys + per-episode shape / raw samples."""
+    rb = env.replay_buffer
+    eid = int(episode_id)
+    n_eps = int(rb.n_episodes)
+    if eid < 0 or eid >= n_eps:
+        raise IndexError(f"episode {eid} out of range (0..{n_eps - 1})")
+    sl = rb.get_episode_slice(eid)
+    n_rows = int(sl.stop - sl.start)
+    sample_rows = max(1, min(int(sample_rows), 32))
+    take_n = min(sample_rows, n_rows) if n_rows > 0 else 0
+
+    columns: list[dict] = []
+    keys = sorted(str(k) for k in getattr(rb, "data", {}).keys())
+    for name in keys:
+        try:
+            raw = rb.data[name]
+            # Prefer episode slice when first dim is time.
+            try:
+                chunk = np.asarray(raw[sl])
+            except Exception:
+                chunk = np.asarray(raw)
+        except Exception as exc:  # noqa: BLE001
+            columns.append(
+                {
+                    "name": name,
+                    "dtype": f"<error: {exc}>",
+                    "shape": None,
+                    "is_text": False,
+                    "samples": [],
+                }
+            )
+            continue
+
+        shape = list(chunk.shape[1:]) if chunk.ndim >= 1 else []
+        dtype_str = str(chunk.dtype)
+        if shape:
+            dtype_str = f"{chunk.dtype}{shape}"
+        is_text = chunk.dtype.kind in ("U", "S", "O")
+        samples: list[str] = []
+        for i in range(take_n):
+            try:
+                cell = chunk[i]
+            except Exception:
+                break
+            samples.append(_zarr_cell_raw(cell))
+            if not is_text and len(samples) >= min(3, sample_rows):
+                break
+            if is_text and len(samples) >= sample_rows:
+                break
+
+        columns.append(
+            {
+                "name": name,
+                "dtype": dtype_str,
+                "shape": shape or None,
+                "is_text": bool(is_text),
+                "samples": samples,
+            }
+        )
+
+    zpath = Path(env.output_dir) / "replay_buffer.zarr"
+    return {
+        "ok": True,
+        "source": "zarr",
+        "episode_id": eid,
+        "path": str(zpath if zpath.exists() else env.output_dir),
+        "n_rows": n_rows,
+        "tasks": [],
+        "columns": columns,
+    }
+
+
+def episode_fields(env, episode_id: int, *, sample_rows: int = 3) -> dict:
+    """Episode field overview: LeRobot parquet or zarr buffer keys (+ tasks)."""
+    fmt = getattr(env, "dataset_format", "zarr")
+    if fmt == "lerobot":
+        from modules.lerobot_dataset_io import episode_parquet_fields
+
+        data = episode_parquet_fields(
+            Path(env.output_dir), int(episode_id), sample_rows=sample_rows
+        )
+        data["ok"] = True
+        data["source"] = "lerobot"
+        return data
+    return episode_zarr_fields(env, int(episode_id), sample_rows=sample_rows)
+
+
 def _open_episode_video(env, episode_id: int) -> Optional[cv2.VideoCapture]:
     vdir = Path(env.video_dir) / str(episode_id)
     if not vdir.is_dir():
@@ -1076,7 +1179,7 @@ class CollectWebServer:
                         self._send(200, jpeg, "image/jpeg")
                         return
 
-                    # /api/episodes/{id}/series
+                    # /api/episodes/{id}/series | fields | frame
                     parts = path.strip("/").split("/")
                     if (
                         len(parts) == 4
@@ -1098,6 +1201,33 @@ class CollectWebServer:
                             self._send_json(200, data)
                         except IndexError as exc:
                             self._send_json(404, {"error": str(exc)})
+                        except Exception as exc:  # noqa: BLE001
+                            self._send_json(500, {"error": str(exc)})
+                        return
+
+                    if (
+                        len(parts) == 4
+                        and parts[0] == "api"
+                        and parts[1] == "episodes"
+                        and parts[3] == "fields"
+                    ):
+                        if state.env is None:
+                            self._send_json(503, {"error": "env not ready"})
+                            return
+                        eid = int(parts[2])
+                        try:
+                            sample_rows = int(qs.get("sample_rows", ["3"])[0])
+                        except (TypeError, ValueError):
+                            sample_rows = 3
+                        try:
+                            data = episode_fields(
+                                state.env, eid, sample_rows=sample_rows
+                            )
+                            self._send_json(200, data)
+                        except IndexError as exc:
+                            self._send_json(404, {"error": str(exc)})
+                        except ImportError as exc:
+                            self._send_json(500, {"error": str(exc)})
                         except Exception as exc:  # noqa: BLE001
                             self._send_json(500, {"error": str(exc)})
                         return

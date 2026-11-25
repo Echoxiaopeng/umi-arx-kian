@@ -151,7 +151,8 @@
       min-width: 0;
     }
     body.viewer-mode header .hint,
-    body.library-mode header .hint {
+    body.library-mode header .hint,
+    body.browse-mode header .hint {
       display: none;
     }
     /* 顶栏「库管理」：仅数据管理 Viewer 时显示，比普通按钮更醒目 */
@@ -186,7 +187,38 @@
       height: 14px;
       flex: 0 0 auto;
     }
-    /* 顶栏「返回数据管理」：仅库管理页显示 */
+    #btnOpenEpisodeBrowse {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 12px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      border-radius: 6px;
+      border: 1px solid color-mix(in srgb, var(--accent, #1f6feb) 55%, var(--border));
+      background: color-mix(in srgb, var(--accent, #1f6feb) 18%, var(--panel));
+      color: var(--text);
+      cursor: pointer;
+      white-space: nowrap;
+      flex: 0 0 auto;
+    }
+    #btnOpenEpisodeBrowse:hover:not(:disabled) {
+      filter: brightness(1.08);
+    }
+    #btnOpenEpisodeBrowse:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    body.viewer-mode #btnOpenEpisodeBrowse {
+      display: inline-flex;
+    }
+    #btnOpenEpisodeBrowse .lib-ico {
+      width: 14px;
+      height: 14px;
+      flex: 0 0 auto;
+    }
+    /* 顶栏「返回数据管理」：库管理 / 内容浏览页显示 */
     #btnHeaderLibraryBack {
       display: none;
       align-items: center;
@@ -211,13 +243,131 @@
       opacity: 0.45;
       cursor: not-allowed;
     }
-    body.library-mode #btnHeaderLibraryBack {
+    body.library-mode #btnHeaderLibraryBack,
+    body.browse-mode #btnHeaderLibraryBack {
       display: inline-flex;
     }
     #btnHeaderLibraryBack .lib-ico {
       width: 14px;
       height: 14px;
       flex: 0 0 auto;
+    }
+    .browse-page {
+      display: none;
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: hidden;
+      padding: 0;
+      justify-content: stretch;
+      align-items: stretch;
+    }
+    .browse-page.show { display: flex; }
+    .browse-card {
+      width: 100%;
+      height: 100%;
+      max-width: none;
+      text-align: left;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin: 0;
+      border-radius: 0;
+      border-left: none;
+      border-right: none;
+      border-bottom: none;
+      padding: 10px 14px 12px;
+      min-height: 0;
+    }
+    .browse-card h2 {
+      margin: 0 0 2px;
+      font-size: 1.15rem;
+      font-weight: 600;
+      text-transform: none;
+      letter-spacing: 0;
+      color: var(--text);
+    }
+    .browse-layout {
+      flex: 1 1 auto;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(200px, 260px) 1fr;
+      gap: 12px;
+    }
+    .browse-ep-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel-2, var(--panel));
+      min-height: 0;
+    }
+    .browse-ep-list li {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+    }
+    .browse-ep-list li:hover {
+      background: color-mix(in srgb, var(--accent, #1f6feb) 10%, transparent);
+    }
+    .browse-ep-list li.active {
+      background: color-mix(in srgb, var(--accent, #1f6feb) 18%, transparent);
+    }
+    .browse-ep-list .meta {
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-top: 2px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .browse-detail {
+      min-height: 0;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: var(--panel-2, var(--panel));
+    }
+    .browse-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+    .browse-summary strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+    .browse-task-text {
+      font-size: 0.95rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .browse-fields-wrap {
+      overflow: auto;
+      max-height: min(36vh, 320px);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .browse-chart-wrap {
+      flex: 0 0 auto;
+      min-height: 220px;
+    }
+    #browseChart {
+      width: 100%;
+      min-height: 220px;
+    }
+    @media (max-width: 900px) {
+      .browse-layout {
+        grid-template-columns: 1fr;
+        grid-template-rows: minmax(140px, 28vh) 1fr;
+      }
     }
     .font-btns {
       display: inline-flex;
@@ -918,6 +1068,85 @@
       flex-direction: column;
       gap: 6px;
     }
+    .ep-text-panel {
+      flex: 0 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin: 4px 0 2px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel-2, var(--panel));
+      max-height: min(28vh, 260px);
+      overflow: auto;
+    }
+    .ep-text-panel[hidden] { display: none !important; }
+    .ep-text-label {
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .ep-task-text {
+      font-size: 0.92rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--text);
+    }
+    .ep-fields-fold > summary {
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--text);
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .ep-fields-fold > summary::-webkit-details-marker { display: none; }
+    .ep-fields-fold > summary::before {
+      content: "▸";
+      color: var(--muted);
+      font-size: 0.75rem;
+    }
+    .ep-fields-fold[open] > summary::before { content: "▾"; }
+    .ep-fields-wrap {
+      margin-top: 8px;
+      overflow: auto;
+      max-height: 160px;
+    }
+    .ep-fields-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+    }
+    .ep-fields-table th,
+    .ep-fields-table td {
+      border-bottom: 1px solid var(--border);
+      padding: 4px 6px;
+      text-align: left;
+      vertical-align: top;
+    }
+    .ep-fields-table th {
+      color: var(--muted);
+      font-weight: 600;
+      position: sticky;
+      top: 0;
+      background: var(--panel-2, var(--panel));
+    }
+    .ep-fields-table td.col-name {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: nowrap;
+    }
+    .ep-fields-table td.col-sample {
+      word-break: break-word;
+      color: var(--muted);
+    }
+    .ep-fields-table tr.is-text td.col-name { color: var(--fmt-lerobot-fg, var(--accent)); }
     .badge {
       display: inline-flex;
       align-items: center;
@@ -1757,6 +1986,23 @@
       </button>
       <button
         type="button"
+        id="btnOpenEpisodeBrowse"
+        class="primary"
+        title="浏览当前数据集每个 episode 的 task / 字段 / 曲线"
+        disabled
+      >
+        <svg class="lib-ico" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path
+            d="M4 5h16v4H4V5Zm0 5h16v4H4v-4Zm0 5h10v4H4v-4Z"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linejoin="round"
+          />
+        </svg>
+        内容浏览
+      </button>
+      <button
+        type="button"
         id="btnHeaderLibraryBack"
         title="返回数据管理（Esc）"
       >
@@ -1892,6 +2138,64 @@
     </div>
   </div>
 
+  <div class="browse-page" id="episodeBrowsePage">
+    <div class="browse-card panel" id="episodeBrowseCard">
+      <h2>Episode 内容浏览</h2>
+      <p class="merge-sub" id="browsePageHint">
+        查看当前已加载数据集的每个 episode：Task、parquet 字段原文、曲线与状态摘要。Esc 返回数据管理。
+      </p>
+      <div class="path-row" style="margin:0;flex-wrap:wrap;align-items:center">
+        <label>当前数据集</label>
+        <input id="browseDatasetPath" type="text" readonly style="flex:1;min-width:180px" spellcheck="false" />
+        <span class="badge" id="browseFmtBadge" style="display:none">—</span>
+        <button id="btnBrowseRefresh" type="button" title="刷新 episode 列表">刷新</button>
+        <button id="btnBrowseBack" type="button" title="返回数据管理">返回数据管理</button>
+        <div class="msg" id="browseMsg" style="margin:0"></div>
+      </div>
+      <div class="browse-layout">
+        <ul class="browse-ep-list" id="browseEpList"></ul>
+        <div class="browse-detail" id="browseDetail">
+          <div class="browse-summary" id="browseSummary">
+            <span>选择左侧 episode</span>
+          </div>
+          <div>
+            <div class="ep-text-label">Task</div>
+            <div class="browse-task-text" id="browseTaskText">—</div>
+          </div>
+          <div>
+            <div class="ep-text-label">字段一览 <span class="msg" id="browseFieldsHint" style="margin:0;display:inline">parquet 原文样例</span></div>
+            <div class="browse-fields-wrap">
+              <table class="ep-fields-table" id="browseFieldsTable">
+                <thead>
+                  <tr><th>列名</th><th>类型</th><th>样例（原文）</th></tr>
+                </thead>
+                <tbody id="browseFieldsBody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <div class="ep-text-label">曲线 / 状态</div>
+            <div class="chan-btns" id="browseChanBtns" style="margin-bottom:6px">
+              <button type="button" data-browse-chan="pos" class="active">pos</button>
+              <button type="button" data-browse-chan="gripper">gripper</button>
+              <button type="button" data-browse-chan="rot">rot</button>
+              <button type="button" data-browse-chan="action">action</button>
+              <button type="button" data-browse-chan="all">all</button>
+            </div>
+            <div class="chan-btns" id="browseArmBtns" style="margin-bottom:6px">
+              <button type="button" data-browse-arm="both" class="active">Both</button>
+              <button type="button" data-browse-arm="L">L</button>
+              <button type="button" data-browse-arm="R">R</button>
+            </div>
+            <div class="browse-chart-wrap">
+              <div id="browseChart"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="merge-page" id="mergePage">
     <div class="merge-card panel" id="mergeCard">
       <h2>合并 LeRobot</h2>
@@ -2005,17 +2309,6 @@
       </div>
     </div>
 
-    <div class="modal-bg" id="mergeLerobotModal">
-      <div class="modal">
-        <h3>合并 LeRobot？</h3>
-        <p id="mergeLerobotText">将合并所选数据集到输出目录。</p>
-        <div class="btns">
-          <button id="mergeLerobotYes" class="ok">确认合并</button>
-          <button id="mergeLerobotNo">取消</button>
-        </div>
-      </div>
-    </div>
-
     <div class="panel grow" id="episodePanel">
       <h2>Episode viewer</h2>
       <div class="viewer" id="vizLayout">
@@ -2085,6 +2378,23 @@
               </select>
             </label>
             <div class="msg" id="viewerMsg" style="margin:0">Select an episode or Follow LIVE while recording.</div>
+          </div>
+          <div class="ep-text-panel" id="epTextPanel" hidden>
+            <div class="ep-task-block">
+              <div class="ep-text-label">Task</div>
+              <div class="ep-task-text" id="epTaskText">—</div>
+            </div>
+            <details class="ep-fields-fold" id="epFieldsFold">
+              <summary>字段一览 <span class="msg" id="epFieldsHint" style="margin:0;display:inline">parquet schema + 样例</span></summary>
+              <div class="ep-fields-wrap">
+                <table class="ep-fields-table" id="epFieldsTable">
+                  <thead>
+                    <tr><th>列名</th><th>类型</th><th>样例</th></tr>
+                  </thead>
+                  <tbody id="epFieldsBody"></tbody>
+                </table>
+              </div>
+            </details>
           </div>
           <div class="viewer-toolbar">
               <div class="chan-btns" id="chanBtns">
@@ -2342,7 +2652,18 @@
     </div>
   </div>
 
-  <!-- 库管理弹窗必须在 mainWrap 外：库页打开时 mainWrap 为 display:none -->
+  <!-- 合并/库管理弹窗必须在 mainWrap 外：合并页与库页会把 mainWrap 设为 display:none -->
+  <div class="modal-bg" id="mergeLerobotModal">
+    <div class="modal" style="max-width:480px">
+      <h3>合并 LeRobot？</h3>
+      <p id="mergeLerobotText" style="white-space:pre-wrap;word-break:break-all">将合并所选数据集到输出目录。</p>
+      <div class="btns">
+        <button id="mergeLerobotYes" class="ok">确认合并</button>
+        <button id="mergeLerobotNo">取消</button>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-bg" id="libraryRenameModal">
     <div class="modal">
       <h3>重命名数据集</h3>
@@ -2500,6 +2821,12 @@
     let fsPickMode = "load"; // load | merge_add | library_root | library_move
     let mergePageOpen = false;
     let libraryPageOpen = false;
+    let episodeBrowsePageOpen = false;
+    let browseEpisodes = [];
+    let browseSelectedEp = null;
+    let browseSeries = null;
+    let browseChannel = "pos";
+    let browseArmFilter = "both";
     let libraryRoot = "";
     let libraryData = { path: "", parent: null, datasets: [], other_dirs: [] };
     let librarySelected = new Set(); // paths
@@ -3115,7 +3442,10 @@
     function showMergePage() {
       mergePageOpen = true;
       libraryPageOpen = false;
+      episodeBrowsePageOpen = false;
+      document.body.classList.remove("browse-mode", "library-mode");
       if ($("libraryPage")) $("libraryPage").classList.remove("show");
+      if ($("episodeBrowsePage")) $("episodeBrowsePage").classList.remove("show");
       if ($("mergePage")) $("mergePage").classList.add("show");
       if ($("mainWrap")) $("mainWrap").style.display = "none";
       if ($("hubPage")) $("hubPage").classList.remove("show");
@@ -3131,7 +3461,7 @@
       mergePageOpen = false;
       if ($("mergePage")) $("mergePage").classList.remove("show");
       // 回到数据管理主界面（由后续 applyUiMode / poll 校正）
-      if (!hubMode && !libraryPageOpen && $("mainWrap")) {
+      if (!hubMode && !libraryPageOpen && !episodeBrowsePageOpen && $("mainWrap")) {
         $("mainWrap").style.display = "flex";
       }
       $("headerHint").textContent = "数据管理 · 返回入口 · 仅可信局域网";
@@ -3363,9 +3693,11 @@
     async function showLibraryPage(path) {
       libraryPageOpen = true;
       mergePageOpen = false;
+      episodeBrowsePageOpen = false;
       document.body.classList.add("library-mode");
-      document.body.classList.remove("viewer-mode");
+      document.body.classList.remove("viewer-mode", "browse-mode");
       if ($("mergePage")) $("mergePage").classList.remove("show");
+      if ($("episodeBrowsePage")) $("episodeBrowsePage").classList.remove("show");
       if ($("libraryPage")) $("libraryPage").classList.add("show");
       if ($("mainWrap")) $("mainWrap").style.display = "none";
       if ($("hubPage")) $("hubPage").classList.remove("show");
@@ -3392,7 +3724,7 @@
       libraryPageOpen = false;
       document.body.classList.remove("library-mode");
       if ($("libraryPage")) $("libraryPage").classList.remove("show");
-      if (!hubMode && !mergePageOpen && $("mainWrap")) {
+      if (!hubMode && !mergePageOpen && !episodeBrowsePageOpen && $("mainWrap")) {
         $("mainWrap").style.display = "flex";
       }
       $("headerHint").textContent = "数据管理 · 返回入口 · 仅可信局域网";
@@ -3420,6 +3752,398 @@
       hideLibraryPage();
       applyUiMode(status.mode || "VIEW", status);
       return true;
+    }
+
+    function setBrowseMsg(text) {
+      if ($("browseMsg")) $("browseMsg").textContent = text || "";
+    }
+
+    function hideEpisodeBrowsePage() {
+      episodeBrowsePageOpen = false;
+      document.body.classList.remove("browse-mode");
+      if ($("episodeBrowsePage")) $("episodeBrowsePage").classList.remove("show");
+      if (!hubMode && !mergePageOpen && !libraryPageOpen && $("mainWrap")) {
+        $("mainWrap").style.display = "flex";
+      }
+      $("headerHint").textContent = "数据管理 · 返回入口 · 仅可信局域网";
+      $("pageTitle").textContent = "ARX5 Dataset Viewer";
+      document.title = "ARX5 Dataset Viewer";
+    }
+
+    function exitBrowseToViewer() {
+      if (!episodeBrowsePageOpen) return false;
+      hideEpisodeBrowsePage();
+      applyUiMode(status.mode || "VIEW", status);
+      return true;
+    }
+
+    function exitOverlayToViewer() {
+      if (episodeBrowsePageOpen) return exitBrowseToViewer();
+      if (libraryPageOpen) return exitLibraryToViewer();
+      return false;
+    }
+
+    function renderBrowseEpList() {
+      const ul = $("browseEpList");
+      if (!ul) return;
+      ul.innerHTML = "";
+      const eps = browseEpisodes || [];
+      if (!eps.length) {
+        const li = document.createElement("li");
+        li.textContent = "无 episode";
+        ul.appendChild(li);
+        return;
+      }
+      eps.slice().reverse().forEach((ep) => {
+        const li = document.createElement("li");
+        li.dataset.id = String(ep.id);
+        if (browseSelectedEp != null && Number(browseSelectedEp) === Number(ep.id)) {
+          li.classList.add("active");
+        }
+        const dur = ep.duration != null ? `${Number(ep.duration).toFixed(1)}s` : "?s";
+        const taskBit = truncateTaskMeta(ep.tasks);
+        const meta =
+          `${ep.n_steps} steps · ${dur}${ep.has_video ? " · video" : ""}` +
+          (taskBit ? `\n${taskBit}` : "");
+        li.innerHTML = `<strong>Ep ${ep.id}</strong><div class="meta"></div>`;
+        const metaEl = li.querySelector(".meta");
+        if (metaEl) metaEl.textContent = meta;
+        li.onclick = () => selectBrowseEpisode(ep.id);
+        ul.appendChild(li);
+      });
+    }
+
+    function renderBrowseFields(data) {
+      const body = $("browseFieldsBody");
+      const hint = $("browseFieldsHint");
+      if (!body) return;
+      body.innerHTML = "";
+      const cols = (data && data.columns) || [];
+      if (hint) {
+        const n = data && data.n_rows != null ? data.n_rows : "?";
+        const nText = cols.filter((c) => c && c.is_text).length;
+        hint.textContent =
+          `${cols.length} 列 · ${n} 行` + (nText ? ` · ${nText} 文本列` : "") +
+          " · 样例为原文";
+      }
+      if (!cols.length) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td colspan="3" class="col-sample">无 parquet 列</td>`;
+        body.appendChild(tr);
+        return;
+      }
+      cols.forEach((c) => {
+        const tr = document.createElement("tr");
+        if (c.is_text) tr.classList.add("is-text");
+        const tdName = document.createElement("td");
+        tdName.className = "col-name";
+        tdName.textContent = c.name || "";
+        const tdType = document.createElement("td");
+        tdType.textContent = c.dtype || "—";
+        const tdSample = document.createElement("td");
+        tdSample.className = "col-sample";
+        const samples = Array.isArray(c.samples) ? c.samples : [];
+        tdSample.textContent = samples.length ? samples.join("\n---\n") : "—";
+        tdSample.style.whiteSpace = "pre-wrap";
+        tr.appendChild(tdName);
+        tr.appendChild(tdType);
+        tr.appendChild(tdSample);
+        body.appendChild(tr);
+      });
+    }
+
+    function renderBrowseSummary(epMeta, seriesData, fieldsData) {
+      const el = $("browseSummary");
+      if (!el) return;
+      const nSteps =
+        (seriesData && seriesData.n_steps) ||
+        (epMeta && epMeta.n_steps) ||
+        "—";
+      const dur =
+        epMeta && epMeta.duration != null
+          ? `${Number(epMeta.duration).toFixed(2)}s`
+          : "—";
+      const fps =
+        status.dataset_fps != null
+          ? status.dataset_fps
+          : status.frequency != null
+            ? status.frequency
+            : "—";
+      const cols = (fieldsData && fieldsData.columns) || [];
+      const nText = cols.filter((c) => c && c.is_text).length;
+      let taskIndex = "—";
+      const tiCol = cols.find((c) => c && c.name === "task_index");
+      if (tiCol && tiCol.samples && tiCol.samples.length) {
+        taskIndex = tiCol.samples[0];
+      }
+      el.innerHTML =
+        `<span>Episode <strong>${browseSelectedEp}</strong></span>` +
+        `<span>Steps <strong>${nSteps}</strong></span>` +
+        `<span>Duration <strong>${dur}</strong></span>` +
+        `<span>FPS <strong>${fps}</strong></span>` +
+        `<span>task_index <strong>${taskIndex}</strong></span>` +
+        `<span>列 <strong>${cols.length || "—"}</strong>` +
+        (cols.length ? `（文本 ${nText}）` : "") +
+        `</span>`;
+    }
+
+    function plotBrowseSeries(data) {
+      browseSeries = data || null;
+      const gd = $("browseChart");
+      if (!gd || typeof Plotly === "undefined") return;
+      if (!data) {
+        Plotly.purge(gd);
+        return;
+      }
+      const n =
+        (data.steps && data.steps.length) || (data.t && data.t.length) || 0;
+      const x =
+        data.steps && data.steps.length
+          ? data.steps
+          : Array.from({ length: n }, (_, i) => i);
+      let arms = armSeriesList(data);
+      if (browseArmFilter === "L") {
+        arms = arms.filter((a) => a.label === "L" || a.label === "A0");
+      } else if (browseArmFilter === "R") {
+        arms = arms.filter((a) => a.label === "R" || a.label === "A1");
+      }
+      const action = data.action || [];
+      const multi =
+        (data.n_robots && data.n_robots > 1) ||
+        (data.robots && data.robots.length > 1) ||
+        arms.length > 1;
+      const tc = chartThemeColors();
+      const axisCommon = {
+        gridcolor: cssVar("--border", "#2d3a4d"),
+        zeroline: false,
+        color: cssVar("--muted", "#8b9bb4"),
+      };
+      const traces = [];
+      const chan = browseChannel;
+      arms.forEach((arm) => {
+        const pfx = multi ? `${arm.label}_` : "";
+        const xyz = arm.xyz || [];
+        const rot = arm.rot || [];
+        const grip = arm.grip || [];
+        if (chan === "pos" || chan === "all") {
+          traces.push(
+            { x, y: xyz.map((p) => p[0]), name: `${pfx}pos_x`, line: { width: 1.5 } },
+            { x, y: xyz.map((p) => p[1]), name: `${pfx}pos_y`, line: { width: 1.5 } },
+            { x, y: xyz.map((p) => p[2]), name: `${pfx}pos_z`, line: { width: 1.5 } }
+          );
+        }
+        if (chan === "gripper" || chan === "all") {
+          traces.push({
+            x,
+            y: grip,
+            name: `${pfx}grip`,
+            line: { width: 1.5 },
+          });
+        }
+        if (chan === "rot" || chan === "all") {
+          traces.push(
+            { x, y: rot.map((p) => p[0]), name: `${pfx}rot_x`, line: { width: 1.5 } },
+            { x, y: rot.map((p) => p[1]), name: `${pfx}rot_y`, line: { width: 1.5 } },
+            { x, y: rot.map((p) => p[2]), name: `${pfx}rot_z`, line: { width: 1.5 } }
+          );
+        }
+        if ((chan === "action" || chan === "all") && action.length && action[0]) {
+          const r = arm.label === "R" || arm.label === "A1" ? 1 : 0;
+          const base = 7 * r;
+          if ((action[0].length || 0) > base) {
+            traces.push(
+              {
+                x,
+                y: action.map((a) => (a && a[base + 0]) || 0),
+                name: `${pfx}act_x`,
+                line: { width: 1.5 },
+              },
+              {
+                x,
+                y: action.map((a) => (a && a[base + 1]) || 0),
+                name: `${pfx}act_y`,
+                line: { width: 1.5 },
+              },
+              {
+                x,
+                y: action.map((a) => (a && a[base + 2]) || 0),
+                name: `${pfx}act_z`,
+                line: { width: 1.5 },
+              }
+            );
+          }
+        }
+      });
+      const layout = {
+        title: false,
+        paper_bgcolor: tc.paper,
+        plot_bgcolor: tc.plot,
+        font: { color: tc.font, size: 11 },
+        margin: { l: 40, r: 16, t: 10, b: 32 },
+        height: 240,
+        autosize: true,
+        showlegend: true,
+        legend: { orientation: "h", y: 1.12, font: { size: 10 } },
+        xaxis: { ...axisCommon, title: "" },
+        yaxis: { ...axisCommon, title: "", automargin: true },
+        dragmode: "pan",
+      };
+      Plotly.react(gd, traces, layout, {
+        displayModeBar: false,
+        responsive: true,
+      });
+    }
+
+    async function selectBrowseEpisode(id) {
+      browseSelectedEp = id;
+      renderBrowseEpList();
+      setBrowseMsg(`加载 Ep ${id}…`);
+      const isLerobot = String(status.dataset_format || "") === "lerobot";
+      const epMeta = (browseEpisodes || []).find((e) => Number(e.id) === Number(id));
+      let seriesData = null;
+      let fieldsData = null;
+      try {
+        const seriesP = fetch(`/api/episodes/${id}/series?max_points=2000`).then(
+          async (r) => {
+            const d = await r.json();
+            if (!r.ok) throw new Error(d.error || r.statusText);
+            return d;
+          }
+        );
+        const fieldsP = fetch(`/api/episodes/${id}/fields?sample_rows=3`).then(
+          async (r) => {
+            const d = await r.json();
+            if (!r.ok) throw new Error(d.error || d.reason || r.statusText);
+            return d;
+          }
+        );
+        const settled = await Promise.allSettled([seriesP, fieldsP]);
+        if (settled[0].status === "fulfilled") seriesData = settled[0].value;
+        else throw settled[0].reason;
+        if (settled[1].status === "fulfilled") fieldsData = settled[1].value;
+        else {
+          fieldsData = {
+            columns: [],
+            tasks: [],
+            error: String(settled[1].reason || settled[1].value),
+          };
+        }
+
+        const tasks =
+          (fieldsData && fieldsData.tasks) ||
+          (seriesData && seriesData.tasks) ||
+          (epMeta && epMeta.tasks) ||
+          [];
+        if ($("browseTaskText")) {
+          if (Array.isArray(tasks) && tasks.length) {
+            $("browseTaskText").textContent = tasks.join("\n");
+          } else if (isLerobot) {
+            $("browseTaskText").textContent = "（无 task 文本）";
+          } else {
+            $("browseTaskText").textContent =
+              "（zarr 无 task；转换 LeRobot 后可在 meta/tasks 中查看）";
+          }
+        }
+        if (fieldsData && fieldsData.error) {
+          if ($("browseFieldsBody")) {
+            $("browseFieldsBody").innerHTML =
+              `<tr><td colspan="3" class="col-sample">字段加载失败: ${fieldsData.error}</td></tr>`;
+          }
+        } else {
+          renderBrowseFields(fieldsData || { columns: [] });
+          const src = (fieldsData && fieldsData.source) || (isLerobot ? "lerobot" : "zarr");
+          if ($("browseFieldsHint") && fieldsData && !fieldsData.error) {
+            const cols = fieldsData.columns || [];
+            const n = fieldsData.n_rows != null ? fieldsData.n_rows : "?";
+            $("browseFieldsHint").textContent =
+              `${src} · ${cols.length} 列 · ${n} 行 · 样例为原文`;
+          }
+        }
+        renderBrowseSummary(epMeta, seriesData, fieldsData);
+        plotBrowseSeries(seriesData);
+        setBrowseMsg(`Ep ${id} · ${seriesData.n_steps || 0} steps`);
+      } catch (e) {
+        setBrowseMsg("加载失败: " + (e.message || e));
+        if ($("browseTaskText")) $("browseTaskText").textContent = "—";
+        plotBrowseSeries(null);
+      }
+    }
+
+    async function refreshBrowseEpisodes() {
+      const path = String(status.output_dir || "").trim();
+      if ($("browseDatasetPath")) $("browseDatasetPath").value = path || "（未加载）";
+      const fmt = String(status.dataset_format || "");
+      if ($("browseFmtBadge")) {
+        if (fmt) {
+          $("browseFmtBadge").style.display = "";
+          $("browseFmtBadge").textContent = fmt;
+          $("browseFmtBadge").className =
+            "badge " + (fmt === "lerobot" ? "fmt-lerobot" : "fmt-zarr");
+        } else {
+          $("browseFmtBadge").style.display = "none";
+        }
+      }
+      if (!path) {
+        browseEpisodes = [];
+        renderBrowseEpList();
+        setBrowseMsg("请先打开数据集");
+        return;
+      }
+      setBrowseMsg("加载 episode 列表…");
+      try {
+        const r = await fetch("/api/episodes");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || r.statusText);
+        browseEpisodes = data.episodes || [];
+        renderBrowseEpList();
+        let pick = browseSelectedEp;
+        if (
+          pick == null ||
+          pick === "live" ||
+          !browseEpisodes.some((e) => Number(e.id) === Number(pick))
+        ) {
+          if (
+            selectedEp != null &&
+            selectedEp !== "live" &&
+            browseEpisodes.some((e) => Number(e.id) === Number(selectedEp))
+          ) {
+            pick = selectedEp;
+          } else if (browseEpisodes.length) {
+            pick = browseEpisodes[browseEpisodes.length - 1].id;
+          } else {
+            pick = null;
+          }
+        }
+        if (pick != null) await selectBrowseEpisode(pick);
+        else setBrowseMsg("无 episode");
+      } catch (e) {
+        setBrowseMsg("列表失败: " + (e.message || e));
+      }
+    }
+
+    async function showEpisodeBrowsePage() {
+      if (status.mode === "DELETING" || status.deleting) {
+        setMsg("正在处理数据，请稍候…");
+        return;
+      }
+      if (!String(status.output_dir || "").trim()) {
+        setMsg("请先打开数据集");
+        return;
+      }
+      episodeBrowsePageOpen = true;
+      libraryPageOpen = false;
+      mergePageOpen = false;
+      document.body.classList.add("browse-mode");
+      document.body.classList.remove("viewer-mode", "library-mode");
+      if ($("mergePage")) $("mergePage").classList.remove("show");
+      if ($("libraryPage")) $("libraryPage").classList.remove("show");
+      if ($("episodeBrowsePage")) $("episodeBrowsePage").classList.add("show");
+      if ($("mainWrap")) $("mainWrap").style.display = "none";
+      if ($("hubPage")) $("hubPage").classList.remove("show");
+      $("headerHint").textContent = "内容浏览 · Esc 返回数据管理 · 仅可信局域网";
+      $("pageTitle").textContent = "ARX5 Episode Browser";
+      document.title = "ARX5 Episode Browser";
+      await refreshBrowseEpisodes();
     }
 
     async function openLibraryDataset(path) {
@@ -4302,14 +5026,22 @@
       viewerOnly = !!(s && s.viewer_only) || mode === "VIEW";
       document.body.classList.toggle(
         "viewer-mode",
-        viewerOnly && !hubMode && !mergePageOpen && !libraryPageOpen
+        viewerOnly &&
+          !hubMode &&
+          !mergePageOpen &&
+          !libraryPageOpen &&
+          !episodeBrowsePageOpen
       );
       document.body.classList.toggle(
         "library-mode",
         !!libraryPageOpen && !hubMode
       );
+      document.body.classList.toggle(
+        "browse-mode",
+        !!episodeBrowsePageOpen && !hubMode
+      );
 
-      // 库/合并页优先；入口页其次；否则主界面
+      // 库/合并/浏览页优先；入口页其次；否则主界面
       if ($("mergePage")) {
         $("mergePage").classList.toggle("show", !!mergePageOpen && !hubMode);
       }
@@ -4319,15 +5051,25 @@
           !!libraryPageOpen && !hubMode && !mergePageOpen
         );
       }
+      if ($("episodeBrowsePage")) {
+        $("episodeBrowsePage").classList.toggle(
+          "show",
+          !!episodeBrowsePageOpen && !hubMode && !mergePageOpen && !libraryPageOpen
+        );
+      }
       $("hubPage").classList.toggle("show", hubMode);
       if (hubMode) {
         mergePageOpen = false;
         libraryPageOpen = false;
+        episodeBrowsePageOpen = false;
         if ($("mergePage")) $("mergePage").classList.remove("show");
         if ($("libraryPage")) $("libraryPage").classList.remove("show");
+        if ($("episodeBrowsePage")) $("episodeBrowsePage").classList.remove("show");
       }
       $("mainWrap").style.display =
-        hubMode || mergePageOpen || libraryPageOpen ? "none" : "flex";
+        hubMode || mergePageOpen || libraryPageOpen || episodeBrowsePageOpen
+          ? "none"
+          : "flex";
 
       if ($("hubCard")) {
         $("hubCard").classList.toggle("hub-connecting", connecting);
@@ -4347,6 +5089,12 @@
         $("headerHint").textContent = "库管理 · Esc 返回数据管理 · 仅可信局域网";
         $("pageTitle").textContent = "ARX5 Dataset Library";
         document.title = "ARX5 Dataset Library";
+        return;
+      }
+      if (episodeBrowsePageOpen && !hubMode) {
+        $("headerHint").textContent = "内容浏览 · Esc 返回数据管理 · 仅可信局域网";
+        $("pageTitle").textContent = "ARX5 Episode Browser";
+        document.title = "ARX5 Episode Browser";
         return;
       }
 
@@ -4429,6 +5177,9 @@
       const el = $("datasetFormatBadge");
       if (!el) return;
       const fmt = String((s && s.dataset_format) || "");
+      if (!fmt && $("epTextPanel") && !$("epTextPanel").hidden) {
+        clearEpisodeTextPanel();
+      }
       if (!fmt || hubMode) {
         el.style.display = "none";
         return;
@@ -4554,6 +5305,13 @@
       const busy = !!(s && (s.mode === "DELETING" || s.deleting));
       const canOpen = !!(s && s.viewer_only) && !hubMode;
       if ($("btnOpenLibraryPage")) $("btnOpenLibraryPage").disabled = !canOpen || busy;
+      const hasDataset = !!String((s && s.output_dir) || "").trim();
+      if ($("btnOpenEpisodeBrowse")) {
+        $("btnOpenEpisodeBrowse").disabled = !canOpen || busy || !hasDataset;
+        $("btnOpenEpisodeBrowse").title = !hasDataset
+          ? "请先打开数据集"
+          : "浏览当前数据集每个 episode 的 task / 字段 / 曲线";
+      }
       [
         "btnMergeLerobot",
         "btnMergeAddSource",
@@ -5307,11 +6065,138 @@
 
     function episodeListSignature(episodes) {
       return (episodes || [])
-        .map(
-          (ep) =>
-            `${ep.id}:${ep.n_steps}:${ep.duration ?? ""}:${ep.has_video ? 1 : 0}`
-        )
+        .map((ep) => {
+          const task0 =
+            Array.isArray(ep.tasks) && ep.tasks.length
+              ? String(ep.tasks[0]).slice(0, 24)
+              : "";
+          return `${ep.id}:${ep.n_steps}:${ep.duration ?? ""}:${ep.has_video ? 1 : 0}:${task0}`;
+        })
         .join("|");
+    }
+
+    function truncateTaskMeta(tasks, maxLen) {
+      const list = Array.isArray(tasks) ? tasks.filter(Boolean) : [];
+      if (!list.length) return "";
+      let s = String(list[0]);
+      if (list.length > 1) s += ` (+${list.length - 1})`;
+      const lim = maxLen || 42;
+      if (s.length > lim) return s.slice(0, lim - 1) + "…";
+      return s;
+    }
+
+    function clearEpisodeTextPanel() {
+      const panel = $("epTextPanel");
+      if (panel) panel.hidden = true;
+      if ($("epTaskText")) $("epTaskText").textContent = "—";
+      if ($("epFieldsBody")) $("epFieldsBody").innerHTML = "";
+      if ($("epFieldsHint")) $("epFieldsHint").textContent = "parquet schema + 样例";
+      if ($("epFieldsFold")) $("epFieldsFold").open = false;
+    }
+
+    function renderEpisodeTask(tasks) {
+      const el = $("epTaskText");
+      if (!el) return;
+      const list = Array.isArray(tasks) ? tasks.map((t) => String(t || "").trim()).filter(Boolean) : [];
+      if (!list.length) {
+        el.textContent = "（无 task 文本）";
+        return;
+      }
+      el.textContent = list.join("\n");
+    }
+
+    function renderEpisodeFields(data) {
+      const body = $("epFieldsBody");
+      const hint = $("epFieldsHint");
+      if (!body) return;
+      body.innerHTML = "";
+      const cols = (data && data.columns) || [];
+      if (hint) {
+        const n = data && data.n_rows != null ? data.n_rows : "?";
+        const nText = cols.filter((c) => c && c.is_text).length;
+        hint.textContent = `${cols.length} 列 · ${n} 行` + (nText ? ` · ${nText} 文本列` : "");
+      }
+      if (!cols.length) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td colspan="3" class="col-sample">无 parquet 列</td>`;
+        body.appendChild(tr);
+        return;
+      }
+      cols.forEach((c) => {
+        const tr = document.createElement("tr");
+        if (c.is_text) tr.classList.add("is-text");
+        const dtype = c.dtype || "—";
+        const samples = Array.isArray(c.samples) ? c.samples : [];
+        const sample = samples.length ? samples.join(" · ") : "—";
+        const tdName = document.createElement("td");
+        tdName.className = "col-name";
+        tdName.textContent = c.name || "";
+        const tdType = document.createElement("td");
+        tdType.textContent = dtype;
+        const tdSample = document.createElement("td");
+        tdSample.className = "col-sample";
+        tdSample.textContent = sample;
+        tr.appendChild(tdName);
+        tr.appendChild(tdType);
+        tr.appendChild(tdSample);
+        body.appendChild(tr);
+      });
+    }
+
+    async function loadEpisodeTextPanel(id, fallbackTasks) {
+      const panel = $("epTextPanel");
+      const fmt = String(status.dataset_format || "");
+      // 内嵌面板：LeRobot 与 zarr 都可看字段；无数据集则隐藏
+      if (!fmt) {
+        clearEpisodeTextPanel();
+        return;
+      }
+      if (panel) panel.hidden = false;
+      // series 里已有 tasks 时先展示，避免 fields 失败把 Task 盖成错误文案
+      if (fallbackTasks != null) renderEpisodeTask(fallbackTasks);
+      else if (fmt !== "lerobot") {
+        renderEpisodeTask([]);
+        if ($("epTaskText")) {
+          $("epTaskText").textContent =
+            "（zarr 无 task；下方为 buffer 字段原文样例）";
+        }
+      }
+      try {
+        const r = await fetch(`/api/episodes/${id}/fields?sample_rows=3`);
+        let data = {};
+        try {
+          data = await r.json();
+        } catch (_) {
+          data = {};
+        }
+        if (!r.ok) {
+          throw new Error(
+            data.error || data.reason || `${r.status} ${r.statusText}`
+          );
+        }
+        if (Array.isArray(data.tasks) && data.tasks.length) {
+          renderEpisodeTask(data.tasks);
+        } else if (fallbackTasks != null) {
+          renderEpisodeTask(fallbackTasks);
+        }
+        renderEpisodeFields(data);
+        if ($("epFieldsHint") && data) {
+          const src = data.source || fmt || "data";
+          const cols = data.columns || [];
+          const n = data.n_rows != null ? data.n_rows : "?";
+          $("epFieldsHint").textContent =
+            `${src} · ${cols.length} 列 · ${n} 行 · 原文样例`;
+        }
+      } catch (e) {
+        if (fallbackTasks != null) renderEpisodeTask(fallbackTasks);
+        if ($("epFieldsBody")) {
+          $("epFieldsBody").innerHTML =
+            `<tr><td colspan="3" class="col-sample">字段一览加载失败: ${String(
+              e.message || e
+            )}（若刚更新代码请重启 --web）</td></tr>`;
+        }
+        if ($("epFieldsHint")) $("epFieldsHint").textContent = "加载失败";
+      }
     }
 
     function renderEpList(episodes, { force = false } = {}) {
@@ -5344,7 +6229,16 @@
           li.classList.add("active");
         }
         const dur = ep.duration != null ? `${ep.duration.toFixed(1)}s` : "?s";
-        li.innerHTML = `<strong>Ep ${ep.id}</strong><div class="meta">${ep.n_steps} steps · ${dur}${ep.has_video ? " · video" : ""}</div>`;
+        const taskBit = truncateTaskMeta(ep.tasks);
+        const meta =
+          `${ep.n_steps} steps · ${dur}${ep.has_video ? " · video" : ""}` +
+          (taskBit ? `\n${taskBit}` : "");
+        li.innerHTML = `<strong>Ep ${ep.id}</strong><div class="meta"></div>`;
+        const metaEl = li.querySelector(".meta");
+        if (metaEl) {
+          metaEl.style.whiteSpace = "pre-wrap";
+          metaEl.textContent = meta;
+        }
         li.onclick = () => selectEpisode(ep.id);
         ul.appendChild(li);
       });
@@ -6225,11 +7119,25 @@
         plotSeries(data, `Episode ${id}`, 0);
         $("scrub").value = "0";
         await loadFrame(0);
-        $("viewerMsg").textContent = `Episode ${id} · ${data.n_steps} steps`;
+        const taskOne =
+          Array.isArray(data.tasks) && data.tasks.length
+            ? String(data.tasks[0])
+            : "";
+        $("viewerMsg").textContent =
+          `Episode ${id} · ${data.n_steps} steps` +
+          (taskOne ? ` · ${truncateTaskMeta(data.tasks, 60)}` : "");
         updateTrimRangeLabel();
         syncVizHeader(status);
+        if (String(status.dataset_format || "")) {
+          if ($("epTextPanel")) $("epTextPanel").hidden = false;
+          renderEpisodeTask(data.tasks);
+          loadEpisodeTextPanel(id, data.tasks).catch(() => {});
+        } else {
+          clearEpisodeTextPanel();
+        }
       } catch (e) {
         $("viewerMsg").textContent = "Failed: " + e.message;
+        clearEpisodeTextPanel();
       }
     }
 
@@ -6237,6 +7145,7 @@
       selectedEp = "live";
       clearTrimMarks({ refreshChart: false });
       setTrimControlsEnabled(false);
+      clearEpisodeTextPanel();
       document.querySelectorAll(".ep-list li").forEach((li) => li.classList.remove("active"));
       $("btnDelete").disabled = true;
       $("viewerMsg").textContent = viewerOnly
@@ -6433,6 +7342,37 @@
     if ($("btnOpenLibraryPage")) {
       $("btnOpenLibraryPage").onclick = () => showLibraryPage();
     }
+    if ($("btnOpenEpisodeBrowse")) {
+      $("btnOpenEpisodeBrowse").onclick = () => {
+        showEpisodeBrowsePage().catch((e) => setMsg(e.message));
+      };
+    }
+    if ($("btnBrowseBack")) {
+      $("btnBrowseBack").onclick = () => exitBrowseToViewer();
+    }
+    if ($("btnBrowseRefresh")) {
+      $("btnBrowseRefresh").onclick = () => {
+        refreshBrowseEpisodes().catch((e) => setBrowseMsg(e.message));
+      };
+    }
+    document.querySelectorAll("#browseChanBtns button[data-browse-chan]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        browseChannel = btn.dataset.browseChan || "pos";
+        document.querySelectorAll("#browseChanBtns button[data-browse-chan]").forEach((b) => {
+          b.classList.toggle("active", b === btn);
+        });
+        if (browseSeries) plotBrowseSeries(browseSeries);
+      });
+    });
+    document.querySelectorAll("#browseArmBtns button[data-browse-arm]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        browseArmFilter = btn.dataset.browseArm || "both";
+        document.querySelectorAll("#browseArmBtns button[data-browse-arm]").forEach((b) => {
+          b.classList.toggle("active", b === btn);
+        });
+        if (browseSeries) plotBrowseSeries(browseSeries);
+      });
+    });
     if ($("btnMergeBack")) {
       $("btnMergeBack").onclick = () => {
         if (status.mode === "DELETING" || status.deleting) {
@@ -6450,7 +7390,7 @@
     }
     if ($("btnHeaderLibraryBack")) {
       $("btnHeaderLibraryBack").onclick = () => {
-        exitLibraryToViewer();
+        exitOverlayToViewer();
       };
     }
     if ($("btnLibraryOpenRoot")) {
@@ -7417,6 +8357,13 @@
       const mergeModalOpen =
         $("mergeLerobotModal") &&
         $("mergeLerobotModal").classList.contains("show");
+
+      // 内容浏览页：Esc 返回数据管理
+      if (episodeBrowsePageOpen && k === "escape") {
+        ev.preventDefault();
+        exitBrowseToViewer();
+        return;
+      }
 
       // 库管理页：Esc 优先关弹窗，否则返回数据管理（输入框内也生效）
       if (libraryPageOpen && k === "escape") {
