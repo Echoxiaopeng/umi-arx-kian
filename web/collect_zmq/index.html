@@ -2111,16 +2111,18 @@
         <label title="可只填 user@ip，再点「浏览远端」选目录；或直接填 user@host:/path/">远程目标</label>
         <input id="librarySyncDest" type="text" list="librarySyncDestList" style="flex:1;min-width:220px" spellcheck="false" autocomplete="off" placeholder="user@ip 回车浏览远端目录，或填 user@host:/path/" title="输入 user@ip 后按回车开始选择远端目录" />
         <datalist id="librarySyncDestList"></datalist>
+        <input id="librarySyncLabel" type="text" style="width:140px;min-width:100px" spellcheck="false" autocomplete="off" placeholder="备注(可选)" title="常用地址备注名" />
         <button id="btnLibrarySyncBrowse" type="button" class="ok" title="连接远端并浏览目录">浏览远端…</button>
-        <select id="librarySyncSaved" title="常用地址" style="max-width:200px">
+        <select id="librarySyncSaved" title="常用地址" style="max-width:220px">
           <option value="">常用地址…</option>
         </select>
-        <button id="btnLibrarySyncSaveDest" type="button" title="把当前目标保存到常用地址（不存密码）">保存地址</button>
+        <button id="btnLibrarySyncSaveDest" type="button" title="保存/更新常用地址（写入仓库 config/sync_remotes.json；不存密码）">保存地址</button>
         <button id="btnLibrarySyncRemoveDest" type="button" title="从常用地址删除当前选中项">删除地址</button>
         <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted);margin:0" title="危险：会删除远端有而本地没有的文件">
           <input id="librarySyncDelete" type="checkbox" /> rsync --delete
         </label>
       </div>
+      <div class="msg" id="librarySyncRemotesHint" style="margin:4px 0 0;font-size:0.8rem;color:var(--muted)">config/sync_remotes.json（可随 git 同步；密码仅本机浏览器）</div>
       <div id="librarySyncStatus" aria-live="polite"></div>
       <div class="library-batch">
         <button id="btnLibraryMergeSelected" type="button" class="primary" disabled title="所选须全部为 LeRobot 且至少 2 个">合并所选</button>
@@ -3704,6 +3706,7 @@
       $("headerHint").textContent = "库管理 · Esc 返回数据管理 · 仅可信局域网";
       $("pageTitle").textContent = "ARX5 Dataset Library";
       document.title = "ARX5 Dataset Library";
+      pullSyncRemotesFromServer().catch(() => {});
       let root = (path || "").trim();
       if (!root) {
         root =
@@ -4258,32 +4261,133 @@
       );
     }
 
+    function normalizeSyncRemoteList(arr) {
+      if (!Array.isArray(arr)) return [];
+      const byDest = new Map();
+      const order = [];
+      arr.forEach((x) => {
+        let dest = "";
+        let label = "";
+        if (typeof x === "string") {
+          dest = x.trim();
+        } else if (x && typeof x === "object") {
+          dest = String(x.dest || "").trim();
+          label = String(x.label || "").trim();
+        }
+        if (!dest) return;
+        if (!byDest.has(dest)) order.push(dest);
+        byDest.set(dest, { dest, label });
+      });
+      return order.map((d) => byDest.get(d));
+    }
+
     function loadSyncRemotes() {
       try {
         const raw = localStorage.getItem(SYNC_REMOTE_SAVED_KEY);
-        const arr = raw ? JSON.parse(raw) : [];
-        if (!Array.isArray(arr)) return [];
-        return arr
-          .map((x) => {
-            if (typeof x === "string") return { dest: x.trim(), label: "" };
-            if (x && typeof x === "object") {
-              return {
-                dest: String(x.dest || "").trim(),
-                label: String(x.label || "").trim(),
-              };
-            }
-            return null;
-          })
-          .filter((x) => x && x.dest);
+        return normalizeSyncRemoteList(raw ? JSON.parse(raw) : []);
       } catch (_) {
         return [];
       }
     }
 
-    function saveSyncRemotes(list) {
+    function saveSyncRemotesLocal(list) {
       try {
-        localStorage.setItem(SYNC_REMOTE_SAVED_KEY, JSON.stringify(list || []));
+        localStorage.setItem(
+          SYNC_REMOTE_SAVED_KEY,
+          JSON.stringify(normalizeSyncRemoteList(list || []))
+        );
       } catch (_) {}
+    }
+
+    /** @deprecated use persistSyncRemotes */
+    function saveSyncRemotes(list) {
+      saveSyncRemotesLocal(list);
+    }
+
+    function mergeSyncRemoteLists(serverList, localList) {
+      const byDest = new Map();
+      const order = [];
+      normalizeSyncRemoteList(serverList).forEach((item) => {
+        if (!byDest.has(item.dest)) order.push(item.dest);
+        byDest.set(item.dest, { dest: item.dest, label: item.label || "" });
+      });
+      normalizeSyncRemoteList(localList).forEach((item) => {
+        if (!byDest.has(item.dest)) {
+          order.push(item.dest);
+          byDest.set(item.dest, { dest: item.dest, label: item.label || "" });
+        } else {
+          const cur = byDest.get(item.dest);
+          if (!cur.label && item.label) {
+            byDest.set(item.dest, { dest: item.dest, label: item.label });
+          }
+        }
+      });
+      return order.map((d) => byDest.get(d));
+    }
+
+    async function persistSyncRemotes(list) {
+      const cleaned = normalizeSyncRemoteList(list || []);
+      saveSyncRemotesLocal(cleaned);
+      renderSyncRemoteUi();
+      try {
+        const r = await fetch("/api/sync/remotes", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ remotes: cleaned }),
+        });
+        let j = {};
+        try {
+          j = await r.json();
+        } catch (_) {
+          j = {};
+        }
+        if (!r.ok) {
+          throw new Error(j.error || r.statusText || "保存常用地址失败");
+        }
+        if (Array.isArray(j.remotes)) {
+          saveSyncRemotesLocal(j.remotes);
+          renderSyncRemoteUi();
+        }
+        return j.remotes || cleaned;
+      } catch (e) {
+        throw e;
+      }
+    }
+
+    async function pullSyncRemotesFromServer() {
+      try {
+        const r = await fetch("/api/sync/remotes");
+        let j = {};
+        try {
+          j = await r.json();
+        } catch (_) {
+          j = {};
+        }
+        if (!r.ok) {
+          renderSyncRemoteUi();
+          return loadSyncRemotes();
+        }
+        const merged = mergeSyncRemoteLists(j.remotes || [], loadSyncRemotes());
+        saveSyncRemotesLocal(merged);
+        renderSyncRemoteUi();
+        return merged;
+      } catch (_) {
+        renderSyncRemoteUi();
+        return loadSyncRemotes();
+      }
+    }
+
+    function migrateSyncPasswordKey(oldDest, newDest) {
+      const oldKey = syncHostKey(oldDest);
+      const newKey = syncHostKey(newDest);
+      if (!oldKey || !newKey || oldKey === newKey) return;
+      const map = loadSyncPasswordMap();
+      if (!map[oldKey]) return;
+      if (!map[newKey]) {
+        map[newKey] = map[oldKey];
+      }
+      delete map[oldKey];
+      saveSyncPasswordMap(map);
     }
 
     function isValidSyncHost(dest) {
@@ -4365,6 +4469,7 @@
         list.forEach((item) => {
           const opt = document.createElement("option");
           opt.value = item.dest;
+          opt.dataset.label = item.label || "";
           opt.textContent = item.label
             ? `${item.label} · ${item.dest}`
             : item.dest;
@@ -4372,6 +4477,20 @@
         });
         if (cur && list.some((x) => x.dest === cur)) sel.value = cur;
       }
+    }
+
+    function fillSyncRemoteEditorsFromSelection() {
+      const sel = $("librarySyncSaved");
+      if (!sel || !sel.value) return;
+      const dest = sel.value;
+      if ($("librarySyncDest")) $("librarySyncDest").value = dest;
+      const opt = sel.selectedOptions && sel.selectedOptions[0];
+      const label =
+        (opt && opt.dataset && opt.dataset.label) ||
+        (loadSyncRemotes().find((x) => x.dest === dest) || {}).label ||
+        "";
+      if ($("librarySyncLabel")) $("librarySyncLabel").value = label;
+      rememberSyncDest(dest);
     }
 
     function initSyncRemoteDestInput() {
@@ -4393,24 +4512,47 @@
       } catch (_) {}
     }
 
-    function saveCurrentSyncDest() {
+    async function saveCurrentSyncDest() {
       const dest = ($("librarySyncDest") && $("librarySyncDest").value.trim()) || "";
+      const label =
+        ($("librarySyncLabel") && $("librarySyncLabel").value.trim()) || "";
       if (!isValidSyncHost(dest)) {
         setMsg("地址格式无效，例如 user@ip 或 user@host:/path/");
         return;
       }
       const list = loadSyncRemotes();
-      if (!list.some((x) => x.dest === dest)) {
-        list.push({ dest, label: "" });
-        saveSyncRemotes(list);
+      const selectedOld =
+        ($("librarySyncSaved") && $("librarySyncSaved").value) || "";
+      // 改：选中项存在且 dest 变了 → 用原 dest 定位替换；冲突则报错
+      if (selectedOld && selectedOld !== dest) {
+        if (list.some((x) => x.dest === dest)) {
+          setMsg(`常用地址已存在: ${dest}`);
+          return;
+        }
+        const idx = list.findIndex((x) => x.dest === selectedOld);
+        if (idx < 0) {
+          list.push({ dest, label });
+        } else {
+          list[idx] = { dest, label };
+          migrateSyncPasswordKey(selectedOld, dest);
+        }
+      } else {
+        // 增 / 改 label：同 dest 则更新 label
+        const idx = list.findIndex((x) => x.dest === dest);
+        if (idx >= 0) list[idx] = { dest, label };
+        else list.push({ dest, label });
       }
-      rememberSyncDest(dest);
-      renderSyncRemoteUi();
-      if ($("librarySyncSaved")) $("librarySyncSaved").value = dest;
-      setMsg(`已保存常用地址: ${dest}`);
+      try {
+        await persistSyncRemotes(list);
+        rememberSyncDest(dest);
+        if ($("librarySyncSaved")) $("librarySyncSaved").value = dest;
+        setMsg(`已保存常用地址: ${label ? label + " · " : ""}${dest}`);
+      } catch (e) {
+        setMsg(e.message || String(e));
+      }
     }
 
-    function removeSelectedSyncDest() {
+    async function removeSelectedSyncDest() {
       const dest =
         ($("librarySyncSaved") && $("librarySyncSaved").value) ||
         ($("librarySyncDest") && $("librarySyncDest").value.trim()) ||
@@ -4420,9 +4562,13 @@
         return;
       }
       const next = loadSyncRemotes().filter((x) => x.dest !== dest);
-      saveSyncRemotes(next);
-      renderSyncRemoteUi();
-      setMsg(`已从常用地址删除: ${dest}`);
+      try {
+        await persistSyncRemotes(next);
+        if ($("librarySyncSaved")) $("librarySyncSaved").value = "";
+        setMsg(`已从常用地址删除: ${dest}`);
+      } catch (e) {
+        setMsg(e.message || String(e));
+      }
     }
 
     function openLibrarySync(paths) {
@@ -7494,15 +7640,18 @@
       };
     }
     if ($("btnLibrarySyncSaveDest")) {
-      $("btnLibrarySyncSaveDest").onclick = () => saveCurrentSyncDest();
+      $("btnLibrarySyncSaveDest").onclick = () => {
+        saveCurrentSyncDest().catch((e) => setMsg(e.message || String(e)));
+      };
     }
     if ($("btnLibrarySyncRemoveDest")) {
-      $("btnLibrarySyncRemoveDest").onclick = () => removeSelectedSyncDest();
+      $("btnLibrarySyncRemoveDest").onclick = () => {
+        removeSelectedSyncDest().catch((e) => setMsg(e.message || String(e)));
+      };
     }
     if ($("librarySyncSaved")) {
       $("librarySyncSaved").addEventListener("change", () => {
-        const v = $("librarySyncSaved").value;
-        if (v && $("librarySyncDest")) $("librarySyncDest").value = v;
+        fillSyncRemoteEditorsFromSelection();
       });
     }
     if ($("librarySyncDest")) {

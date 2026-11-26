@@ -1148,6 +1148,30 @@ class CollectWebServer:
                             self._send_json(500, {"error": str(exc)})
                         return
 
+                    if path == "/api/sync/remotes":
+                        import importlib
+
+                        import modules.sync_remotes_store as _remotes_store
+
+                        _remotes_store = importlib.reload(_remotes_store)
+                        try:
+                            remotes = _remotes_store.load_sync_remotes()
+                            path_used = str(
+                                _remotes_store.default_sync_remotes_path()
+                            )
+                            self._send_json(
+                                200,
+                                {
+                                    "ok": True,
+                                    "remotes": remotes,
+                                    "path": path_used,
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            traceback.print_exc()
+                            self._send_json(500, {"error": str(exc)})
+                        return
+
                     if path == "/api/video":
                         self._stream_mjpeg()
                         return
@@ -1302,6 +1326,34 @@ class CollectWebServer:
                         payload = json.loads(raw.decode("utf-8") or "{}")
                     except json.JSONDecodeError:
                         self._send_json(400, {"error": "invalid json"})
+                        return
+
+                    if parsed.path == "/api/sync/remotes":
+                        import importlib
+
+                        import modules.sync_remotes_store as _remotes_store
+
+                        _remotes_store = importlib.reload(_remotes_store)
+                        try:
+                            remotes_in = payload.get("remotes", payload)
+                            if isinstance(remotes_in, dict):
+                                remotes_in = remotes_in.get("remotes") or []
+                            saved = _remotes_store.save_sync_remotes(
+                                remotes_in if isinstance(remotes_in, list) else []
+                            )
+                            self._send_json(
+                                200,
+                                {
+                                    "ok": True,
+                                    "remotes": saved,
+                                    "path": str(
+                                        _remotes_store.default_sync_remotes_path()
+                                    ),
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            traceback.print_exc()
+                            self._send_json(500, {"error": str(exc)})
                         return
 
                     # Synchronous remote browse / probe (password only in this request).
